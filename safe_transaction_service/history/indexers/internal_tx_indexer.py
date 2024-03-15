@@ -39,9 +39,11 @@ class InternalTxIndexerProvider:
         else:
             instance_class = InternalTxIndexer
 
-        return instance_class(
-            EthereumClient(settings.ETHEREUM_TRACING_NODE_URL),
+        ethereum_client = EthereumClient(
+            settings.ETHEREUM_TRACING_NODE_URL,
+            limit_requests_per_second=settings.ETHEREUM_NODE_THROTTLING_RPS
         )
+        return instance_class(ethereum_client)
 
     @classmethod
     def del_singleton(cls):

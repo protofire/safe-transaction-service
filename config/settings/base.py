@@ -430,6 +430,7 @@ REDIS_URL = env("REDIS_URL", default="redis://localhost:6379/0")
 # Ethereum RPC
 # ------------------------------------------------------------------------------
 ETHEREUM_NODE_URL = env("ETHEREUM_NODE_URL", default=None)
+ETHEREUM_NODE_THROTTLING_RPS = env.int("ETHEREUM_NODE_THROTTLING_RPS", default=None)
 HIDE_ETHEREUM_RPC = env.bool(
     "HIDE_ETHEREUM_RPC", default=False
 )  # Don't expose the Ethereum RPC URL

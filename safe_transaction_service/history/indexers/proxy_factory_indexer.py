@@ -30,7 +30,11 @@ class ProxyFactoryIndexerProvider:
     def get_new_instance(cls) -> "ProxyFactoryIndexer":
         from django.conf import settings
 
-        return ProxyFactoryIndexer(EthereumClient(settings.ETHEREUM_NODE_URL))
+        ethereum_client = EthereumClient(
+            settings.ETHEREUM_NODE_URL,
+            limit_requests_per_second=settings.ETHEREUM_NODE_THROTTLING_RPS
+        )
+        return ProxyFactoryIndexer(ethereum_client)
 
     @classmethod
     def del_singleton(cls):

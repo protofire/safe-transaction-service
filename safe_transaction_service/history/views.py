@@ -150,7 +150,10 @@ class AboutEthereumTracingRPCView(AboutEthereumRPCView):
         if not settings.ETHEREUM_TRACING_NODE_URL:
             return Response(status=status.HTTP_404_NOT_FOUND)
         else:
-            ethereum_client = EthereumClient(settings.ETHEREUM_TRACING_NODE_URL)
+            ethereum_client = EthereumClient(
+                settings.ETHEREUM_TRACING_NODE_URL,
+                limit_requests_per_second=settings.ETHEREUM_NODE_THROTTLING_RPS
+            )
             return Response(self._get_info(ethereum_client))
 
 

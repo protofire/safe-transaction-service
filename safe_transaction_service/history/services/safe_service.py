@@ -54,7 +54,10 @@ class SafeServiceProvider:
 
             ethereum_client = EthereumClientProvider()
             ethereum_tracing_client = (
-                EthereumClient(settings.ETHEREUM_TRACING_NODE_URL)
+                EthereumClient(
+                    settings.ETHEREUM_TRACING_NODE_URL,
+                    limit_requests_per_second=settings.ETHEREUM_NODE_THROTTLING_RPS
+                )
                 if settings.ETHEREUM_TRACING_NODE_URL
                 else None
             )
