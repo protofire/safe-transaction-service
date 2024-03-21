@@ -1,8 +1,12 @@
+import django
+
 from config.gunicorn import (
     gunicorn_request_timeout,
     gunicorn_worker_connections,
     gunicorn_workers,
 )
+
+django.setup()
 
 access_logfile = "-"
 error_logfile = "-"
