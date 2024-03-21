@@ -12,7 +12,7 @@ ALLOWED_HOSTS = env.list("DJANGO_ALLOWED_HOSTS", default=["*"])
 # ------------------------------------------------------------------------------
 # DATABASES['default'] = env.db('DATABASE_URL')  # noqa F405
 DATABASES["default"]["ATOMIC_REQUESTS"] = False  # noqa F405
-
+DATABASES["default"]['OPTIONS']['check_same_thread'] = False  # noqa F405
 REDIS_URL = env.str("REDIS_URL")
 
 # CACHES
