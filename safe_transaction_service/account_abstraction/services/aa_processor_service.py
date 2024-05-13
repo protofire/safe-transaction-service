@@ -15,6 +15,7 @@ from gnosis.eth.account_abstraction import (
     BundlerClientException,
     UserOperation,
     UserOperationReceipt,
+    UserOperationV07,
 )
 from gnosis.eth.utils import fast_to_checksum_address
 from gnosis.safe.account_abstraction import SafeOperation
@@ -22,7 +23,7 @@ from gnosis.safe.safe_signature import SafeSignature
 
 from safe_transaction_service.history import models as history_models
 
-from ..constants import USER_OPERATION_EVENT_TOPICS, USER_OPERATION_NUMBER_TOPICS
+from ..constants import USER_OPERATION_EVENT_TOPIC, USER_OPERATION_NUMBER_TOPICS
 from ..models import SafeOperation as SafeOperationModel
 from ..models import SafeOperationConfirmation as SafeOperationConfirmationModel
 from ..models import UserOperation as UserOperationModel
@@ -36,7 +37,7 @@ class AaProcessorServiceException(Exception):
     pass
 
 
-class ExecutionFromSafeModuleNotDetected(AaProcessorServiceException):
+class UserOperationNotSupportedException(Exception):
     pass
 
 
@@ -67,20 +68,20 @@ class AaProcessorService:
         self.bundler_client = bundler_client
         self.supported_entry_points = supported_entry_points
 
-    def get_user_operation_logs(
+    def get_user_operation_hashes_from_logs(
         self, safe_address: ChecksumAddress, logs: [Sequence[LogReceipt]]
-    ) -> List[LogReceipt]:
+    ) -> List[HexBytes]:
         """
         :param safe_address:
         :param logs:
-        :return: Logs for ``UserOperation`` from entrypoint if detected
+        :return: ``UserOperations`` hashes if detected
         """
         return [
-            log
+            HexBytes(log["topics"][1])
             for log in logs
             if (
                 len(log["topics"]) == USER_OPERATION_NUMBER_TOPICS
-                and HexBytes(log["topics"][0]) in USER_OPERATION_EVENT_TOPICS
+                and HexBytes(log["topics"][0]) == USER_OPERATION_EVENT_TOPIC
                 and fast_to_checksum_address(log["address"])
                 in self.supported_entry_points  # Only index supported entryPoints
                 and fast_to_checksum_address(log["topics"][2][-40:])
@@ -150,19 +151,22 @@ class AaProcessorService:
         """
 
         if not (module_address := user_operation_receipt.get_module_address()):
+            # UserOperation it's being indexed as UserOperation event been emitted. So
+            # `nonce` was increased and the UserOperation must be indexed, but we should log the information
+            # so it's easy to debug edge cases, as 4337 entrypoint is still a work in progress.
+            logger.info(
+                "[%s] Cannot find ExecutionFromModuleSuccess or ExecutionFromModuleFailure "
+                "events for user-operation-hash=%s , it seems like UserOperation was reverted",
+                user_operation_model.sender,
+                user_operation.user_operation_hash.hex(),
+            )
             if user_operation_receipt.get_deployed_account():
-                # UserOperation `initCode` was executed but `callData` failed, so account was deployed but no
-                # SafeOperation was executed
+                # UserOperation `initCode` was executed but `callData` failed, so account was deployed but
+                # SafeOperation was reverted
                 logger.info(
                     "[%s] user-operation-hash=%s was reverted but contract was deployed",
                     user_operation_model.sender,
                     user_operation.user_operation_hash.hex(),
-                )
-                return None
-            else:
-                raise ExecutionFromSafeModuleNotDetected(
-                    f"Cannot find ExecutionFromModuleSuccess or ExecutionFromModuleFailure events for "
-                    f"user-operation-hash={user_operation.user_operation_hash.hex()}"
                 )
 
         # Build SafeOperation from UserOperation
@@ -235,13 +239,21 @@ class AaProcessorService:
             tx_hash,
         )
 
+        # Cut reason if longer than `max_length`
+        reason = (
+            user_operation_receipt.reason[
+                : UserOperationReceiptModel._meta.get_field("reason").max_length
+            ]
+            if user_operation_receipt.reason
+            else ""
+        )
         return (
             UserOperationReceiptModel.objects.create(
                 user_operation=user_operation_model,
                 actual_gas_cost=user_operation_receipt.actual_gas_cost,
                 actual_gas_used=user_operation_receipt.actual_gas_used,
                 success=user_operation_receipt.success,
-                reason=user_operation_receipt.reason,
+                reason=reason,
                 deposited=deposited,
             ),
             user_operation_receipt,
@@ -251,49 +263,53 @@ class AaProcessorService:
     def index_user_operation(
         self,
         safe_address: ChecksumAddress,
-        log: LogReceipt,
+        user_operation_hash: HexBytes,
         ethereum_tx: history_models.EthereumTx,
     ) -> Tuple[UserOperationModel, UserOperation]:
         """
         Index ``UserOperation``, ``SafeOperation`` and ``UserOperationReceipt`` for the given ``UserOperation`` log
 
         :param safe_address: to prevent indexing UserOperations from other address
-        :param log: log event with the ``UserOperation`` emitted by the entryPoint
+        :param user_operation_hash: hash for the ``UserOperation``
         :param ethereum_tx: Stored EthereumTx in database containing the ``UserOperation``
         :return: tuple of ``UserOperationModel`` and ``UserOperation``
         """
-        user_operation_hash = HexBytes(log["topics"][1]).hex()
+        user_operation_hash_hex = user_operation_hash.hex()
         # If the UserOperationReceipt is present, UserOperation was already processed and mined
-        if self.is_user_operation_indexed(user_operation_hash):
+        if self.is_user_operation_indexed(user_operation_hash_hex):
             logger.warning(
                 "[%s] user-operation-hash=%s receipt was already indexed",
                 safe_address,
-                user_operation_hash,
+                user_operation_hash_hex,
             )
         else:
             logger.debug(
                 "[%s] Retrieving UserOperation from Bundler with user-operation-hash=%s on tx-hash=%s",
                 safe_address,
-                user_operation_hash,
+                user_operation_hash_hex,
                 ethereum_tx.tx_hash,
             )
             user_operation = self.bundler_client.get_user_operation_by_hash(
-                user_operation_hash
+                user_operation_hash_hex
             )
             if not user_operation:
                 self.bundler_client.get_user_operation_by_hash.cache_clear()
                 raise BundlerClientException(
-                    f"user-operation={user_operation_hash} returned `null`"
+                    f"user-operation={user_operation_hash_hex} returned `null`"
+                )
+            if isinstance(user_operation, UserOperationV07):
+                raise UserOperationNotSupportedException(
+                    f"user-operation={user_operation_hash_hex} for EntryPoint v0.7.0 is not supported"
                 )
 
             try:
                 user_operation_model = UserOperationModel.objects.get(
-                    hash=user_operation_hash
+                    hash=user_operation_hash_hex
                 )
                 logger.debug(
                     "[%s] Updating UserOperation with user-operation=%s on tx-hash=%s",
                     safe_address,
-                    user_operation_hash,
+                    user_operation_hash_hex,
                     ethereum_tx.tx_hash,
                 )
                 user_operation_model.signature = user_operation.signature
@@ -303,12 +319,12 @@ class AaProcessorService:
                 logger.debug(
                     "[%s] Storing UserOperation with user-operation=%s on tx-hash=%s",
                     safe_address,
-                    user_operation_hash,
+                    user_operation_hash_hex,
                     ethereum_tx.tx_hash,
                 )
                 user_operation_model = UserOperationModel.objects.create(
                     ethereum_tx=ethereum_tx,
-                    hash=user_operation_hash,
+                    hash=user_operation_hash_hex,
                     sender=user_operation.sender,
                     nonce=user_operation.nonce,
                     init_code=user_operation.init_code,
@@ -344,17 +360,27 @@ class AaProcessorService:
         :param ethereum_tx: EthereumTx to check for UserOperations
         :return: Number of detected ``UserOperations`` in transaction
         """
-        aa_logs = self.get_user_operation_logs(safe_address, ethereum_tx.logs)
-        number_detected_user_operations = len(aa_logs)
+        user_operation_hashes = self.get_user_operation_hashes_from_logs(
+            safe_address, ethereum_tx.logs
+        )
+        number_detected_user_operations = len(user_operation_hashes)
         if not self.bundler_client:
             logger.debug(
                 "Detected 4337 User Operation but bundler client was not configured"
             )
             return number_detected_user_operations
 
-        for log in aa_logs:
+        for user_operation_hash in user_operation_hashes:
             try:
-                self.index_user_operation(safe_address, log, ethereum_tx)
+                self.index_user_operation(
+                    safe_address, user_operation_hash, ethereum_tx
+                )
+            except UserOperationNotSupportedException as exc:
+                logger.error(
+                    "[%s] Error processing user-operation: %s",
+                    safe_address,
+                    exc,
+                )
             except BundlerClientException as exc:
                 logger.error(
                     "[%s] Error retrieving user-operation from bundler API: %s",
