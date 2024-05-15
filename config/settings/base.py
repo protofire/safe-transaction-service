@@ -478,7 +478,7 @@ ETH_EVENTS_GET_LOGS_CONCURRENCY = env.int(
     "ETH_EVENTS_GET_LOGS_CONCURRENCY", default=20
 )  # Number of concurrent requests to `getLogs`
 ETH_EVENTS_QUERY_CHUNK_SIZE = env.int(
-    "ETH_EVENTS_QUERY_CHUNK_SIZE", default=250
+    "ETH_EVENTS_QUERY_CHUNK_SIZE", default=50
 )  # Number of addresses to use as `getLogs` parameter. `0 == no limit`. By testing `1_000` looks like a good default
 ETH_EVENTS_UPDATED_BLOCK_BEHIND = env.int(
     "ETH_EVENTS_UPDATED_BLOCK_BEHIND", default=24 * 60 * 60 // 15
