@@ -478,13 +478,13 @@ ETH_EVENTS_GET_LOGS_CONCURRENCY = env.int(
     "ETH_EVENTS_GET_LOGS_CONCURRENCY", default=20
 )  # Number of concurrent requests to `getLogs`
 ETH_EVENTS_QUERY_CHUNK_SIZE = env.int(
-    "ETH_EVENTS_QUERY_CHUNK_SIZE", default=1_000
+    "ETH_EVENTS_QUERY_CHUNK_SIZE", default=250
 )  # Number of addresses to use as `getLogs` parameter. `0 == no limit`. By testing `1_000` looks like a good default
 ETH_EVENTS_UPDATED_BLOCK_BEHIND = env.int(
     "ETH_EVENTS_UPDATED_BLOCK_BEHIND", default=24 * 60 * 60 // 15
 )  # Number of blocks to consider an address 'almost updated'.
 ETH_REORG_BLOCKS_BATCH = env.int(
-    "ETH_REORG_BLOCKS_BATCH", default=250
+    "ETH_REORG_BLOCKS_BATCH", default=200
 )  # Number of blocks to be checked in the same batch for reorgs
 ETH_REORG_BLOCKS = env.int(
     "ETH_REORG_BLOCKS", default=200 if ETH_L2_NETWORK else 10
@@ -501,7 +501,7 @@ TOKENS_ENS_IMAGE_URL = env.str(
     default="https://safe-transaction-assets.safe.global/tokens/logos/ENS.png",
 )
 TOKENS_ERC20_GET_BALANCES_BATCH = env.int(
-    "TOKENS_ERC20_GET_BALANCES_BATCH", default=2_000
+    "TOKENS_ERC20_GET_BALANCES_BATCH", default=1_000
 )  # Number of tokens to get balances from in the same request. From 2_500 some nodes raise HTTP 413
 
 # Notifications
