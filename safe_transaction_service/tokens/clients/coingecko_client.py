@@ -33,6 +33,14 @@ class CoingeckoClient(BaseHTTPClient):
         EthereumNetwork.POLYGON_ZKEVM: "polygon-zkevm",
         EthereumNetwork.CELO_MAINNET: "celo",
         EthereumNetwork.METER_MAINNET: "meter",
+        EthereumNetwork.ASTAR: "astar",
+        EthereumNetwork.SHIDEN: "shiden",
+        EthereumNetwork.EVMOS: "evmos",
+        EthereumNetwork.HARMONY_MAINNET_SHARD_0: "harmony-shard-0",
+        EthereumNetwork.MOONBEAM: "moonbeam",
+        EthereumNetwork.MOONRIVER: "moonriver",
+        EthereumNetwork.WEMIX3_0_MAINNET: "wemix-network",
+        EthereumNetwork.ZETACHAIN_MAINNET: "zetachain",
     }
     base_url = "https://api.coingecko.com/"
 
