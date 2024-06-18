@@ -13,6 +13,11 @@ from eth_account import Account
 from gnosis.eth import EthereumClient, EthereumNetwork
 
 from ...utils.redis import get_redis
+from ..indexers import (
+    Erc20EventsIndexerProvider,
+    InternalTxIndexerProvider,
+    SafeEventsIndexerProvider,
+)
 from ..models import MultisigTransaction, SafeContract, SafeLastStatus, SafeStatus
 from ..services import CollectiblesService, CollectiblesServiceProvider, IndexService
 from ..services.collectibles_service import CollectibleWithMetadata
@@ -50,6 +55,17 @@ logger = logging.getLogger(__name__)
 
 
 class TestTasks(TestCase):
+    def _delete_singletons(self):
+        Erc20EventsIndexerProvider.del_singleton()
+        InternalTxIndexerProvider.del_singleton()
+        SafeEventsIndexerProvider.del_singleton()
+
+    def setUp(self):
+        self._delete_singletons()
+
+    def tearDown(self):
+        self._delete_singletons()
+
     def test_check_reorgs_task(self):
         self.assertIsNone(check_reorgs_task.delay().result, 0)
 
@@ -67,8 +83,9 @@ class TestTasks(TestCase):
         with self.assertLogs(logger=task_logger) as cm:
             safe_contract = SafeContractFactory()
             index_erc20_events_out_of_sync_task.delay()
+            addresses = {safe_contract.address}
             self.assertIn(
-                f"Start indexing of erc20/721 events for out of sync addresses {[safe_contract.address]}",
+                f"Start indexing of erc20/721 events for out of sync addresses {addresses}",
                 cm.output[0],
             )
             self.assertIn(

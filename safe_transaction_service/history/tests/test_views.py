@@ -3210,7 +3210,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "setup_data": None,
                 "data_decoded": None,
                 "transaction_hash": internal_tx.ethereum_tx_id,
-                "safe_operation": None,
+                "user_operation": None,
             }
             self.assertDictEqual(response.data, expected)
 
@@ -3241,35 +3241,37 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             format="json",
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
-        expected["safe_operation"] = {
-            "created": datetime_to_str(safe_operation.created),
-            "modified": datetime_to_str(safe_operation.created),
-            "ethereum_tx_hash": internal_tx.ethereum_tx_id,
+        expected["user_operation"] = {
             "sender": safe_operation.user_operation.sender,
-            "user_operation_hash": safe_operation.user_operation.hash,
-            "safe_operation_hash": safe_operation.hash,
             "nonce": safe_operation.user_operation.nonce,
+            "user_operation_hash": safe_operation.user_operation.hash,
+            "ethereum_tx_hash": internal_tx.ethereum_tx_id,
             "init_code": "0x1234",
             "call_data": "0x",
-            "call_data_gas_limit": safe_operation.user_operation.call_data_gas_limit,
+            "call_gas_limit": safe_operation.user_operation.call_gas_limit,
             "verification_gas_limit": safe_operation.user_operation.verification_gas_limit,
             "pre_verification_gas": safe_operation.user_operation.pre_verification_gas,
             "max_fee_per_gas": safe_operation.user_operation.max_fee_per_gas,
             "max_priority_fee_per_gas": safe_operation.user_operation.max_priority_fee_per_gas,
             "paymaster": safe_operation.user_operation.paymaster,
             "paymaster_data": "0x",
-            "signature": "0x",
+            "signature": "0x" + safe_operation.user_operation.signature.hex(),
             "entry_point": safe_operation.user_operation.entry_point,
-            "valid_after": datetime_to_str(safe_operation.valid_after),
-            "valid_until": datetime_to_str(safe_operation.valid_until),
-            "module_address": safe_operation.module_address,
-            "confirmations": [],
-            "prepared_signature": None,
+            "safe_operation": {
+                "created": datetime_to_str(safe_operation.created),
+                "modified": datetime_to_str(safe_operation.created),
+                "safe_operation_hash": safe_operation.hash,
+                "valid_after": datetime_to_str(safe_operation.valid_after),
+                "valid_until": datetime_to_str(safe_operation.valid_until),
+                "module_address": safe_operation.module_address,
+                "confirmations": [],
+                "prepared_signature": HexBytes(safe_operation.build_signature()).hex(),
+            },
         }
 
-        self.assertIsNotNone(response.data["safe_operation"])
+        self.assertIsNotNone(response.data["user_operation"])
         self.assertDictEqual(response.data, expected)
-        safe_operation.delete()
+        safe_operation.user_operation.delete()
 
         another_trace_2 = dict(call_trace)
         another_trace_2["traceAddress"] = [0]
@@ -3307,7 +3309,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                             "master_copy": test_data["master_copy"],
                             "setup_data": test_data["setup_data"],
                             "data_decoded": data_decoded,
-                            "safe_operation": None,
+                            "user_operation": None,
                         },
                     )
 
@@ -3513,10 +3515,6 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
     def test_singletons_view(self):
         url = reverse("v1:history:singletons")
-        return self._test_singletons_view(url)
-
-    def test_master_copies_view(self):
-        url = reverse("v1:history:master-copies")
         return self._test_singletons_view(url)
 
     def test_modules_view(self):

@@ -1,8 +1,10 @@
+import datetime
 from collections import OrderedDict
 from logging import getLogger
-from typing import Iterator, List, Optional, Sequence
+from typing import Iterator, List, NamedTuple, Optional, Sequence
 
 from django.db.models import QuerySet
+from django.db.models.query import EmptyQuerySet
 
 from eth_typing import ChecksumAddress
 from web3.contract.contract import ContractEvent
@@ -15,13 +17,17 @@ from ..models import (
     ERC20Transfer,
     ERC721Transfer,
     IndexingStatus,
-    MonitoredAddress,
     SafeContract,
     TokenTransfer,
 )
 from .events_indexer import EventsIndexer
 
 logger = getLogger(__name__)
+
+
+class AddressesCache(NamedTuple):
+    addresses: set[ChecksumAddress]
+    last_checked: Optional[datetime.datetime]
 
 
 class Erc20EventsIndexerProvider:
@@ -58,6 +64,7 @@ class Erc20EventsIndexer(EventsIndexer):
         super().__init__(*args, **kwargs)
 
         self._processed_element_cache = FixedSizeDict(maxlen=40_000)  # Around 3MiB
+        self.addresses_cache: Optional[AddressesCache] = None
 
     @property
     def contract_events(self) -> List[ContractEvent]:
@@ -71,12 +78,12 @@ class Erc20EventsIndexer(EventsIndexer):
         return "erc20_block_number"
 
     @property
-    def database_queryset(self):
+    def database_queryset(self) -> QuerySet:
         return SafeContract.objects.all()
 
     def _do_node_query(
         self,
-        addresses: List[ChecksumAddress],
+        addresses: set[ChecksumAddress],
         from_block_number: int,
         to_block_number: int,
     ) -> List[LogReceipt]:
@@ -89,7 +96,8 @@ class Erc20EventsIndexer(EventsIndexer):
         :return:
         """
 
-        # If not too much addresses it's alright to filter in the RPC server
+        # If not too many addresses are provided it's alright to do the filtering in the RPC server
+        # Otherwise, get all the ERC20/721 events and filter them here
         parameter_addresses = (
             None if len(addresses) > self.query_chunk_size else addresses
         )
@@ -106,19 +114,18 @@ class Erc20EventsIndexer(EventsIndexer):
                 transfer_event
                 for transfer_event in transfer_events
                 if transfer_event["blockHash"]
-                != transfer_event["transactionHash"]  # CELO ERC20 indexing
+                != transfer_event["transactionHash"]  # CELO ERC20 rewards
             ]
 
         # Every ERC20/721 event is returned, we need to filter ourselves
-        addresses_set = set(addresses)
         return [
             transfer_event
             for transfer_event in transfer_events
             if transfer_event["blockHash"]
-            != transfer_event["transactionHash"]  # CELO ERC20 indexing
+            != transfer_event["transactionHash"]  # CELO ERC20 rewards
             and (
-                transfer_event["args"]["to"] in addresses_set
-                or transfer_event["args"]["from"] in addresses_set
+                transfer_event["args"]["to"] in addresses
+                or transfer_event["args"]["from"] in addresses
             )
         ]
 
@@ -201,7 +208,7 @@ class Erc20EventsIndexer(EventsIndexer):
 
     def get_almost_updated_addresses(
         self, current_block_number: int
-    ) -> QuerySet[MonitoredAddress]:
+    ) -> set[ChecksumAddress]:
         """
 
         :param current_block_number:
@@ -210,28 +217,66 @@ class Erc20EventsIndexer(EventsIndexer):
 
         logger.debug("%s: Retrieving monitored addresses", self.__class__.__name__)
 
-        addresses = self.database_queryset.all()
+        last_checked: Optional[datetime.datetime]
+        if self.addresses_cache:
+            # Only search for the new addresses
+            query = self.database_queryset.filter(
+                created__gte=self.addresses_cache.last_checked
+            )
+            addresses = self.addresses_cache.addresses
+            last_checked = self.addresses_cache.last_checked
+        else:
+            query = self.database_queryset.all()
+            addresses = set()
+            last_checked = None
+
+        for created, address in query.values_list("created", "address").order_by(
+            "created"
+        ):
+            addresses.add(address)
+
+        try:
+            last_checked = created
+        except NameError:  # database query empty, `created` not defined
+            pass
+
+        if last_checked:
+            # Don't use caching if list is empty
+            self.addresses_cache = AddressesCache(addresses, last_checked)
 
         logger.debug("%s: Retrieved monitored addresses", self.__class__.__name__)
         return addresses
 
-    def get_not_updated_addresses(
-        self, current_block_number: int
-    ) -> QuerySet[MonitoredAddress]:
+    def get_not_updated_addresses(self, current_block_number: int) -> EmptyQuerySet:
         """
         :param current_block_number:
         :return: Monitored addresses to be processed
         """
-        return []
+        return self.database_queryset.none()
 
-    def get_minimum_block_number(
-        self, addresses: Optional[Sequence[str]] = None
+    def get_from_block_number(
+        self, addresses: Optional[set[ChecksumAddress]] = None
     ) -> Optional[int]:
+        """
+        :param addresses:
+        :return: `block_number` to resume indexing from using `IndexingStatus` table
+        """
         return IndexingStatus.objects.get_erc20_721_indexing_status().block_number
 
     def update_monitored_addresses(
-        self, addresses: Sequence[str], from_block_number: int, to_block_number: int
+        self,
+        addresses: set[ChecksumAddress],
+        from_block_number: int,
+        to_block_number: int,
     ) -> bool:
+        """
+        Update `IndexingStatus` table with the next block to be processed.
+
+        :param addresses:
+        :param from_block_number:
+        :param to_block_number:
+        :return: `True` if table was updated, `False` otherwise
+        """
         # Keep indexing going on the next block
         new_to_block_number = to_block_number + 1
         updated = IndexingStatus.objects.set_erc20_721_indexing_status(

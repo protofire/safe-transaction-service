@@ -65,11 +65,13 @@ def check_reorgs_task(self) -> Optional[int]:
             logger.info("Start checking of reorgs")
             reorg_service: ReorgService = ReorgServiceProvider()
             reorg_block_number = reorg_service.check_reorgs()
-            if reorg_block_number:
-                logger.warning("Reorg found for block-number=%d", reorg_block_number)
-                # Stopping running tasks is not possible with gevent
-                reorg_service.recover_from_reorg(reorg_block_number)
-                return reorg_block_number
+            if not reorg_block_number:
+                logger.info("No reorg was found")
+                return None
+            logger.warning("Reorg found for block-number=%d", reorg_block_number)
+            # Stopping running tasks is not possible with gevent
+            reorg_service.recover_from_reorg(reorg_block_number)
+            return reorg_block_number
 
 
 @app.shared_task(soft_time_limit=SOFT_TIMEOUT, time_limit=LOCK_TIMEOUT)
@@ -115,7 +117,7 @@ def index_erc20_events_task(self) -> Optional[Tuple[int, int]]:
 def index_erc20_events_out_of_sync_task(
     block_process_limit: Optional[int] = None,
     block_process_limit_max: Optional[int] = None,
-    addresses: Optional[ChecksumAddress] = None,
+    addresses: Optional[list[ChecksumAddress]] = None,
     number_of_addresses: Optional[int] = 100,
 ) -> Optional[int]:
     """
@@ -130,12 +132,15 @@ def index_erc20_events_out_of_sync_task(
         erc20_events_indexer.block_process_limit_max = block_process_limit_max
 
     current_block_number = erc20_events_indexer.ethereum_client.current_block_number
-    addresses = addresses or [
-        almost_updated_address.address
-        for almost_updated_address in erc20_events_indexer.get_almost_updated_addresses(
-            current_block_number
-        )[:number_of_addresses]
-    ]
+    addresses = (
+        set(addresses)
+        if addresses
+        else set(
+            list(
+                erc20_events_indexer.get_almost_updated_addresses(current_block_number)
+            )[:number_of_addresses]
+        )
+    )
 
     if not addresses:
         logger.info("No addresses to process")
