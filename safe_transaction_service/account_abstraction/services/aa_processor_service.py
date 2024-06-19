@@ -15,7 +15,6 @@ from gnosis.eth.account_abstraction import (
     BundlerClientException,
     UserOperation,
     UserOperationReceipt,
-    UserOperationV07,
 )
 from gnosis.eth.utils import fast_to_checksum_address
 from gnosis.safe.account_abstraction import SafeOperation
@@ -298,10 +297,6 @@ class AaProcessorService:
                 self.bundler_client.get_user_operation_by_hash.cache_clear()
                 raise BundlerClientException(
                     f"user-operation={user_operation_hash_hex} returned `null`"
-                )
-            if isinstance(user_operation, UserOperationV07):
-                raise UserOperationNotSupportedException(
-                    f"user-operation={user_operation_hash_hex} for EntryPoint v0.7.0 is not supported"
                 )
 
             try:
