@@ -79,7 +79,9 @@ def check_sync_status_task() -> bool:
     """
     Check indexing status of the service
     """
-    if not (is_service_synced := IndexServiceProvider().is_service_synced()):
+    if is_service_synced := IndexServiceProvider().is_service_synced():
+        logger.info("Service is synced")
+    else:
         logger.error("Service is out of sync")
 
     return is_service_synced
@@ -457,7 +459,12 @@ def process_decoded_internal_txs_for_safe_task(
             if InternalTxDecoded.objects.out_of_order_for_safe(safe_address):
                 logger.error("[%s] Found out of order transactions", safe_address)
                 tx_processor.clear_cache(safe_address)
-                index_service.reprocess_addresses([safe_address])
+                index_service.fix_out_of_order(
+                    safe_address,
+                    InternalTxDecoded.objects.pending_for_safe(safe_address)[
+                        0
+                    ].internal_tx,
+                )
 
             # Use chunks for memory issues
             number_processed = 0
