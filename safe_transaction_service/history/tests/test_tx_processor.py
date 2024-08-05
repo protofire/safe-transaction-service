@@ -26,6 +26,7 @@ from ..models import (
     SafeContract,
     SafeContractDelegate,
     SafeLastStatus,
+    SafeRelevantTransaction,
     SafeStatus,
 )
 from .factories import (
@@ -60,6 +61,7 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         fallback_handler = Account.create().address
         master_copy = Account.create().address
         threshold = 1
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 0)
         tx_processor.process_decoded_transaction(
             InternalTxDecodedFactory(
                 function_name="setup",
@@ -68,8 +70,10 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
                 fallback_handler=fallback_handler,
                 internal_tx__to=master_copy,
                 internal_tx___from=safe_address,
+                internal_tx__value=0,
             )
         )
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 0)
         self.assertTrue(SafeContract.objects.get(address=safe_address))
         safe_status = SafeStatus.objects.get(address=safe_address)
         self.assertEqual(safe_status.enabled_modules, [])
@@ -84,16 +88,20 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         tx_processor.process_decoded_transactions(
             [
                 InternalTxDecodedFactory(
-                    function_name="execTransaction", internal_tx___from=safe_address
+                    function_name="execTransaction",
+                    internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
                 InternalTxDecodedFactory(
                     function_name="addOwnerWithThreshold",
                     owner=new_owner,
                     threshold=threshold,
                     internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
             ]
         )
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 1)
 
         self.assertEqual(SafeStatus.objects.count(), 3)
         safe_status = SafeStatus.objects.last_for_address(safe_address)
@@ -117,16 +125,20 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         tx_processor.process_decoded_transactions(
             [
                 InternalTxDecodedFactory(
-                    function_name="execTransaction", internal_tx___from=safe_address
+                    function_name="execTransaction",
+                    internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
                 InternalTxDecodedFactory(
                     function_name="swapOwner",
                     old_owner=owner,
                     owner=another_owner,
                     internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
             ]
         )
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 2)
         self.assertEqual(SafeStatus.objects.count(), 5)
         safe_status = SafeStatus.objects.last_for_address(safe_address)
         safe_last_status = SafeLastStatus.objects.get(address=safe_address)
@@ -173,16 +185,20 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         tx_processor.process_decoded_transactions(
             [
                 InternalTxDecodedFactory(
-                    function_name="execTransaction", internal_tx___from=safe_address
+                    function_name="execTransaction",
+                    internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
                 InternalTxDecodedFactory(
                     function_name="removeOwner",
                     old_owner=another_owner,
                     threshold=threshold,
                     internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
             ]
         )
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 3)
         # At least 1 confirmation is always added by `execTransaction` and 1 should be removed
         self.assertEqual(
             MultisigConfirmation.objects.count(), number_confirmations + 1 - 1
@@ -212,15 +228,19 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         tx_processor.process_decoded_transactions(
             [
                 InternalTxDecodedFactory(
-                    function_name="execTransaction", internal_tx___from=safe_address
+                    function_name="execTransaction",
+                    internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
                 InternalTxDecodedFactory(
                     function_name="setFallbackHandler",
                     fallback_handler=fallback_handler,
                     internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
             ]
         )
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 4)
         self.assertEqual(SafeStatus.objects.count(), 9)
         safe_status = SafeStatus.objects.last_for_address(safe_address)
         safe_last_status = SafeLastStatus.objects.get(address=safe_address)
@@ -232,15 +252,19 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         tx_processor.process_decoded_transactions(
             [
                 InternalTxDecodedFactory(
-                    function_name="execTransaction", internal_tx___from=safe_address
+                    function_name="execTransaction",
+                    internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
                 InternalTxDecodedFactory(
                     function_name="changeMasterCopy",
                     master_copy=master_copy,
                     internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
             ]
         )
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 5)
         safe_status = SafeStatus.objects.last_for_address(safe_address)
         safe_last_status = SafeLastStatus.objects.get(address=safe_address)
         self.assertEqual(safe_status, SafeStatus.from_status_instance(safe_last_status))
@@ -252,15 +276,19 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         tx_processor.process_decoded_transactions(
             [
                 InternalTxDecodedFactory(
-                    function_name="execTransaction", internal_tx___from=safe_address
+                    function_name="execTransaction",
+                    internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
                 InternalTxDecodedFactory(
                     function_name="enableModule",
                     module=module,
                     internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
             ]
         )
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 6)
         safe_status = SafeStatus.objects.last_for_address(safe_address)
         safe_last_status = SafeLastStatus.objects.get(address=safe_address)
         self.assertEqual(safe_status, SafeStatus.from_status_instance(safe_last_status))
@@ -270,15 +298,19 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         tx_processor.process_decoded_transactions(
             [
                 InternalTxDecodedFactory(
-                    function_name="execTransaction", internal_tx___from=safe_address
+                    function_name="execTransaction",
+                    internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
                 InternalTxDecodedFactory(
                     function_name="disableModule",
                     module=module,
                     internal_tx___from=safe_address,
+                    internal_tx__value=0,
                 ),
             ]
         )
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 7)
         safe_status = SafeStatus.objects.last_for_address(safe_address)
         safe_last_status = SafeLastStatus.objects.get(address=safe_address)
         self.assertEqual(safe_status, SafeStatus.from_status_instance(safe_last_status))
@@ -293,16 +325,17 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         ):
             # call_trace has [] as a trace address and module txs need to get the grandfather tx, so [0,0] must
             # be used
-            module_internal_tx_decoded = InternalTxDecodedFactory(
-                function_name="execTransactionFromModule",
-                internal_tx___from=safe_address,
-                internal_tx__trace_address="0,0",
-            )
             tx_processor.process_decoded_transactions(
                 [
-                    module_internal_tx_decoded,
+                    InternalTxDecodedFactory(
+                        function_name="execTransactionFromModule",
+                        internal_tx___from=safe_address,
+                        internal_tx__trace_address="0,0",
+                        internal_tx__value=0,
+                    )
                 ]
             )
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 8)
         safe_status = SafeStatus.objects.last_for_address(safe_address)
         safe_last_status = SafeLastStatus.objects.get(address=safe_address)
         self.assertEqual(safe_status, SafeStatus.from_status_instance(safe_last_status))
@@ -325,6 +358,7 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
             hash_to_approve=hash_to_approve,
             internal_tx___from=safe_address,
             internal_tx__trace_address="0,1,0",
+            internal_tx__value=0,
         )
         approve_hash_previous_call_trace = dict(call_trace)
         approve_hash_previous_call_trace["action"]["from"] = owner_approving
@@ -340,24 +374,25 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
             tx_processor.process_decoded_transactions(
                 [
                     InternalTxDecodedFactory(
-                        function_name="execTransaction", internal_tx___from=safe_address
+                        function_name="execTransaction",
+                        internal_tx___from=safe_address,
+                        internal_tx__value=0,
                     ),
                     approve_hash_decoded_tx,
                 ]
             )
-            safe_status = SafeStatus.objects.last_for_address(safe_address)
-            safe_last_status = SafeLastStatus.objects.get(address=safe_address)
-            self.assertEqual(
-                safe_status, SafeStatus.from_status_instance(safe_last_status)
-            )
-            self.assertEqual(safe_status.nonce, 8)
-            multisig_confirmation = MultisigConfirmation.objects.get(
-                multisig_transaction_hash=hash_to_approve
-            )
-            self.assertEqual(
-                multisig_confirmation.signature_type,
-                SafeSignatureType.APPROVED_HASH.value,
-            )
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 9)
+        safe_status = SafeStatus.objects.last_for_address(safe_address)
+        safe_last_status = SafeLastStatus.objects.get(address=safe_address)
+        self.assertEqual(safe_status, SafeStatus.from_status_instance(safe_last_status))
+        self.assertEqual(safe_status.nonce, 8)
+        multisig_confirmation = MultisigConfirmation.objects.get(
+            multisig_transaction_hash=hash_to_approve
+        )
+        self.assertEqual(
+            multisig_confirmation.signature_type,
+            SafeSignatureType.APPROVED_HASH.value,
+        )
 
     def test_tx_processor_is_failed(self):
         tx_processor = self.tx_processor
