@@ -409,7 +409,7 @@ def reindex_master_copies_task(
                 addresses,
             )
             index_service.reindex_master_copies(
-                from_block_number, to_block_number=to_block_number, addresses=addresses
+                from_block_number, to_block_number=to_block_number, block_process_limit=20, addresses=addresses
             )
 
 
