@@ -299,8 +299,9 @@ class SafeEventsIndexer(EventsIndexer):
         args = dict(decoded_element["args"])
         ethereum_tx_hash = HexBytes(decoded_element["transactionHash"])
         ethereum_tx_hash_hex = ethereum_tx_hash.hex()
-        ethereum_block = EthereumBlock.objects.values("number", "timestamp").get(
-            txs=ethereum_tx_hash
+        ethereum_block_number = decoded_element["blockNumber"]
+        ethereum_block_timestamp = EthereumBlock.objects.get_timestamp_by_hash(
+            decoded_element["blockHash"]
         )
         logger.debug(
             "[%s] %s - tx-hash=%s - Processing event %s",
@@ -312,8 +313,8 @@ class SafeEventsIndexer(EventsIndexer):
 
         internal_tx = InternalTx(
             ethereum_tx_id=ethereum_tx_hash,
-            timestamp=ethereum_block["timestamp"],
-            block_number=ethereum_block["number"],
+            timestamp=ethereum_block_timestamp,
+            block_number=ethereum_block_number,
             _from=safe_address,
             gas=50000,
             data=b"",
@@ -393,8 +394,8 @@ class SafeEventsIndexer(EventsIndexer):
             if args["value"] and not data:  # Simulate ether transfer
                 child_internal_tx = InternalTx(
                     ethereum_tx_id=ethereum_tx_hash,
-                    timestamp=ethereum_block["timestamp"],
-                    block_number=ethereum_block["number"],
+                    timestamp=ethereum_block_timestamp,
+                    block_number=ethereum_block_number,
                     _from=safe_address,
                     gas=23000,
                     data=b"",
@@ -453,17 +454,17 @@ class SafeEventsIndexer(EventsIndexer):
             with transaction.atomic():
                 try:
                     internal_tx.save()
+                    if internal_tx.is_ether_transfer:
+                        # Store Incoming Ether Transfers as relevant transactions for a Safe
+                        SafeRelevantTransaction.objects.get_or_create(
+                            ethereum_tx_id=ethereum_tx_hash,
+                            safe=safe_address,
+                            defaults={
+                                "timestamp": ethereum_block_timestamp,
+                            },
+                        )
                     if child_internal_tx:
                         child_internal_tx.save()
-                        if child_internal_tx.is_ether_transfer:
-                            # Store Ether Transfers as relevant transactions for a Safe
-                            SafeRelevantTransaction.objects.get_or_create(
-                                ethereum_tx_id=ethereum_tx_hash,
-                                safe=safe_address,
-                                defaults={
-                                    "timestamp": ethereum_block["timestamp"],
-                                },
-                            )
                     if internal_tx_decoded:
                         internal_tx_decoded.save()
                 except IntegrityError as exc:

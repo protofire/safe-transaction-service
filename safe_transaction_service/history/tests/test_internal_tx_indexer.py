@@ -181,6 +181,9 @@ class TestInternalTxIndexer(TestCase):
                 )
             ),
         )
+        self.assertEqual(
+            SafeRelevantTransaction.objects.count(), 2
+        )  # 2 Ether Transfers
 
     def test_internal_tx_indexer(self):
         self._test_internal_tx_indexer()
@@ -300,10 +303,8 @@ class TestInternalTxIndexer(TestCase):
         self.assertEqual(safe_status.nonce, 1)
         self.assertEqual(safe_status.threshold, 1)
 
-        # Ether transfer matches the Multisig Transaction, so no new elements are added
-        self.assertEqual(
-            SafeRelevantTransaction.objects.count(), 2
-        )  # 2 Ether Transfers
+        # Multisig Transaction was indexed
+        self.assertEqual(SafeRelevantTransaction.objects.count(), 3)
 
         # Try to decode again without new traces, nothing should be decoded
         internal_txs_decoded = InternalTxDecoded.objects.pending_for_safes()
