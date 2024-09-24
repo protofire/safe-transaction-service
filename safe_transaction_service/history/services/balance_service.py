@@ -11,9 +11,8 @@ from cache_memoize import cache_memoize
 from cachetools import TTLCache, cachedmethod
 from eth_typing import ChecksumAddress
 from redis import Redis
-
-from gnosis.eth import EthereumClient, get_auto_ethereum_client
-from gnosis.eth.utils import fast_is_checksum_address
+from safe_eth.eth import EthereumClient, get_auto_ethereum_client
+from safe_eth.eth.utils import fast_is_checksum_address
 
 from safe_transaction_service.tokens.models import Token
 from safe_transaction_service.utils.redis import get_redis
@@ -158,7 +157,7 @@ class BalanceService:
             .filter(safe=safe_address)
             .count()
         )
-        number_erc20_events = ERC20Transfer.objects.to_or_from(safe_address).count()
+        number_erc20_events = ERC20Transfer.objects.fast_count(safe_address)
         number_eth_events = InternalTx.objects.ether_txs_for_address(
             safe_address
         ).count()
