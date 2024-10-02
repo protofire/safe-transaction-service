@@ -100,9 +100,13 @@ class EventsIndexer(EthereumIndexer):
             "topics": [filter_topics],
         }
 
+        logger.debug("Filtering logs with parameters: %d - %d", from_block_number, to_block_number)
+        logger.debug("Addresses: %s", addresses)
+
         if not self.IGNORE_ADDRESSES_ON_LOG_FILTER:
             # Search logs only for the provided addresses, otherwise all the events will be
             # retrieved and then filtering will happen here
+            logger.debug("Query chunk size: %d", self.query_chunk_size)
             if self.query_chunk_size:
                 addresses_chunks = chunks(list(addresses), self.query_chunk_size)
             else:
@@ -112,6 +116,8 @@ class EventsIndexer(EthereumIndexer):
                 {**parameters, "address": addresses_chunk}
                 for addresses_chunk in addresses_chunks
             ]
+
+            logger.debug("Multiple parameters: %s", multiple_parameters)
 
             gevent_pool = pool.Pool(self.get_logs_concurrency)
             jobs = [
