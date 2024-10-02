@@ -135,6 +135,7 @@ class EventsIndexer(EthereumIndexer):
             return [log_receipt for job in jobs for log_receipt in job.get()]
         else:
             with self.auto_adjust_block_limit(from_block_number, to_block_number):
+                logger.debug("Getting logs with parameters: %s", parameters)
                 return self.ethereum_client.slow_w3.eth.get_logs(parameters)
 
     def _find_elements_using_topics(
