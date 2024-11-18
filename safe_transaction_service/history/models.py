@@ -25,7 +25,15 @@ from django.contrib.postgres.indexes import GinIndex
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, models, transaction
 from django.db.models import Case, Count, Exists, Index, JSONField, Max, Q, QuerySet
-from django.db.models.expressions import F, OuterRef, RawSQL, Subquery, Value, When
+from django.db.models.expressions import (
+    F,
+    Func,
+    OuterRef,
+    RawSQL,
+    Subquery,
+    Value,
+    When,
+)
 from django.db.models.functions import Coalesce
 from django.db.models.query import RawQuerySet
 from django.db.models.signals import post_save
@@ -57,6 +65,7 @@ from safe_transaction_service.utils.constants import (
     SIGNATURE_LENGTH as MAX_SIGNATURE_LENGTH,
 )
 
+from .constants import SAFE_PROXY_FACTORY_CREATION_EVENT_TOPIC
 from .utils import clean_receipt_log
 
 logger = getLogger(__name__)
@@ -443,6 +452,20 @@ class EthereumTx(TimeStampedModel):
                     "transaction_index",
                 ]
             )
+
+    def get_deployed_proxies_from_logs(self) -> list[ChecksumAddress]:
+        """
+        :return: list of `SafeProxyFactory` proxies that emitted the `ProxyCreation` event on this transaction
+        """
+        return [
+            # Deployed address is `indexed`, so it will be stored in topics[1]
+            # Topics are 32 bit, and we are only interested in the last 20 holding the address
+            fast_to_checksum_address(HexBytes(log["topics"][1])[12:])
+            for log in self.logs
+            if log["topics"] and len(log["topics"]) == 2
+            # topics[0] holds the event "signature"
+            and HexBytes(log["topics"][0]) == SAFE_PROXY_FACTORY_CREATION_EVENT_TOPIC
+        ]
 
 
 class TokenTransferQuerySet(models.QuerySet):
@@ -1388,25 +1411,45 @@ class MultisigTransactionQuerySet(models.QuerySet):
               higher than 7).
         We need to get the previous entry to get the proper threshold at that point before it's changed.
         """
-        threshold_safe_status_query = (
-            SafeStatus.objects.filter(
-                address=OuterRef("safe"),
-                nonce=OuterRef("nonce"),
-            )
-            .order_by("-internal_tx_id")
-            .values("threshold")
+        safe_status = SafeStatus.objects.filter(
+            address=OuterRef("safe"),
+            nonce=OuterRef("nonce"),
         )
 
-        threshold_safe_last_status_query = SafeLastStatus.objects.filter(
-            address=OuterRef("safe")
-        ).values("threshold")
+        threshold_safe_status_query = safe_status.order_by("-internal_tx_id").values(
+            "threshold"
+        )
+
+        safe_last_status = SafeLastStatus.objects.filter(address=OuterRef("safe"))
+        threshold_safe_last_status_query = safe_last_status.values("threshold")
+
+        # As a fallback, if there are no SafeStatus and SafeLastStatus information (maybe due to the Safe
+        # being reprocessed due to a reorg, use the number of confirmations for the transaction
+        confirmations = (
+            MultisigConfirmation.objects.filter(
+                multisig_transaction_id=OuterRef("safe_tx_hash")
+            )
+            .annotate(count=Func(F("owner"), function="Count"))
+            .values("count")
+            .order_by("count")
+        )
 
         threshold_queries = Case(
             When(
-                ethereum_tx__isnull=True,
-                then=Subquery(threshold_safe_last_status_query[:1]),
+                Exists(safe_status),
+                then=Subquery(threshold_safe_status_query[:1]),
             ),
-            default=Subquery(threshold_safe_status_query[:1]),
+            default=Case(
+                When(
+                    Exists(safe_last_status),
+                    then=Subquery(threshold_safe_last_status_query[:1]),
+                ),
+                default=Coalesce(
+                    Subquery(confirmations, output_field=Uint256Field()),
+                    0,
+                    output_field=Uint256Field(),
+                ),
+            ),
         )
 
         return self.annotate(confirmations_required=threshold_queries)
@@ -1439,6 +1482,7 @@ class MultisigTransaction(TimeStampedModel):
     safe_tx_hash = Keccak256Field(primary_key=True)
     safe = EthereumAddressBinaryField(db_index=True)
     proposer = EthereumAddressBinaryField(null=True)
+    proposed_by_delegate = EthereumAddressBinaryField(null=True, blank=True)
     ethereum_tx = models.ForeignKey(
         EthereumTx,
         null=True,
@@ -1756,11 +1800,15 @@ class SafeContractDelegateManager(models.Manager):
         if not owner_addresses:
             return self.none()
 
-        return self.filter(
-            # If safe_contract is null on SafeContractDelegate, delegates are valid for every Safe
-            Q(safe_contract_id=safe_address)
-            | Q(safe_contract=None)
-        ).filter(delegator__in=owner_addresses)
+        return (
+            self.filter(
+                # If safe_contract is null on SafeContractDelegate, delegates are valid for every Safe
+                Q(safe_contract_id=safe_address)
+                | Q(safe_contract=None)
+            )
+            .filter(delegator__in=owner_addresses)
+            .filter(Q(expiry_date__isnull=True) | Q(expiry_date__gt=timezone.now()))
+        )
 
     def get_for_safe_and_delegate(
         self,
@@ -1816,6 +1864,7 @@ class SafeContractDelegate(models.Model):
     label = models.CharField(max_length=50)
     read = models.BooleanField(default=True)  # For permissions in the future
     write = models.BooleanField(default=True)
+    expiry_date = models.DateTimeField(null=True, db_index=True)
 
     class Meta:
         constraints = [
@@ -1927,7 +1976,11 @@ class SafeStatusBase(models.Model):
         """
         SafeStatus nonce must be incremental. If current nonce is bigger than the number of SafeStatus for that Safe
         something is wrong. There could be more SafeStatus than nonce (e.g. a call to a MultiSend
-        adding owners and enabling a Module in the same contract `execTransaction`)
+        adding owners and enabling a Module in the same contract `execTransaction`), but never less.
+
+        However, there's the possibility that there isn't a problem in the indexer. For example,
+        in a L2 network a Safe could be migrated from L1 to L2 and some transactions will never be detected
+        by the indexer.
 
         :return: `True` if corrupted, `False` otherwise
         """
@@ -2143,3 +2196,7 @@ class TransactionServiceEventType(Enum):
     MESSAGE_CREATED = 10
     MESSAGE_CONFIRMATION = 11
     DELETED_MULTISIG_TRANSACTION = 12
+    REORG_DETECTED = 13
+    NEW_DELEGATE = 14
+    UPDATED_DELEGATE = 15
+    DELETED_DELEGATE = 16
