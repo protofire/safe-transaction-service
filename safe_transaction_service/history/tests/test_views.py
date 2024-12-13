@@ -1,7 +1,7 @@
 import json
 import logging
 from unittest import mock
-from unittest.mock import MagicMock, PropertyMock
+from unittest.mock import MagicMock
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
@@ -56,6 +56,7 @@ from .factories import (
     SafeMasterCopyFactory,
     SafeStatusFactory,
 )
+from .mocks.blocks import mocked_blocks
 from .mocks.deployments_mock import (
     mainnet_deployments,
     mainnet_deployments_1_4_1,
@@ -116,11 +117,15 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
     @mock.patch.object(
         EthereumClient,
-        "current_block_number",
-        new_callable=PropertyMock,
-        return_value=2_000,
+        "get_block",
+        return_value=mocked_blocks[0],
     )
-    def test_indexing_view(self, current_block_number_mock: PropertyMock):
+    @mock.patch.object(
+        EthereumClient,
+        "get_blocks",
+        return_value=mocked_blocks[1:],
+    )
+    def test_indexing_view(self, mock_get_blocks: MagicMock, mock_get_block: MagicMock):
         IndexingStatus.objects.set_erc20_721_indexing_status(2_005)
         url = reverse("v1:history:indexing")
         response = self.client.get(url, format="json")
@@ -131,6 +136,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 2_000)
         self.assertEqual(response.data["master_copies_synced"], True)
         self.assertEqual(response.data["synced"], True)
+        # Same block, so they should share the same timestamp
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:23Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
 
         IndexingStatus.objects.set_erc20_721_indexing_status(500)
         response = self.client.get(url, format="json")
@@ -141,6 +154,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 2000)
         self.assertEqual(response.data["master_copies_synced"], True)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         safe_master_copy = SafeMasterCopyFactory(tx_block_number=2000)
         response = self.client.get(url, format="json")
@@ -151,6 +171,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 1999)
         self.assertEqual(response.data["master_copies_synced"], True)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         safe_master_copy.tx_block_number = 600
         safe_master_copy.save(update_fields=["tx_block_number"])
@@ -161,6 +188,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 599)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         IndexingStatus.objects.set_erc20_721_indexing_status(10)
         SafeMasterCopyFactory(tx_block_number=8)
@@ -172,6 +206,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 7)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         SafeMasterCopyFactory(tx_block_number=11)
         response = self.client.get(url, format="json")
@@ -182,6 +223,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 7)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         IndexingStatus.objects.set_erc20_721_indexing_status(2_000)
         SafeMasterCopy.objects.update(tx_block_number=2_000)
@@ -193,6 +241,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 1999)
         self.assertEqual(response.data["master_copies_synced"], True)
         self.assertEqual(response.data["synced"], True)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         SafeMasterCopyFactory(tx_block_number=48)
         response = self.client.get(url, format="json")
@@ -203,6 +258,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 47)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
     # Mock chain id to mainnet
     @mock.patch("safe_transaction_service.history.views.get_chain_id", return_value=1)
@@ -799,6 +861,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertIsNone(response.data["max_fee_per_gas"])
         self.assertIsNone(response.data["max_priority_fee_per_gas"])
         self.assertIsNone(response.data["proposer"])
+        self.assertIsNone(response.data["proposed_by_delegate"])
+
         self.assertEqual(
             response.data["data_decoded"],
             {
@@ -850,6 +914,17 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             format="json",
         )
         self.assertEqual(response.data["proposer"], proposer)
+
+        # Check proposed_by_delegate
+        delegate = Account.create().address
+        multisig_tx.proposed_by_delegate = delegate
+        multisig_tx.save()
+        response = self.client.get(
+            reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
+            format="json",
+        )
+        self.assertEqual(response.data["proposer"], proposer)
+        self.assertEqual(response.data["proposed_by_delegate"], delegate)
 
     def test_delete_multisig_transaction(self):
         owner_account = Account.create()
@@ -1025,6 +1100,20 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(len(response.data["results"]), 1)
         self.assertEqual(len(response.data["results"][0]["confirmations"]), 1)
         self.assertEqual(response.data["results"][0]["proposer"], proposer)
+        self.assertIsNone(response.data["results"][0]["proposed_by_delegate"])
+
+        # Check proposed_by_delegate
+        delegate = Account.create().address
+        multisig_tx.proposed_by_delegate = delegate
+        multisig_tx.save()
+        response = self.client.get(
+            reverse("v1:history:multisig-transactions", args=(safe_address,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 1)
+        self.assertEqual(response.data["results"][0]["proposer"], proposer)
+        self.assertEqual(response.data["results"][0]["proposed_by_delegate"], delegate)
 
         # Check not trusted
         response = self.client.get(
@@ -1327,6 +1416,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertIsNone(response.data["executor"])
         self.assertEqual(len(response.data["confirmations"]), 0)
         self.assertEqual(response.data["proposer"], data["sender"])
+        self.assertIsNone(response.data["proposed_by_delegate"])
 
         # Test confirmation with signature
         data["signature"] = safe_owner_1.signHash(safe_tx.safe_tx_hash)[
@@ -1950,6 +2040,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         # Proposer should be the owner address not the delegate
         self.assertNotEqual(multisig_transaction.proposer, safe_delegate.address)
         self.assertEqual(multisig_transaction.proposer, safe_owners[0].address)
+        self.assertEqual(
+            multisig_transaction.proposed_by_delegate, safe_delegate.address
+        )
 
         data["signature"] = data["signature"] + data["signature"][2:]
         response = self.client.post(
@@ -2101,6 +2194,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             self.assertEqual(safe_contract_delegate.delegator, delegator.address)
             self.assertEqual(safe_contract_delegate.label, label)
             self.assertEqual(safe_contract_delegate.safe_contract_id, safe_address)
+            self.assertEqual(safe_contract_delegate.expiry_date, None)
 
             # Update label
             label = "Jimmy McGill"
@@ -2110,6 +2204,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             self.assertEqual(SafeContractDelegate.objects.count(), 1)
             safe_contract_delegate = SafeContractDelegate.objects.get()
             self.assertEqual(safe_contract_delegate.label, label)
+            self.assertEqual(safe_contract_delegate.expiry_date, None)
 
         # Create delegate without a Safe
         another_label = "Kim Wexler"
@@ -2171,12 +2266,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "delegator": safe_contract_delegate_1.delegator,
                 "label": safe_contract_delegate_1.label,
                 "safe": safe_contract.address,
+                "expiry_date": datetime_to_str(safe_contract_delegate_1.expiry_date),
             },
             {
                 "delegate": safe_contract_delegate_2.delegate,
                 "delegator": safe_contract_delegate_2.delegator,
                 "label": safe_contract_delegate_2.label,
                 "safe": safe_contract.address,
+                "expiry_date": datetime_to_str(safe_contract_delegate_2.expiry_date),
             },
         ]
         response = self.client.get(
@@ -2194,12 +2291,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "delegator": safe_contract_delegate_1.delegator,
                 "label": safe_contract_delegate_1.label,
                 "safe": safe_contract.address,
+                "expiry_date": datetime_to_str(safe_contract_delegate_1.expiry_date),
             },
             {
                 "delegate": safe_contract_delegate_3.delegate,
                 "delegator": safe_contract_delegate_3.delegator,
                 "label": safe_contract_delegate_3.label,
                 "safe": safe_contract_delegate_3.safe_contract_id,
+                "expiry_date": datetime_to_str(safe_contract_delegate_3.expiry_date),
             },
         ]
         response = self.client.get(
@@ -3113,6 +3212,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "factory_address": internal_tx._from,
                 "master_copy": None,
                 "setup_data": None,
+                "salt_nonce": None,
                 "data_decoded": None,
                 "transaction_hash": internal_tx.ethereum_tx_id,
                 "user_operation": None,
@@ -3188,11 +3288,15 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         ):
             # `another_trace_2` should change the `creator` and `master_copy` and `setup_data` should appear
 
-            for test_data, data_decoded in [
-                (create_test_data_v1_0_0, data_decoded_v1_0_0),
-                (create_test_data_v1_1_1, data_decoded_v1_1_1),
-                (create_cpk_test_data, data_decoded_cpk),
-                (create_v1_4_1_test_data, data_decoded_v1_4_1),
+            for test_data, data_decoded, salt_nonce in [
+                (create_test_data_v1_0_0, data_decoded_v1_0_0, None),
+                (create_test_data_v1_1_1, data_decoded_v1_1_1, "3087219459602"),
+                (
+                    create_cpk_test_data,
+                    data_decoded_cpk,
+                    "94030236624644942756909922368015716412234033278725318725234853277280604175973",
+                ),
+                (create_v1_4_1_test_data, data_decoded_v1_4_1, "1694202208610"),
             ]:
                 with self.subTest(test_data=test_data, data_decoded=data_decoded):
                     another_trace_2["action"]["input"] = HexBytes(test_data["data"])
@@ -3213,6 +3317,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                             "factory_address": internal_tx._from,
                             "master_copy": test_data["master_copy"],
                             "setup_data": test_data["setup_data"],
+                            "salt_nonce": salt_nonce,
                             "data_decoded": data_decoded,
                             "user_operation": None,
                         },

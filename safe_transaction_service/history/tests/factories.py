@@ -1,3 +1,4 @@
+import datetime
 from typing import Any, Dict
 
 from django.utils import timezone
@@ -276,6 +277,8 @@ class MultisigTransactionFactory(DjangoModelFactory):
         lambda n: fast_keccak_text(f"multisig-tx-{n}").hex()
     )
     safe = factory.LazyFunction(lambda: Account.create().address)
+    proposer = None
+    proposed_by_delegate = None
     ethereum_tx = factory.SubFactory(EthereumTxFactory)
     to = factory.LazyFunction(lambda: Account.create().address)
     value = FuzzyInteger(low=0, high=10)
@@ -335,6 +338,7 @@ class SafeContractDelegateFactory(DjangoModelFactory):
     label = factory.Faker("name")
     read = True
     write = True
+    expiry_date = timezone.now() + datetime.timedelta(minutes=90)
 
 
 class MonitoredAddressFactory(DjangoModelFactory):

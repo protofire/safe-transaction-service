@@ -28,9 +28,12 @@ logger = logging.getLogger(__name__)
 @dataclass
 class IndexingStatus:
     current_block_number: int
+    current_block_timestamp: int
     erc20_block_number: int
+    erc20_block_timestamp: int
     erc20_synced: bool
     master_copies_block_number: int
+    master_copies_block_timestamp: int
     master_copies_synced: bool
     synced: bool
 
@@ -121,7 +124,8 @@ class IndexService:
         )["min_master_copies_block_number"]
 
     def get_indexing_status(self) -> IndexingStatus:
-        current_block_number = self.ethereum_client.current_block_number
+        current_block = self.ethereum_client.get_block("latest")
+        current_block_number = current_block["number"]
 
         # Indexing points to the next block to be indexed, we need the previous ones
         erc20_block_number = min(
@@ -146,11 +150,24 @@ class IndexService:
             current_block_number - master_copies_block_number <= self.eth_reorg_blocks
         )
 
+        if erc20_block_number == master_copies_block_number == current_block_number:
+            erc20_block, master_copies_block = [current_block, current_block]
+        else:
+            erc20_block, master_copies_block = self.ethereum_client.get_blocks(
+                [erc20_block_number, master_copies_block_number]
+            )
+        current_block_timestamp = current_block["timestamp"]
+        erc20_block_timestamp = erc20_block["timestamp"]
+        master_copies_block_timestamp = master_copies_block["timestamp"]
+
         return IndexingStatus(
             current_block_number=current_block_number,
+            current_block_timestamp=current_block_timestamp,
             erc20_block_number=erc20_block_number,
+            erc20_block_timestamp=erc20_block_timestamp,
             erc20_synced=erc20_synced,
             master_copies_block_number=master_copies_block_number,
+            master_copies_block_timestamp=master_copies_block_timestamp,
             master_copies_synced=master_copies_synced,
             synced=erc20_synced and master_copies_synced,
         )
@@ -315,6 +332,12 @@ class IndexService:
                 ethereum_tx.update_with_block_and_receipt(ethereum_block, tx_receipt)
                 ethereum_txs_dict[ethereum_tx.tx_hash] = ethereum_tx
         logger.debug("Blocks, transactions and receipts were inserted")
+
+        # TODO Remove, this is meant to detect a bug on production
+        for tx_hash, ethereum_tx in ethereum_txs_dict.items():
+            if not ethereum_tx:
+                logger.error("Unexpected missing tx with tx-hash=%s", tx_hash)
+
         return list(ethereum_txs_dict.values())
 
     @transaction.atomic
@@ -414,7 +437,6 @@ class IndexService:
                 safe_address,
                 InternalTxDecoded.objects.pending_for_safe(safe_address)[0].internal_tx,
             )
-            self.tx_processor.clear_cache(safe_address)
 
         # Use chunks for memory issues
         total_processed_txs = 0

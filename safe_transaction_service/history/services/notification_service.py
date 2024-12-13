@@ -1,6 +1,6 @@
 import json
 from datetime import timedelta
-from typing import Any, Dict, List, Type, Union
+from typing import Any, Dict, List, Type, TypedDict, Union
 
 from django.db.models import Model
 from django.utils import timezone
@@ -28,7 +28,12 @@ from safe_transaction_service.utils.ethereum import get_chain_id
 def build_event_payload(
     sender: Type[Model],
     instance: Union[
-        TokenTransfer, InternalTx, MultisigConfirmation, MultisigTransaction
+        TokenTransfer,
+        InternalTx,
+        MultisigConfirmation,
+        MultisigTransaction,
+        SafeMessage,
+        SafeMessageConfirmation,
     ],
     deleted: bool = False,
 ) -> List[Dict[str, Any]]:
@@ -179,3 +184,23 @@ def is_relevant_notification(
     elif instance.created + timedelta(minutes=minutes) < timezone.now():
         return False
     return True
+
+
+class ReorgPayload(TypedDict):
+    type: str
+    blockNumber: int
+    chainId: str
+
+
+def build_reorg_payload(block_number: int) -> ReorgPayload:
+    """
+    Build a reorg payload with the provided block_number and the configured chain_id.
+
+    :param block_number:
+    :return:
+    """
+    return ReorgPayload(
+        type=TransactionServiceEventType.REORG_DETECTED.name,
+        blockNumber=block_number,
+        chainId=str(get_chain_id()),
+    )

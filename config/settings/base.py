@@ -325,6 +325,35 @@ REST_FRAMEWORK = {
     "EXCEPTION_HANDLER": "safe_transaction_service.history.exceptions.custom_exception_handler",
 }
 
+# INDEXER LOG LEVEL
+ERC20_721_INDEXER_LOG_LEVEL = (
+    env("ERC20_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+PROXY_FACTORY_INDEXER_LOG_LEVEL = (
+    env("PROXY_FACTORY_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+SAFE_EVENTS_INDEXER_LOG_LEVEL = (
+    env("SAFE_EVENTS_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+INTERNAL_TX_INDEXER_LOG_LEVEL = (
+    env("INTERNAL_TX_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+# API LOG LEVEL
+API_LOG_LEVEL = env("API_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+BALANCES_API_LOG_LEVEL = (
+    env("BALANCES_API_LOG_LEVEL", default="WARNING") if not DEBUG else "DEBUG"
+)
+MESSAGES_API_LOG_LEVEL = (
+    env("MESSAGES_API_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+ALL_TRANSACTIONS_API_LOG_LEVEL = (
+    env("ALL_TRANSACTIONS_API_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+COLLECTIBLES_API_LOG_LEVEL = (
+    env("COLLECTIBLES_API_LOG_LEVEL", default="WARNING") if not DEBUG else "DEBUG"
+)
+
+
 # LOGGING
 # ------------------------------------------------------------------------------
 # See: https://docs.djangoproject.com/en/dev/ref/settings/#logging
@@ -396,11 +425,58 @@ LOGGING = {
             "handlers": ["console"],
             "propagate": False,
         },
+        # BALANCES LOG
+        "safe_transaction_service.history.views.SafeBalanceView": {
+            "level": BALANCES_API_LOG_LEVEL,
+        },
         "safe_transaction_service.history.services.balance_service": {
-            "level": "DEBUG" if DEBUG else "WARNING",
+            "level": BALANCES_API_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.views_v2.SafeBalanceView": {
+            "level": BALANCES_API_LOG_LEVEL,
+        },
+        # COLLECTIBLES LOG
+        "safe_transaction_service.history.views_v2.SafeCollectiblesView": {
+            "level": COLLECTIBLES_API_LOG_LEVEL,
         },
         "safe_transaction_service.history.services.collectibles_service": {
-            "level": "DEBUG" if DEBUG else "WARNING",
+            "level": COLLECTIBLES_API_LOG_LEVEL,
+        },
+        # ALL-TRANSACTIONS LOG
+        "safe_transaction_service.history.views.AllTransactionsListView": {
+            "level": ALL_TRANSACTIONS_API_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.services.transaction_service": {
+            "level": ALL_TRANSACTIONS_API_LOG_LEVEL,
+        },
+        # MESSAGES_API_LOG_LEVEL: NO LOGS FOR NOW
+        # ERC20_721_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.erc20_events_indexer": {
+            "level": ERC20_721_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_erc20_events_task": {
+            "level": ERC20_721_INDEXER_LOG_LEVEL,
+        },
+        # PROXY_FACTORY_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.proxy_factory_indexer": {
+            "level": PROXY_FACTORY_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_new_proxies_task": {
+            "level": PROXY_FACTORY_INDEXER_LOG_LEVEL,
+        },
+        # SAFE_EVENTS_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.safe_events_indexer": {
+            "level": SAFE_EVENTS_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_safe_events_task": {
+            "level": SAFE_EVENTS_INDEXER_LOG_LEVEL,
+        },
+        # INTERNAL_TX_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.internal_tx_indexer": {
+            "level": INTERNAL_TX_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_internal_txs_task": {
+            "level": INTERNAL_TX_INDEXER_LOG_LEVEL,
         },
         "celery": {
             "handlers": ["console"],
@@ -549,6 +625,12 @@ EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT = env.int(
     "EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT", default=0
 )
 
+# Events and notifications
+# ------------------------------------------------------------------------------
+DISABLE_NOTIFICATIONS_AND_EVENTS = env.bool(
+    "DISABLE_NOTIFICATIONS_AND_EVENTS", default=False
+)  # Increases indexing speed for initial sync by disabling sending notifications and events to the queue
+
 # Cache
 CACHE_ALL_TXS_VIEW = env.int(
     "CACHE_ALL_TXS_VIEW", default=10 * 60
@@ -590,3 +672,15 @@ TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS = env.int(
 
 # Compression level – an integer from 0 to 9. 0 means not compression
 CACHE_ALL_TXS_COMPRESSION_LEVEL = env.int("CACHE_ALL_TXS_COMPRESSION_LEVEL", default=0)
+
+# Contracts reindex batch configuration
+# ------------------------------------------------------------------------------
+# The following configuration prevents overwhelming third-party data sources by controlling the rate of requests.
+# Defines the batch size to limit the number of reindex contracts tasks sent to Celery concurrently.
+REINDEX_CONTRACTS_METADATA_BATCH = env.int(
+    "REINDEX_CONTRACTS_METADATA_BATCH", default=100
+)
+# Defines the delay countdown between batches of reindex contract tasks.
+REINDEX_CONTRACTS_METADATA_COUNTDOWN = env.int(
+    "REINDEX_CONTRACTS_METADATA_COUNTDOWN", default=0
+)
