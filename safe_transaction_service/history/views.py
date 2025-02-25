@@ -271,6 +271,7 @@ class SafeDeploymentsView(ListAPIView):
         ),
     },
 )
+@extend_schema(deprecated=True)
 class AllTransactionsListView(ListAPIView):
     filter_backends = (
         django_filters.rest_framework.DjangoFilterBackend,
@@ -569,6 +570,9 @@ class SafeMultisigConfirmationsView(ListCreateAPIView):
         },
     ),
 )
+@extend_schema(
+    deprecated=True,
+)
 class SafeMultisigTransactionDetailView(RetrieveAPIView):
     """
     Returns a multi-signature transaction given its Safe transaction hash
@@ -587,7 +591,7 @@ class SafeMultisigTransactionDetailView(RetrieveAPIView):
 
     def delete(self, request, safe_tx_hash: HexStr):
         """
-        Removes the queued but not executed multi-signature transaction associated with the given Safe tansaction hash.
+        Removes the queued but not executed multi-signature transaction associated with the given Safe transaction hash.
         Only the proposer or the delegate who proposed the transaction can delete it.
         If the transaction was proposed by a delegate, it must still be a valid delegate for the transaction proposer.
         An EOA is required to sign the following EIP-712 data:
@@ -676,6 +680,7 @@ class SafeMultisigTransactionListView(ListAPIView):
             return serializers.SafeMultisigTransactionSerializer
 
     @extend_schema(
+        deprecated=True,
         tags=["transactions"],
         responses={
             200: OpenApiResponse(
@@ -712,11 +717,11 @@ class SafeMultisigTransactionListView(ListAPIView):
         return response
 
     @extend_schema(
+        deprecated=True,
         tags=["transactions"],
         request=serializers.SafeMultisigTransactionSerializer,
         responses={
             201: OpenApiResponse(
-                response=serializers.SafeMultisigTransactionSerializer,
                 description="Created or signature updated",
             ),
             400: OpenApiResponse(description="Invalid data"),
@@ -1251,7 +1256,9 @@ class SafeMultisigTransactionEstimateView(GenericAPIView):
     )
     def post(self, request, address, *args, **kwargs):
         """
-        Returns the estimated `safeTxGas` for a given Safe address and multi-signature transaction
+        Returns the estimated `safeTxGas` for a given Safe address and multi-signature transaction.
+        Estimation is disabled for L2 networks, as this is only required for Safes with version < 1.3.0
+        and those versions are not supported in L2 networks.
         """
         if not fast_is_checksum_address(address):
             return Response(
