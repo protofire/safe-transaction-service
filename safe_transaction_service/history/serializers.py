@@ -1,11 +1,12 @@
+import datetime
 import itertools
 import json
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from django.http import Http404
+from django.utils import timezone
 
-from drf_yasg.utils import swagger_serializer_method
 from eth_typing import ChecksumAddress
 from rest_framework import serializers
 from rest_framework.exceptions import NotFound, ValidationError
@@ -30,7 +31,10 @@ from safe_transaction_service.contracts.tx_decoder import (
     get_db_tx_decoder,
 )
 from safe_transaction_service.tokens.serializers import TokenInfoResponseSerializer
-from safe_transaction_service.utils.serializers import get_safe_owners
+from safe_transaction_service.utils.serializers import (
+    EpochDateTimeField,
+    get_safe_owners,
+)
 
 from .exceptions import NodeConnectionException
 from .helpers import (
@@ -287,6 +291,7 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
             ):
                 trusted = user.has_perm("history.create_trusted")
 
+        proposed_by_delegate = None
         if self.validated_data["sender"] in self.validated_data["safe_owners"]:
             proposer = self.validated_data["sender"]
         else:
@@ -299,6 +304,7 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
                 .first()
                 .delegator
             )
+            proposed_by_delegate = self.validated_data["sender"]
 
         multisig_transaction, created = MultisigTransaction.objects.get_or_create(
             safe_tx_hash=safe_tx_hash,
@@ -319,6 +325,7 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
                 "origin": origin,
                 "trusted": trusted,
                 "proposer": proposer,
+                "proposed_by_delegate": proposed_by_delegate,
             },
         )
 
@@ -374,6 +381,7 @@ class SafeDelegateResponseSerializer(serializers.Serializer):
     delegate = EthereumAddressField()
     delegator = EthereumAddressField()
     label = serializers.CharField(max_length=50)
+    expiry_date = serializers.DateTimeField()
 
 
 class DelegateSerializerMixin:
@@ -441,6 +449,24 @@ class DelegateSerializerV2(DelegateSerializerMixin, serializers.Serializer):
     delegator = EthereumAddressField()
     signature = HexadecimalField(min_length=65, max_length=MAX_SIGNATURE_LENGTH)
     label = serializers.CharField(max_length=50)
+    expiry_date = serializers.DateTimeField(
+        allow_null=True, required=False, default=None
+    )
+
+    def validate_expiry_date(
+        self, expiry_date: Optional[datetime.datetime]
+    ) -> Optional[datetime.datetime]:
+        """
+        Make sure ``expiry_date`` is not previous to the current timestamp
+
+        :param expiry_date:
+        :return: `expiry_date`
+        """
+        if expiry_date and expiry_date <= timezone.now():
+            raise ValidationError(
+                "`expiry_date` cannot be previous to the current timestamp"
+            )
+        return expiry_date
 
     def validate(self, attrs):
         super().validate(attrs)
@@ -462,12 +488,14 @@ class DelegateSerializerV2(DelegateSerializerMixin, serializers.Serializer):
         delegate = self.validated_data["delegate"]
         delegator = self.validated_data["delegator"]
         label = self.validated_data["label"]
+        expiry_date = self.validated_data["expiry_date"]
         obj, _ = SafeContractDelegate.objects.update_or_create(
             safe_contract_id=safe_address,
             delegate=delegate,
             delegator=delegator,
             defaults={
                 "label": label,
+                "expiry_date": expiry_date,
             },
         )
         return obj
@@ -540,10 +568,26 @@ class SafeMultisigTransactionDeleteSerializer(serializers.Serializer):
                 SafeSignatureType.ETH_SIGN,
             ):
                 raise ValidationError("Only EOA and ETH_SIGN signatures are supported")
-            if safe_signature.owner == proposer:
+
+            # The transaction can be deleted by the proposer or by the delegate user who proposed it.
+            owner = safe_signature.owner
+            if owner == proposer:
                 return attrs
 
-        raise ValidationError("Provided owner is not the proposer of the transaction")
+            proposed_by_delegate = multisig_tx.proposed_by_delegate
+            if proposed_by_delegate and owner == proposed_by_delegate:
+                delegates_for_proposer = (
+                    SafeContractDelegate.objects.get_delegates_for_safe_and_owners(
+                        safe_address, [proposer]
+                    )
+                )
+                # Check if it's still a valid delegate.
+                if owner in delegates_for_proposer:
+                    return attrs
+
+        raise ValidationError(
+            "Provided signer is not the proposer or the delegate user who proposed the transaction"
+        )
 
 
 class DataDecoderSerializer(serializers.Serializer):
@@ -627,6 +671,7 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializer):
     transaction_hash = Sha3HashField(source="ethereum_tx_id")
     safe_tx_hash = Sha3HashField()
     proposer = EthereumAddressField()
+    proposed_by_delegate = EthereumAddressField(allow_null=True)
     executor = serializers.SerializerMethodField()
     value = serializers.CharField()
     is_executed = serializers.BooleanField(source="executed")
@@ -648,9 +693,6 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializer):
         if obj.ethereum_tx_id:
             return obj.ethereum_tx.block_id
 
-    @swagger_serializer_method(
-        serializer_or_field=SafeMultisigConfirmationResponseSerializer
-    )
     def get_confirmations(self, obj: MultisigTransaction) -> Dict[str, Any]:
         """
         Filters confirmations queryset
@@ -702,9 +744,12 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializer):
 
 class IndexingStatusSerializer(serializers.Serializer):
     current_block_number = serializers.IntegerField()
+    current_block_timestamp = EpochDateTimeField()
     erc20_block_number = serializers.IntegerField()
+    erc20_block_timestamp = EpochDateTimeField()
     erc20_synced = serializers.BooleanField()
     master_copies_block_number = serializers.IntegerField()
+    master_copies_block_timestamp = EpochDateTimeField()
     master_copies_synced = serializers.BooleanField()
     synced = serializers.BooleanField()
 
@@ -752,6 +797,7 @@ class SafeCreationInfoResponseSerializer(serializers.Serializer):
     factory_address = EthereumAddressField()
     master_copy = EthereumAddressField(allow_null=True)
     setup_data = HexadecimalField(allow_null=True)
+    salt_nonce = serializers.CharField(allow_null=True)
     data_decoded = serializers.SerializerMethodField()
     user_operation = aa_serializers.UserOperationWithSafeOperationResponseSerializer(
         allow_null=True
@@ -1211,3 +1257,9 @@ class SafeDeploymentContractSerializer(serializers.Serializer):
 class SafeDeploymentSerializer(serializers.Serializer):
     version = serializers.CharField(max_length=10)  # Example 1.3.0
     contracts = SafeDeploymentContractSerializer(many=True)
+
+
+class CodeErrorResponse(serializers.Serializer):
+    code = serializers.IntegerField()
+    message = serializers.CharField()
+    arguments = serializers.ListField()

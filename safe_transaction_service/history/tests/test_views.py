@@ -1,11 +1,13 @@
+import datetime
 import json
 import logging
 from unittest import mock
-from unittest.mock import MagicMock, PropertyMock
+from unittest.mock import MagicMock
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.urls import reverse
+from django.utils import timezone
 
 import eth_abi
 from eth_account import Account
@@ -35,13 +37,20 @@ from ...utils.redis import get_redis
 from ..helpers import DelegateSignatureHelper, DeleteMultisigTxSignatureHelper
 from ..models import (
     IndexingStatus,
+    InternalTx,
+    InternalTxType,
+    ModuleTransaction,
     MultisigConfirmation,
     MultisigTransaction,
     SafeContractDelegate,
     SafeMasterCopy,
 )
 from ..serializers import TransferType
-from ..views import SafeMultisigTransactionListView
+from ..views import (
+    SafeModuleTransactionListView,
+    SafeMultisigTransactionListView,
+    SafeTransferListView,
+)
 from .factories import (
     ERC20TransferFactory,
     ERC721TransferFactory,
@@ -56,6 +65,7 @@ from .factories import (
     SafeMasterCopyFactory,
     SafeStatusFactory,
 )
+from .mocks.blocks import mocked_blocks
 from .mocks.deployments_mock import (
     mainnet_deployments,
     mainnet_deployments_1_4_1,
@@ -90,7 +100,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     def test_swagger_json_schema(self):
-        url = reverse("schema-json", args=(".json",))
+        url = reverse("schema-json") + "?format=json"
         response = self.client.get(url, format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
@@ -116,11 +126,15 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
     @mock.patch.object(
         EthereumClient,
-        "current_block_number",
-        new_callable=PropertyMock,
-        return_value=2_000,
+        "get_block",
+        return_value=mocked_blocks[0],
     )
-    def test_indexing_view(self, current_block_number_mock: PropertyMock):
+    @mock.patch.object(
+        EthereumClient,
+        "get_blocks",
+        return_value=mocked_blocks[1:],
+    )
+    def test_indexing_view(self, mock_get_blocks: MagicMock, mock_get_block: MagicMock):
         IndexingStatus.objects.set_erc20_721_indexing_status(2_005)
         url = reverse("v1:history:indexing")
         response = self.client.get(url, format="json")
@@ -131,6 +145,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 2_000)
         self.assertEqual(response.data["master_copies_synced"], True)
         self.assertEqual(response.data["synced"], True)
+        # Same block, so they should share the same timestamp
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:23Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
 
         IndexingStatus.objects.set_erc20_721_indexing_status(500)
         response = self.client.get(url, format="json")
@@ -141,6 +163,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 2000)
         self.assertEqual(response.data["master_copies_synced"], True)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         safe_master_copy = SafeMasterCopyFactory(tx_block_number=2000)
         response = self.client.get(url, format="json")
@@ -151,6 +180,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 1999)
         self.assertEqual(response.data["master_copies_synced"], True)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         safe_master_copy.tx_block_number = 600
         safe_master_copy.save(update_fields=["tx_block_number"])
@@ -161,6 +197,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 599)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         IndexingStatus.objects.set_erc20_721_indexing_status(10)
         SafeMasterCopyFactory(tx_block_number=8)
@@ -172,6 +215,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 7)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         SafeMasterCopyFactory(tx_block_number=11)
         response = self.client.get(url, format="json")
@@ -182,6 +232,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 7)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         IndexingStatus.objects.set_erc20_721_indexing_status(2_000)
         SafeMasterCopy.objects.update(tx_block_number=2_000)
@@ -193,6 +250,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 1999)
         self.assertEqual(response.data["master_copies_synced"], True)
         self.assertEqual(response.data["synced"], True)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
         SafeMasterCopyFactory(tx_block_number=48)
         response = self.client.get(url, format="json")
@@ -203,6 +267,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["master_copies_block_number"], 47)
         self.assertEqual(response.data["master_copies_synced"], False)
         self.assertEqual(response.data["synced"], False)
+        self.assertEqual(
+            response.data["current_block_timestamp"], "2024-06-03T18:29:23Z"
+        )
+        self.assertEqual(response.data["erc20_block_timestamp"], "2024-06-03T18:29:35Z")
+        self.assertEqual(
+            response.data["master_copies_block_timestamp"], "2024-06-03T18:29:47Z"
+        )
 
     # Mock chain id to mainnet
     @mock.patch("safe_transaction_service.history.views.get_chain_id", return_value=1)
@@ -578,6 +649,19 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 1)
 
+        # Test that the result should be cached
+        # Mock get_queryset with empty queryset return value to get proper error in case of fail
+        with mock.patch.object(
+            SafeModuleTransactionListView,
+            "get_queryset",
+            return_value=ModuleTransaction.objects.none(),
+        ) as patched_queryset:
+            response = self.client.get(url, format="json")
+            # queryset shouldn't be called
+            patched_queryset.assert_not_called()
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], 1)
+
     def test_get_module_transaction(self):
         wrong_module_transaction_id = "wrong_module_transaction_id"
         url = reverse(
@@ -799,6 +883,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertIsNone(response.data["max_fee_per_gas"])
         self.assertIsNone(response.data["max_priority_fee_per_gas"])
         self.assertIsNone(response.data["proposer"])
+        self.assertIsNone(response.data["proposed_by_delegate"])
+
         self.assertEqual(
             response.data["data_decoded"],
             {
@@ -851,6 +937,17 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         self.assertEqual(response.data["proposer"], proposer)
 
+        # Check proposed_by_delegate
+        delegate = Account.create().address
+        multisig_tx.proposed_by_delegate = delegate
+        multisig_tx.save()
+        response = self.client.get(
+            reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
+            format="json",
+        )
+        self.assertEqual(response.data["proposer"], proposer)
+        self.assertEqual(response.data["proposed_by_delegate"], delegate)
+
     def test_delete_multisig_transaction(self):
         owner_account = Account.create()
         safe_tx_hash = fast_keccak_text("random-tx").hex()
@@ -860,7 +957,10 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
         # Add our test MultisigTransaction to the database
-        multisig_transaction = MultisigTransactionFactory(safe_tx_hash=safe_tx_hash)
+        safe = SafeContractFactory()
+        multisig_transaction = MultisigTransactionFactory(
+            safe_tx_hash=safe_tx_hash, safe=safe.address
+        )
 
         # Add other MultisigTransactions to the database to make sure they are not deleted
         MultisigTransactionFactory()
@@ -943,25 +1043,95 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             {
                 "non_field_errors": [
                     ErrorDetail(
-                        string="Provided owner is not the proposer of the transaction",
+                        string="Provided signer is not the proposer or the delegate user who proposed the transaction",
                         code="invalid",
                     )
                 ]
             },
         )
 
-        # Use a proper signature
+        # Calculate a valid message_hash
         message_hash = DeleteMultisigTxSignatureHelper.calculate_hash(
-            multisig_transaction.safe,
+            safe.address,
             safe_tx_hash,
             self.ethereum_client.get_chain_id(),
             previous_totp=False,
         )
-        data = {
-            "signature": owner_account.signHash(message_hash)[
-                "signature"
-            ].hex()  # Random signature
-        }
+
+        # Use an expired user delegate
+        safe_delegate = Account.create()
+        safe_contract_delegate = SafeContractDelegateFactory(
+            safe_contract_id=multisig_transaction.safe,
+            delegate=safe_delegate.address,
+            delegator=owner_account.address,
+            expiry_date=timezone.now() - datetime.timedelta(minutes=1),
+        )
+        multisig_transaction.proposer = owner_account.address
+        multisig_transaction.proposed_by_delegate = safe_delegate.address
+        multisig_transaction.save(update_fields=["proposer", "proposed_by_delegate"])
+        data = {"signature": safe_delegate.signHash(message_hash)["signature"].hex()}
+        response = self.client.delete(url, format="json", data=data)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertDictEqual(
+            response.data,
+            {
+                "non_field_errors": [
+                    ErrorDetail(
+                        string="Provided signer is not the proposer or the delegate user who proposed the transaction",
+                        code="invalid",
+                    )
+                ]
+            },
+        )
+
+        # Use a deleted user delegate
+        safe_contract_delegate.delete()
+        multisig_transaction.proposer = owner_account.address
+        multisig_transaction.proposed_by_delegate = safe_delegate.address
+        multisig_transaction.save(update_fields=["proposer", "proposed_by_delegate"])
+        data = {"signature": safe_delegate.signHash(message_hash)["signature"].hex()}
+        response = self.client.delete(url, format="json", data=data)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertDictEqual(
+            response.data,
+            {
+                "non_field_errors": [
+                    ErrorDetail(
+                        string="Provided signer is not the proposer or the delegate user who proposed the transaction",
+                        code="invalid",
+                    )
+                ]
+            },
+        )
+
+        # Use a proper signature of an user delegate
+        SafeContractDelegateFactory(
+            safe_contract_id=multisig_transaction.safe,
+            delegate=safe_delegate.address,
+            delegator=owner_account.address,
+        )
+        multisig_transaction.proposer = owner_account.address
+        multisig_transaction.proposed_by_delegate = safe_delegate.address
+        multisig_transaction.save(update_fields=["proposer", "proposed_by_delegate"])
+        data = {"signature": safe_delegate.signHash(message_hash)["signature"].hex()}
+        self.assertEqual(MultisigTransaction.objects.count(), 3)
+        self.assertTrue(
+            MultisigTransaction.objects.filter(safe_tx_hash=safe_tx_hash).exists()
+        )
+        response = self.client.delete(url, format="json", data=data)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(MultisigTransaction.objects.count(), 2)
+        self.assertFalse(
+            MultisigTransaction.objects.filter(safe_tx_hash=safe_tx_hash).exists()
+        )
+
+        # Use a proper signature of a proposer user
+        multisig_transaction = MultisigTransactionFactory(
+            safe_tx_hash=safe_tx_hash, safe=safe.address, ethereum_tx=None
+        )
+        multisig_transaction.proposer = owner_account.address
+        multisig_transaction.save(update_fields=["proposer"])
+        data = {"signature": owner_account.signHash(message_hash)["signature"].hex()}
         self.assertEqual(MultisigTransaction.objects.count(), 3)
         self.assertTrue(
             MultisigTransaction.objects.filter(safe_tx_hash=safe_tx_hash).exists()
@@ -1025,6 +1195,20 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(len(response.data["results"]), 1)
         self.assertEqual(len(response.data["results"][0]["confirmations"]), 1)
         self.assertEqual(response.data["results"][0]["proposer"], proposer)
+        self.assertIsNone(response.data["results"][0]["proposed_by_delegate"])
+
+        # Check proposed_by_delegate
+        delegate = Account.create().address
+        multisig_tx.proposed_by_delegate = delegate
+        multisig_tx.save()
+        response = self.client.get(
+            reverse("v1:history:multisig-transactions", args=(safe_address,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(len(response.data["results"]), 1)
+        self.assertEqual(response.data["results"][0]["proposer"], proposer)
+        self.assertEqual(response.data["results"][0]["proposed_by_delegate"], delegate)
 
         # Check not trusted
         response = self.client.get(
@@ -1045,6 +1229,23 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 2)
         self.assertEqual(response.data["count_unique_nonce"], 1)
+
+        #
+        # Mock get_queryset with empty queryset return value to get proper error in case of fail
+        with mock.patch.object(
+            SafeMultisigTransactionListView,
+            "get_queryset",
+            return_value=MultisigTransaction.objects.none(),
+        ) as patched_queryset:
+            response = self.client.get(
+                reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                format="json",
+            )
+            # view shouldn't be called
+            patched_queryset.assert_not_called()
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], 2)
+            self.assertEqual(response.data["count_unique_nonce"], 1)
 
     def test_get_multisig_transactions_unique_nonce(self):
         """
@@ -1115,14 +1316,19 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             ContractFactory(
                 address=multisig_transaction.to, trusted_for_delegate_call=True
             )
-            response = self.client.get(
-                reverse("v1:history:multisig-transactions", args=(safe_address,)),
-                format="json",
-            )
-            self.assertEqual(response.status_code, status.HTTP_200_OK)
-            self.assertEqual(
-                response.data["results"][0]["data_decoded"], {"param1": "value"}
-            )
+            # Force don't use cache because we are not cleaning the cache on contracts change
+            with mock.patch(
+                "safe_transaction_service.history.views.settings.CACHE_VIEW_DEFAULT_TIMEOUT",
+                0,
+            ):
+                response = self.client.get(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                )
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(
+                    response.data["results"][0]["data_decoded"], {"param1": "value"}
+                )
         finally:
             ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
 
@@ -1327,6 +1533,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertIsNone(response.data["executor"])
         self.assertEqual(len(response.data["confirmations"]), 0)
         self.assertEqual(response.data["proposer"], data["sender"])
+        self.assertIsNone(response.data["proposed_by_delegate"])
 
         # Test confirmation with signature
         data["signature"] = safe_owner_1.signHash(safe_tx.safe_tx_hash)[
@@ -1950,6 +2157,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         # Proposer should be the owner address not the delegate
         self.assertNotEqual(multisig_transaction.proposer, safe_delegate.address)
         self.assertEqual(multisig_transaction.proposer, safe_owners[0].address)
+        self.assertEqual(
+            multisig_transaction.proposed_by_delegate, safe_delegate.address
+        )
 
         data["signature"] = data["signature"] + data["signature"][2:]
         response = self.client.post(
@@ -2101,6 +2311,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             self.assertEqual(safe_contract_delegate.delegator, delegator.address)
             self.assertEqual(safe_contract_delegate.label, label)
             self.assertEqual(safe_contract_delegate.safe_contract_id, safe_address)
+            self.assertEqual(safe_contract_delegate.expiry_date, None)
 
             # Update label
             label = "Jimmy McGill"
@@ -2110,6 +2321,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             self.assertEqual(SafeContractDelegate.objects.count(), 1)
             safe_contract_delegate = SafeContractDelegate.objects.get()
             self.assertEqual(safe_contract_delegate.label, label)
+            self.assertEqual(safe_contract_delegate.expiry_date, None)
 
         # Create delegate without a Safe
         another_label = "Kim Wexler"
@@ -2171,12 +2383,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "delegator": safe_contract_delegate_1.delegator,
                 "label": safe_contract_delegate_1.label,
                 "safe": safe_contract.address,
+                "expiry_date": datetime_to_str(safe_contract_delegate_1.expiry_date),
             },
             {
                 "delegate": safe_contract_delegate_2.delegate,
                 "delegator": safe_contract_delegate_2.delegator,
                 "label": safe_contract_delegate_2.label,
                 "safe": safe_contract.address,
+                "expiry_date": datetime_to_str(safe_contract_delegate_2.expiry_date),
             },
         ]
         response = self.client.get(
@@ -2194,12 +2408,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "delegator": safe_contract_delegate_1.delegator,
                 "label": safe_contract_delegate_1.label,
                 "safe": safe_contract.address,
+                "expiry_date": datetime_to_str(safe_contract_delegate_1.expiry_date),
             },
             {
                 "delegate": safe_contract_delegate_3.delegate,
                 "delegator": safe_contract_delegate_3.delegator,
                 "label": safe_contract_delegate_3.label,
                 "safe": safe_contract_delegate_3.safe_contract_id,
+                "expiry_date": datetime_to_str(safe_contract_delegate_3.expiry_date),
             },
         ]
         response = self.client.get(
@@ -2891,13 +3107,26 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         for result in response.data["results"]:
             self.assertEqual(result["type"], TransferType.ETHER_TRANSFER.name)
 
-        response = self.client.get(
-            reverse("v1:history:transfers", args=(safe_address,)) + "?ether=false",
-            format="json",
-        )
+        url = reverse("v1:history:transfers", args=(safe_address,)) + "?ether=false"
+        response = self.client.get(url, format="json")
         self.assertGreater(len(response.data["results"]), 0)
         for result in response.data["results"]:
             self.assertNotEqual(result["type"], TransferType.ETHER_TRANSFER.name)
+
+        # Test that the result should be cached
+        # Mock get_queryset with empty queryset return value to get proper error in case of fail
+        with mock.patch.object(
+            SafeTransferListView,
+            "get_queryset",
+            return_value=InternalTx.objects.none(),
+        ) as patched_queryset:
+            response = self.client.get(url, format="json")
+            # queryset shouldn't be called
+            patched_queryset.assert_not_called()
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertGreater(len(response.data["results"]), 0)
+            for result in response.data["results"]:
+                self.assertNotEqual(result["type"], TransferType.ETHER_TRANSFER.name)
 
     def test_get_transfer_view(self):
         # test wrong random transfer_id
@@ -3100,6 +3329,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 contract_address=safe_address,
                 trace_address="0,0",
                 ethereum_tx__status=1,
+                tx_type=InternalTxType.CREATE.value,
             )
             response = self.client.get(
                 reverse("v1:history:safe-creation", args=(safe_address,)),
@@ -3113,6 +3343,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "factory_address": internal_tx._from,
                 "master_copy": None,
                 "setup_data": None,
+                "salt_nonce": None,
                 "data_decoded": None,
                 "transaction_hash": internal_tx.ethereum_tx_id,
                 "user_operation": None,
@@ -3188,11 +3419,15 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         ):
             # `another_trace_2` should change the `creator` and `master_copy` and `setup_data` should appear
 
-            for test_data, data_decoded in [
-                (create_test_data_v1_0_0, data_decoded_v1_0_0),
-                (create_test_data_v1_1_1, data_decoded_v1_1_1),
-                (create_cpk_test_data, data_decoded_cpk),
-                (create_v1_4_1_test_data, data_decoded_v1_4_1),
+            for test_data, data_decoded, salt_nonce in [
+                (create_test_data_v1_0_0, data_decoded_v1_0_0, None),
+                (create_test_data_v1_1_1, data_decoded_v1_1_1, "3087219459602"),
+                (
+                    create_cpk_test_data,
+                    data_decoded_cpk,
+                    "94030236624644942756909922368015716412234033278725318725234853277280604175973",
+                ),
+                (create_v1_4_1_test_data, data_decoded_v1_4_1, "1694202208610"),
             ]:
                 with self.subTest(test_data=test_data, data_decoded=data_decoded):
                     another_trace_2["action"]["input"] = HexBytes(test_data["data"])
@@ -3213,6 +3448,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                             "factory_address": internal_tx._from,
                             "master_copy": test_data["master_copy"],
                             "setup_data": test_data["setup_data"],
+                            "salt_nonce": salt_nonce,
                             "data_decoded": data_decoded,
                             "user_operation": None,
                         },
