@@ -35,3 +35,4 @@ requests==2.32.3
 git+https://github.com/protofire/safe-eth-py.git@v7.1.1#egg=safe-eth-py
 # safe-eth-py[django]==7.1.1
 web3==7.8.0
+
