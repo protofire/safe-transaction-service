@@ -1,13 +1,16 @@
 import datetime
 import itertools
 import json
+import logging
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from django.http import Http404
 from django.utils import timezone
 
+from drf_spectacular.utils import extend_schema_field
 from eth_typing import ChecksumAddress
+from hexbytes import HexBytes
 from rest_framework import serializers
 from rest_framework.exceptions import NotFound, ValidationError
 from safe_eth.eth import EthereumClient, get_auto_ethereum_client
@@ -24,6 +27,7 @@ from safe_eth.eth.django.serializers import (
 from safe_eth.safe import Safe
 from safe_eth.safe.safe_signature import EthereumBytes, SafeSignature, SafeSignatureType
 from safe_eth.safe.serializers import SafeMultisigTxSerializer
+from safe_eth.util.util import to_0x_hex_str
 
 from safe_transaction_service.account_abstraction import serializers as aa_serializers
 from safe_transaction_service.contracts.tx_decoder import (
@@ -36,7 +40,7 @@ from safe_transaction_service.utils.serializers import (
     get_safe_owners,
 )
 
-from .exceptions import NodeConnectionException
+from .exceptions import InternalValidationError, NodeConnectionException
 from .helpers import (
     DelegateSignatureHelper,
     DelegateSignatureHelperV2,
@@ -53,6 +57,8 @@ from .models import (
     TransferDict,
 )
 from .services.safe_service import SafeCreationInfo
+
+logger = logging.getLogger(__name__)
 
 
 def get_data_decoded_from_data(data: bytes, address: Optional[ChecksumAddress] = None):
@@ -125,7 +131,7 @@ class SafeMultisigConfirmationSerializer(serializers.Serializer):
                 )
             if not safe_signature.is_valid(ethereum_client, safe_address):
                 raise ValidationError(
-                    f"Signature={safe_signature.signature.hex()} for owner={owner} is not valid"
+                    f"Signature={to_0x_hex_str(safe_signature.signature)} for owner={owner} is not valid"
                 )
             if owner in signature_owners:
                 raise ValidationError(f"Signature for owner={owner} is duplicated")
@@ -139,7 +145,7 @@ class SafeMultisigConfirmationSerializer(serializers.Serializer):
         multisig_confirmations = []
         parsed_signatures = SafeSignature.parse_signature(signature, safe_tx_hash)
         for safe_signature in parsed_signatures:
-            multisig_confirmation, _ = MultisigConfirmation.objects.get_or_create(
+            multisig_confirmation, created = MultisigConfirmation.objects.get_or_create(
                 multisig_transaction_hash=safe_tx_hash,
                 owner=safe_signature.owner,
                 defaults={
@@ -147,6 +153,9 @@ class SafeMultisigConfirmationSerializer(serializers.Serializer):
                     "signature": safe_signature.export_signature(),
                     "signature_type": safe_signature.signature_type.value,
                 },
+            )
+            logger.info(
+                multisig_confirmation.to_log(f"{'Created' if created else 'Updated'}")
             )
             multisig_confirmations.append(multisig_confirmation)
 
@@ -203,8 +212,8 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
         # Check safe tx hash matches
         if safe_tx_hash != attrs["contract_transaction_hash"]:
             raise ValidationError(
-                f"Contract-transaction-hash={safe_tx_hash.hex()} "
-                f'does not match provided contract-tx-hash={attrs["contract_transaction_hash"].hex()}'
+                f"Contract-transaction-hash={to_0x_hex_str(safe_tx_hash)} "
+                f'does not match provided contract-tx-hash={to_0x_hex_str(attrs["contract_transaction_hash"])}'
             )
 
         # Check there's not duplicated tx with same `nonce` or same `safeTxHash` for the same Safe.
@@ -214,9 +223,9 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
         ).executed()
         if multisig_transactions:
             for multisig_transaction in multisig_transactions:
-                if multisig_transaction.safe_tx_hash == safe_tx_hash.hex():
+                if multisig_transaction.safe_tx_hash == to_0x_hex_str(safe_tx_hash):
                     raise ValidationError(
-                        f"Tx with safe-tx-hash={safe_tx_hash.hex()} "
+                        f"Tx with safe-tx-hash={to_0x_hex_str(safe_tx_hash)} "
                         f"for safe={safe_address} was already executed in "
                         f"tx-hash={multisig_transaction.ethereum_tx_id}"
                     )
@@ -252,7 +261,7 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
             owner = safe_signature.owner
             if not safe_signature.is_valid(ethereum_client, safe_address):
                 raise ValidationError(
-                    f"Signature={safe_signature.signature.hex()} for owner={owner} is not valid"
+                    f"Signature={to_0x_hex_str(safe_signature.signature)} for owner={owner} is not valid"
                 )
 
             if owner in delegates and len(parsed_signatures) > 1:
@@ -334,16 +343,27 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
             multisig_transaction.trusted = trusted
             multisig_transaction.save(update_fields=["origin", "trusted"])
 
+        logger.info(
+            multisig_transaction.to_log(f"{"Created" if created else "Updated"}")
+        )
+
         for safe_signature in self.validated_data.get("parsed_signatures"):
             if safe_signature.owner in self.validated_data["safe_owners"]:
-                MultisigConfirmation.objects.get_or_create(
-                    multisig_transaction_hash=safe_tx_hash,
-                    owner=safe_signature.owner,
-                    defaults={
-                        "multisig_transaction": multisig_transaction,
-                        "signature": safe_signature.export_signature(),
-                        "signature_type": safe_signature.signature_type.value,
-                    },
+                multisig_confirmation, created = (
+                    MultisigConfirmation.objects.get_or_create(
+                        multisig_transaction_hash=safe_tx_hash,
+                        owner=safe_signature.owner,
+                        defaults={
+                            "multisig_transaction": multisig_transaction,
+                            "signature": safe_signature.export_signature(),
+                            "signature_type": safe_signature.signature_type.value,
+                        },
+                    )
+                )
+                logger.info(
+                    multisig_confirmation.to_log(
+                        f"{'Created' if created else 'Updated'}"
+                    )
                 )
         return multisig_transaction
 
@@ -630,9 +650,7 @@ class SafeModuleTransactionResponseSerializer(GnosisBaseModelSerializer):
         )
 
     def get_data_decoded(self, obj: ModuleTransaction) -> Dict[str, Any]:
-        return get_data_decoded_from_data(
-            obj.data.tobytes() if obj.data else b"", address=obj.to
-        )
+        return get_data_decoded_from_data(obj.data if obj.data else b"", address=obj.to)
 
     def get_is_successful(self, obj: ModuleTransaction) -> bool:
         return not obj.failed
@@ -687,7 +705,7 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializer):
     confirmations_required = serializers.IntegerField()
     confirmations = serializers.SerializerMethodField()
     trusted = serializers.BooleanField()
-    signatures = HexadecimalField(allow_null=True, required=False)
+    signatures = serializers.SerializerMethodField()
 
     def get_block_number(self, obj: MultisigTransaction) -> Optional[int]:
         if obj.ethereum_tx_id:
@@ -699,9 +717,104 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializer):
         :param obj: MultisigConfirmation instance
         :return: Serialized queryset
         """
-        return SafeMultisigConfirmationResponseSerializer(
+        if obj.ethereum_tx_id:
+            return SafeMultisigConfirmationResponseSerializer(
+                obj.confirmations, many=True
+            ).data
+
+        signature_owners_addresses = []
+        safe_address = obj.safe
+        safe_tx_hash = obj.safe_tx_hash
+        safe_owners = get_safe_owners(safe_address)
+
+        ethereum_client = get_auto_ethereum_client()
+        safe = Safe(safe_address, ethereum_client)
+        safe_tx = safe.build_multisig_tx(
+            obj.to,
+            obj.value,
+            obj.data,
+            obj.operation,
+            obj.safe_tx_gas,
+            obj.base_gas,
+            obj.gas_price,
+            obj.gas_token,
+            obj.refund_receiver,
+            safe_nonce=obj.nonce,
+        )
+
+        # Check safe tx hash matches
+        safe_tx_hash_calculated = safe_tx.safe_tx_hash
+        if safe_tx_hash_calculated != HexBytes(safe_tx_hash):
+            logger.error(
+                obj.to_log(
+                    f"Wrong contract-transaction-hash={to_0x_hex_str(safe_tx_hash_calculated)}"
+                )
+            )
+            raise InternalValidationError(
+                f"[{safe_tx_hash}]: Wrong contract-transaction-hash={to_0x_hex_str(safe_tx_hash_calculated)}"
+            )
+
+        serialized_confirmations = SafeMultisigConfirmationResponseSerializer(
             obj.confirmations, many=True
         ).data
+        for multisig_confirmation in serialized_confirmations:
+            owner = multisig_confirmation["owner"]
+            signature = multisig_confirmation["signature"]
+            if owner not in safe_owners:
+                logger.error(
+                    obj.to_log(
+                        f"Signer={owner} is not an owner. Current owners={safe_owners}"
+                    )
+                )
+                raise InternalValidationError(
+                    f"[{safe_tx_hash}]: Signer={owner} is not an owner. Current owners={safe_owners}"
+                )
+            parsed_signatures = SafeSignature.parse_signature(
+                signature,
+                safe_tx_hash,
+                safe_hash_preimage=safe_tx.safe_tx_hash_preimage,
+            )
+            if len(parsed_signatures) != 1:
+                logger.error(
+                    obj.to_log(
+                        f"1 owner signature was expected for owner {owner}, {len(parsed_signatures)} received"
+                    )
+                )
+                raise InternalValidationError(
+                    f"1 owner signature was expected for owner {owner}, {len(parsed_signatures)} received"
+                )
+            parsed_signature = parsed_signatures[0]
+            if not parsed_signature.is_valid(ethereum_client, safe_address):
+                logger.error(
+                    obj.to_log(
+                        f"Signature={to_0x_hex_str(parsed_signature.signature)} for owner={owner} is not valid"
+                    )
+                )
+                raise InternalValidationError(
+                    f"Signature={to_0x_hex_str(parsed_signature.signature)} for owner={owner} is not valid"
+                )
+            if parsed_signature.owner != owner:
+                logger.error(
+                    obj.to_log(
+                        f"Signature owner {parsed_signature.owner} does not match confirmation owner={owner}"
+                    )
+                )
+                raise InternalValidationError(
+                    f"Signature owner {parsed_signature.owner} does not match confirmation owner={owner}"
+                )
+            if owner in signature_owners_addresses:
+                logger.error(
+                    obj.to_log(
+                        f"[{safe_tx_hash}]: Signature for owner={owner} is duplicated"
+                    )
+                )
+                raise InternalValidationError(
+                    f"[{safe_tx_hash}]: Signature for owner={owner} is duplicated"
+                )
+
+            signature_owners_addresses.append(owner)
+
+        return serialized_confirmations
 
     def get_executor(self, obj: MultisigTransaction) -> Optional[str]:
         if obj.ethereum_tx_id:
@@ -738,8 +851,28 @@ class SafeMultisigTransactionResponseSerializer(SafeMultisigTxSerializer):
         # If delegate call contract must be whitelisted (security)
         if obj.data_should_be_decoded():
             return get_data_decoded_from_data(
-                obj.data.tobytes() if obj.data else b"", address=obj.to
+                obj.data if obj.data else b"", address=obj.to
             )
+
+    @extend_schema_field(HexadecimalField(allow_null=True, required=False))
+    def get_signatures(self, obj: MultisigTransaction):
+        if obj.signatures and obj.ethereum_tx is None:
+            safe_tx_hash = obj.safe_tx_hash
+            logger.error(
+                obj.to_log("Transaction hash is required when providing signatures")
+            )
+            raise InternalValidationError(
+                f"[{safe_tx_hash}]: Transaction hash is required when providing signatures"
+            )
+        return to_0x_hex_str(obj.signatures) if obj.signatures is not None else None
+
+
+class SafeMultisigTransactionResponseSerializerV2(
+    SafeMultisigTransactionResponseSerializer
+):
+    nonce = serializers.CharField()
+    base_gas = serializers.CharField()
+    safe_tx_gas = serializers.CharField()
 
 
 class IndexingStatusSerializer(serializers.Serializer):
@@ -809,7 +942,7 @@ class SafeCreationInfoResponseSerializer(serializers.Serializer):
 
 class SafeInfoResponseSerializer(serializers.Serializer):
     address = EthereumAddressField()
-    nonce = serializers.IntegerField()
+    nonce = serializers.CharField()
     threshold = serializers.IntegerField()
     owners = serializers.ListField(child=EthereumAddressField())
     master_copy = EthereumAddressField()
@@ -961,6 +1094,16 @@ class SafeMultisigTransactionWithTransfersResponseSerializer(
         return TxType.MULTISIG_TRANSACTION.name
 
 
+class SafeMultisigTransactionWithTransfersResponseSerializerV2(
+    SafeMultisigTransactionResponseSerializerV2
+):
+    transfers = TransferWithTokenInfoResponseSerializer(many=True)
+    tx_type = serializers.SerializerMethodField()
+
+    def get_tx_type(self, obj):
+        return TxType.MULTISIG_TRANSACTION.name
+
+
 class EthereumTxWithTransfersResponseSerializer(serializers.Serializer):
     class Meta:
         model = EthereumTx
@@ -999,6 +1142,16 @@ class AllTransactionsSchemaSerializer(serializers.Serializer):
 
     tx_type_1 = SafeModuleTransactionWithTransfersResponseSerializer()
     tx_type_2 = SafeMultisigTransactionWithTransfersResponseSerializer()
+    tx_type_3 = EthereumTxWithTransfersResponseSerializer()
+
+
+class AllTransactionsSchemaSerializerV2(serializers.Serializer):
+    """
+    Just for the purpose of documenting, don't use it
+    """
+
+    tx_type_1 = SafeModuleTransactionWithTransfersResponseSerializer()
+    tx_type_2 = SafeMultisigTransactionWithTransfersResponseSerializerV2()
     tx_type_3 = EthereumTxWithTransfersResponseSerializer()
 
 

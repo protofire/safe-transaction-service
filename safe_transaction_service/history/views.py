@@ -273,6 +273,7 @@ class SafeDeploymentsView(ListAPIView):
         ),
     },
 )
+@extend_schema(deprecated=True)
 class AllTransactionsListView(ListAPIView):
     filter_backends = (
         django_filters.rest_framework.DjangoFilterBackend,
@@ -556,6 +557,10 @@ class SafeMultisigConfirmationsView(ListCreateAPIView):
         given Safe transaction hash. Multiple signatures can be submitted at once. This endpoint
         does not support the use of delegates to make transactions trusted.
         """
+        logger.info(
+            f"Add request confirmation for {self.kwargs["safe_tx_hash"]}"
+            f"signature={request.data.get('signature')}"
+        )
         return super().post(request, *args, **kwargs)
 
 
@@ -570,6 +575,9 @@ class SafeMultisigConfirmationsView(ListCreateAPIView):
             400: OpenApiResponse(description="Error processing data"),
         },
     ),
+)
+@extend_schema(
+    deprecated=True,
 )
 class SafeMultisigTransactionDetailView(RetrieveAPIView):
     """
@@ -589,7 +597,7 @@ class SafeMultisigTransactionDetailView(RetrieveAPIView):
 
     def delete(self, request, safe_tx_hash: HexStr):
         """
-        Removes the queued but not executed multi-signature transaction associated with the given Safe tansaction hash.
+        Removes the queued but not executed multi-signature transaction associated with the given Safe transaction hash.
         Only the proposer or the delegate who proposed the transaction can delete it.
         If the transaction was proposed by a delegate, it must still be a valid delegate for the transaction proposer.
         An EOA is required to sign the following EIP-712 data:
@@ -678,6 +686,7 @@ class SafeMultisigTransactionListView(ListAPIView):
             return serializers.SafeMultisigTransactionSerializer
 
     @extend_schema(
+        deprecated=True,
         tags=["transactions"],
         responses={
             200: OpenApiResponse(
@@ -714,11 +723,11 @@ class SafeMultisigTransactionListView(ListAPIView):
         return response
 
     @extend_schema(
+        deprecated=True,
         tags=["transactions"],
         request=serializers.SafeMultisigTransactionSerializer,
         responses={
             201: OpenApiResponse(
-                response=serializers.SafeMultisigTransactionSerializer,
                 description="Created or signature updated",
             ),
             400: OpenApiResponse(description="Invalid data"),
@@ -746,7 +755,7 @@ class SafeMultisigTransactionListView(ListAPIView):
 
         request.data["safe"] = address
         serializer = self.get_serializer(data=request.data)
-
+        logger.info(f"POST MultisigTransaction: {request.data}")
         if not serializer.is_valid():
             return Response(
                 status=status.HTTP_422_UNPROCESSABLE_ENTITY, data=serializer.errors
@@ -1253,7 +1262,9 @@ class SafeMultisigTransactionEstimateView(GenericAPIView):
     )
     def post(self, request, address, *args, **kwargs):
         """
-        Returns the estimated `safeTxGas` for a given Safe address and multi-signature transaction
+        Returns the estimated `safeTxGas` for a given Safe address and multi-signature transaction.
+        Estimation is disabled for L2 networks, as this is only required for Safes with version < 1.3.0
+        and those versions are not supported in L2 networks.
         """
         if not fast_is_checksum_address(address):
             return Response(
