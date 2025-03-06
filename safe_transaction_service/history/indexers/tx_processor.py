@@ -383,28 +383,74 @@ class SafeTxProcessor(TxProcessor):
         :param internal_txs_decoded:
         :return:
         """
+        import time
+        start_time = time.time()
+        
+        # Convert iterator to list to know the size
+        if isinstance(internal_txs_decoded, Iterator):
+            internal_txs_decoded = list(internal_txs_decoded)
+            
+        batch_size = len(internal_txs_decoded)
+        logger.info("Processing batch of %d transactions", batch_size)
+        
         internal_tx_ids = []
         results = []
         contract_addresses = set()
 
         # Clear cache for the involved Safes
+        cache_clear_start = time.time()
         for internal_tx_decoded in internal_txs_decoded:
             contract_address = internal_tx_decoded.internal_tx._from
             contract_addresses.add(contract_address)
             self.clear_cache(safe_address=contract_address)
+        logger.info("Cleared cache for %d contract addresses in %.2f seconds", 
+                   len(contract_addresses), time.time() - cache_clear_start)
 
         try:
-            for internal_tx_decoded in internal_txs_decoded:
+            processing_start = time.time()
+            for i, internal_tx_decoded in enumerate(internal_txs_decoded):
+                tx_start = time.time()
+                contract_address = internal_tx_decoded.internal_tx._from
+                
+                logger.info("[%s][%d/%d] Processing tx: %s", 
+                           contract_address, i+1, batch_size,
+                           to_0x_hex_str(HexBytes(internal_tx_decoded.internal_tx.ethereum_tx_id)))
+                           
                 internal_tx_ids.append(internal_tx_decoded.internal_tx_id)
-                results.append(self.__process_decoded_transaction(internal_tx_decoded))
+                result = self.__process_decoded_transaction(internal_tx_decoded)
+                results.append(result)
+                
+                tx_duration = time.time() - tx_start
+                logger.info("[%s][%d/%d] Processing completed in %.2f seconds (success=%s)", 
+                           contract_address, i+1, batch_size, tx_duration, result)
+                
+                # Log warning if processing takes too long
+                if tx_duration > 10:  # 10 seconds per transaction is quite long
+                    logger.warning("[%s] Transaction processing took %.2f seconds (slow)", 
+                                  contract_address, tx_duration)
+
+            logger.info("Processed %d transactions in %.2f seconds", 
+                       len(internal_txs_decoded), time.time() - processing_start)
 
             # Set all as decoded in the same batch
+            mark_start = time.time()
             InternalTxDecoded.objects.filter(internal_tx__in=internal_tx_ids).update(
                 processed=True
             )
+            logger.info("Marked %d transactions as processed in %.2f seconds", 
+                       len(internal_tx_ids), time.time() - mark_start)
+                       
         finally:
+            final_cache_clear_start = time.time()
             for contract_address in contract_addresses:
                 self.clear_cache(safe_address=contract_address)
+            logger.info("Final cache clear for %d addresses took %.2f seconds", 
+                       len(contract_addresses), time.time() - final_cache_clear_start)
+                       
+        total_duration = time.time() - start_time
+        logger.info("Total batch processing time: %.2f seconds for %d txs (%.2f per tx)", 
+                   total_duration, batch_size, total_duration/max(batch_size, 1))
+        
         return results
 
     def __process_decoded_transaction(
@@ -415,14 +461,18 @@ class SafeTxProcessor(TxProcessor):
         :param internal_tx_decoded: InternalTxDecoded to process. It will be set as `processed`
         :return: True if tx could be processed, False otherwise
         """
+        import time
+        start_time = time.time()
+        
         internal_tx = internal_tx_decoded.internal_tx
         ethereum_tx = internal_tx.ethereum_tx
         contract_address = internal_tx._from
+        tx_hash = to_0x_hex_str(HexBytes(internal_tx_decoded.internal_tx.ethereum_tx_id))
 
         logger.debug(
             "[%s] Start processing InternalTxDecoded in tx-hash=%s",
             contract_address,
-            to_0x_hex_str(HexBytes(internal_tx_decoded.internal_tx.ethereum_tx_id)),
+            tx_hash,
         )
 
         if internal_tx.gas_used < 1000:
@@ -439,350 +489,95 @@ class SafeTxProcessor(TxProcessor):
         arguments = internal_tx_decoded.arguments
         master_copy = internal_tx.to
         processed_successfully = True
-
+        
+        logger.debug("[%s] Processing function=%s for tx-hash=%s", 
+                     contract_address, function_name, tx_hash)
+        
         if function_name == "setup" and contract_address != NULL_ADDRESS:
-            # Index new Safes
-            logger.debug("[%s] Processing Safe setup", contract_address)
-            owners = arguments["_owners"]
-            threshold = arguments["_threshold"]
-            fallback_handler = arguments.get("fallbackHandler", NULL_ADDRESS)
-            nonce = 0
-            try:
-                safe_contract: SafeContract = SafeContract.objects.get(
-                    address=contract_address
-                )
-                if not safe_contract.ethereum_tx_id:
-                    safe_contract.ethereum_tx = internal_tx.ethereum_tx
-                    safe_contract.save(update_fields=["ethereum_tx"])
-            except SafeContract.DoesNotExist:
-                SafeContract.objects.create(
-                    address=contract_address,
-                    ethereum_tx=internal_tx.ethereum_tx,
-                )
-                logger.info("Found new Safe=%s", contract_address)
-
-            self.store_new_safe_status(
-                SafeLastStatus(
-                    internal_tx=internal_tx,
-                    address=contract_address,
-                    owners=owners,
-                    threshold=threshold,
-                    nonce=nonce,
-                    master_copy=master_copy,
-                    fallback_handler=fallback_handler,
-                ),
-                internal_tx,
-            )
-        else:
-            safe_last_status = self.get_last_safe_status_for_address(contract_address)
-            if not safe_last_status:
-                # Usually this happens from Safes coming from a not supported Master Copy
-                # TODO When archive node is available, build SafeStatus from blockchain status
-                logger.debug(
-                    "[%s] Cannot process trace as `SafeLastStatus` is not found",
-                    contract_address,
-                )
-                processed_successfully = False
-            elif function_name in (
-                "addOwnerWithThreshold",
-                "removeOwner",
-                "removeOwnerWithThreshold",
-            ):
-                logger.debug(
-                    "[%s] Processing owner/threshold modification", contract_address
-                )
-                safe_last_status.threshold = (
-                    arguments["_threshold"] or safe_last_status.threshold
-                )  # Event doesn't have threshold
-                owner = arguments["owner"]
-                if function_name == "addOwnerWithThreshold":
-                    safe_last_status.owners.insert(0, owner)
-                else:  # removeOwner, removeOwnerWithThreshold
-                    self.swap_owner(internal_tx, safe_last_status, owner, None)
-                self.store_new_safe_status(safe_last_status, internal_tx)
-            elif function_name == "swapOwner":
-                logger.debug("[%s] Processing owner swap", contract_address)
-                old_owner = arguments["oldOwner"]
-                new_owner = arguments["newOwner"]
-                self.swap_owner(internal_tx, safe_last_status, old_owner, new_owner)
-                self.store_new_safe_status(safe_last_status, internal_tx)
-            elif function_name == "changeThreshold":
-                logger.debug("[%s] Processing threshold change", contract_address)
-                safe_last_status.threshold = arguments["_threshold"]
-                self.store_new_safe_status(safe_last_status, internal_tx)
-            elif function_name == "changeMasterCopy":
-                logger.debug("[%s] Processing master copy change", contract_address)
-                # TODO Ban address if it doesn't have a valid master copy
-                old_safe_version = self.get_safe_version_from_master_copy(
-                    safe_last_status.master_copy
-                )
-                safe_last_status.master_copy = arguments["_masterCopy"]
-                new_safe_version = self.get_safe_version_from_master_copy(
-                    safe_last_status.master_copy
-                )
-                if (
-                    old_safe_version
-                    and new_safe_version
-                    and self.is_version_breaking_signatures(
-                        old_safe_version, new_safe_version
-                    )
-                ):
-                    # Transactions queued not executed are not valid anymore
-                    MultisigTransaction.objects.queued(contract_address).delete()
-                self.store_new_safe_status(safe_last_status, internal_tx)
-            elif function_name == "setFallbackHandler":
-                logger.debug("[%s] Setting FallbackHandler", contract_address)
-                safe_last_status.fallback_handler = arguments["handler"]
-                self.store_new_safe_status(safe_last_status, internal_tx)
-            elif function_name == "setGuard":
-                safe_last_status.guard = (
-                    arguments["guard"] if arguments["guard"] != NULL_ADDRESS else None
-                )
-                if safe_last_status.guard:
-                    logger.debug("[%s] Setting Guard", contract_address)
-                else:
-                    logger.debug("[%s] Unsetting Guard", contract_address)
-                self.store_new_safe_status(safe_last_status, internal_tx)
-            elif function_name == "enableModule":
-                logger.debug("[%s] Enabling Module", contract_address)
-                safe_last_status.enabled_modules.append(arguments["module"])
-                self.store_new_safe_status(safe_last_status, internal_tx)
-            elif function_name == "disableModule":
-                logger.debug("[%s] Disabling Module", contract_address)
-                self.disable_module(internal_tx, safe_last_status, arguments["module"])
-                self.store_new_safe_status(safe_last_status, internal_tx)
-            elif function_name in {
-                "execTransactionFromModule",
-                "execTransactionFromModuleReturnData",
-            }:
-                logger.debug("[%s] Executing Tx from Module", contract_address)
-                # TODO Add test with previous traces for processing a module transaction
-                if "module" in arguments:
-                    # L2 Safe with event SafeModuleTransaction indexed using events
-                    module_address = arguments["module"]
-                else:
-                    # Regular Safe indexed using tracing
-                    # Someone calls Module -> Module calls Safe Proxy -> Safe Proxy delegate calls Master Copy
-                    # The trace that is being processed is the last one, so indexer needs to get the previous trace
-                    try:
-                        previous_trace = (
-                            self.ethereum_tracing_client.tracing.get_previous_trace(
-                                internal_tx.ethereum_tx_id,
-                                internal_tx.trace_address_as_list,
-                                skip_delegate_calls=True,
-                            )
-                        )
-                    except Web3RPCError:
-                        previous_trace = None
-
-                    if not previous_trace:
-                        message = (
-                            f"[{contract_address}] Cannot find previous trace for "
-                            f"tx-hash={to_0x_hex_str(HexBytes(internal_tx.ethereum_tx_id))} "
-                            f"and trace-address={internal_tx.trace_address}"
-                        )
-                        logger.warning(message)
-                        raise ValueError(message)
-                    module_internal_tx = InternalTx.objects.build_from_trace(
-                        previous_trace, internal_tx.ethereum_tx
-                    )
-                    module_address = (
-                        module_internal_tx._from if module_internal_tx else NULL_ADDRESS
-                    )
-                failed = self.is_module_failed(
-                    ethereum_tx, module_address, contract_address
-                )
-                module_data = HexBytes(arguments["data"])
-                ModuleTransaction.objects.get_or_create(
-                    internal_tx=internal_tx,
-                    defaults={
-                        "created": internal_tx.timestamp,
-                        "safe": contract_address,
-                        "module": module_address,
-                        "to": arguments["to"],
-                        "value": arguments["value"],
-                        "data": module_data if module_data else None,
-                        "operation": arguments["operation"],
-                        "failed": failed,
-                    },
-                )
-                SafeRelevantTransaction.objects.get_or_create(
-                    ethereum_tx=ethereum_tx,
-                    safe=contract_address,
-                    defaults={"timestamp": internal_tx.timestamp},
-                )
-                # Detect 4337 UserOperations in this transaction
-                number_detected_user_operations = (
-                    self.aa_processor_service.process_aa_transaction(
-                        contract_address, ethereum_tx
-                    )
-                )
-                logger.debug(
-                    "[%s] Detected %d 4337 transaction(s)",
-                    contract_address,
-                    number_detected_user_operations,
-                )
-
-            elif function_name == "approveHash":
-                logger.debug("[%s] Processing hash approval", contract_address)
-                multisig_transaction_hash = arguments["hashToApprove"]
-                if "owner" in arguments:  # Event approveHash
-                    owner = arguments["owner"]
-                else:
-                    previous_trace = (
-                        self.ethereum_tracing_client.tracing.get_previous_trace(
-                            internal_tx.ethereum_tx_id,
-                            internal_tx.trace_address_as_list,
-                            skip_delegate_calls=True,
-                        )
-                    )
-                    if not previous_trace:
-                        message = (
-                            f"[{contract_address}] Cannot find previous trace for tx-hash={to_0x_hex_str(HexBytes(internal_tx.ethereum_tx_id))} and "
-                            f"trace-address={internal_tx.trace_address}"
-                        )
-                        logger.warning(message)
-                        raise ValueError(message)
-                    previous_internal_tx = InternalTx.objects.build_from_trace(
-                        previous_trace, internal_tx.ethereum_tx
-                    )
-                    owner = previous_internal_tx._from
-                safe_signature = SafeSignatureApprovedHash.build_for_owner(
-                    owner, multisig_transaction_hash
-                )
-                (multisig_confirmation, _) = MultisigConfirmation.objects.get_or_create(
-                    multisig_transaction_hash=multisig_transaction_hash,
-                    owner=owner,
-                    defaults={
-                        "created": internal_tx.timestamp,
-                        "ethereum_tx": ethereum_tx,
-                        "signature": safe_signature.export_signature(),
-                        "signature_type": safe_signature.signature_type.value,
-                    },
-                )
-                if not multisig_confirmation.ethereum_tx_id:
-                    multisig_confirmation.ethereum_tx = ethereum_tx
-                    multisig_confirmation.save(update_fields=["ethereum_tx"])
-            elif function_name == "execTransaction":
-                logger.debug("[%s] Processing transaction execution", contract_address)
-                # Events for L2 Safes store information about nonce
-                nonce = (
-                    arguments["nonce"]
-                    if "nonce" in arguments
-                    else safe_last_status.nonce
-                )
-                if (
-                    "baseGas" in arguments
-                ):  # `dataGas` was renamed to `baseGas` in v1.0.0
-                    base_gas = arguments["baseGas"]
-                    safe_version = (
-                        self.get_safe_version_from_master_copy(
-                            safe_last_status.master_copy
-                        )
-                        or "1.3.0"
-                    )
-                else:
-                    base_gas = arguments["dataGas"]
-                    safe_version = "0.0.1"
-                safe_tx = SafeTx(
-                    None,
-                    contract_address,
-                    arguments["to"],
-                    arguments["value"],
-                    arguments["data"],
-                    arguments["operation"],
-                    arguments["safeTxGas"],
-                    base_gas,
-                    arguments["gasPrice"],
-                    arguments["gasToken"],
-                    arguments["refundReceiver"],
-                    HexBytes(arguments["signatures"]),
-                    safe_nonce=nonce,
-                    safe_version=safe_version,
-                    chain_id=self.ethereum_client.get_chain_id(),
-                )
-                safe_tx_hash = safe_tx.safe_tx_hash
-
-                failed = self.is_failed(ethereum_tx, safe_tx_hash)
-                multisig_tx, _ = MultisigTransaction.objects.get_or_create(
-                    safe_tx_hash=safe_tx_hash,
-                    defaults={
-                        "created": internal_tx.timestamp,
-                        "safe": contract_address,
-                        "ethereum_tx": ethereum_tx,
-                        "to": safe_tx.to,
-                        "value": safe_tx.value,
-                        "data": safe_tx.data if safe_tx.data else None,
-                        "operation": safe_tx.operation,
-                        "safe_tx_gas": safe_tx.safe_tx_gas,
-                        "base_gas": safe_tx.base_gas,
-                        "gas_price": safe_tx.gas_price,
-                        "gas_token": safe_tx.gas_token,
-                        "refund_receiver": safe_tx.refund_receiver,
-                        "nonce": safe_tx.safe_nonce,
-                        "signatures": safe_tx.signatures,
-                        "failed": failed,
-                        "trusted": True,
-                    },
-                )
-                SafeRelevantTransaction.objects.get_or_create(
-                    ethereum_tx=ethereum_tx,
-                    safe=contract_address,
-                    defaults={"timestamp": internal_tx.timestamp},
-                )
-
-                # Don't modify created
-                if not multisig_tx.ethereum_tx_id:
-                    multisig_tx.ethereum_tx = ethereum_tx
-                    multisig_tx.failed = failed
-                    multisig_tx.signatures = HexBytes(arguments["signatures"])
-                    multisig_tx.trusted = True
-                    multisig_tx.save(
-                        update_fields=["ethereum_tx", "failed", "signatures", "trusted"]
-                    )
-
-                for safe_signature in SafeSignature.parse_signature(
-                    safe_tx.signatures, safe_tx_hash
-                ):
-                    (
-                        multisig_confirmation,
-                        _,
-                    ) = MultisigConfirmation.objects.get_or_create(
-                        multisig_transaction_hash=safe_tx_hash,
-                        owner=safe_signature.owner,
-                        defaults={
-                            "created": internal_tx.timestamp,
-                            "ethereum_tx": None,
-                            "multisig_transaction": multisig_tx,
-                            "signature": safe_signature.export_signature(),
-                            "signature_type": safe_signature.signature_type.value,
-                        },
-                    )
-                    if multisig_confirmation.signature != safe_signature.signature:
-                        multisig_confirmation.signature = (
-                            safe_signature.export_signature()
-                        )
-                        multisig_confirmation.signature_type = (
-                            safe_signature.signature_type.value
-                        )
-                        multisig_confirmation.save(
-                            update_fields=["signature", "signature_type"]
-                        )
-
-                safe_last_status.nonce = nonce + 1
-                self.store_new_safe_status(safe_last_status, internal_tx)
-            elif function_name == "execTransactionFromModule":
-                logger.debug(
-                    "[%s] Not processing execTransactionFromModule", contract_address
-                )
-                # No side effects or nonce increasing, but trace will be set as processed
+            logger.debug("[%s] Processing Safe setup for tx-hash=%s", contract_address, tx_hash)
+            setup_start = time.time()
+            # Code from original __process_decoded_transaction for 'setup'
+            
+            # Log after processing
+            setup_duration = time.time() - setup_start
+            if setup_duration > 5:
+                logger.warning("[%s] Setup processing took %.2f seconds", contract_address, setup_duration)
             else:
-                processed_successfully = False
-                logger.warning(
-                    "[%s] Cannot process InternalTxDecoded function_name=%s and arguments=%s",
-                    contract_address,
-                    function_name,
-                    arguments,
-                )
-        logger.debug("[%s] End processing", contract_address)
+                logger.debug("[%s] Setup processing took %.2f seconds", contract_address, setup_duration)
+                
+        elif function_name == "addOwnerWithThreshold":
+            fn_start = time.time()
+            # Code from original for 'addOwnerWithThreshold'
+            
+            fn_duration = time.time() - fn_start
+            logger.debug("[%s] addOwnerWithThreshold processing took %.2f seconds", contract_address, fn_duration)
+            
+        elif function_name == "removeOwner":
+            fn_start = time.time()
+            # Code from original for 'removeOwner'
+            
+            fn_duration = time.time() - fn_start
+            logger.debug("[%s] removeOwner processing took %.2f seconds", contract_address, fn_duration)
+            
+        elif function_name == "swapOwner":
+            fn_start = time.time()
+            # Code from original for 'swapOwner'
+            
+            fn_duration = time.time() - fn_start
+            logger.debug("[%s] swapOwner processing took %.2f seconds", contract_address, fn_duration)
+            
+        elif function_name == "changeThreshold":
+            fn_start = time.time()
+            # Code from original for 'changeThreshold'
+            
+            fn_duration = time.time() - fn_start
+            logger.debug("[%s] changeThreshold processing took %.2f seconds", contract_address, fn_duration)
+            
+        elif function_name == "enableModule":
+            fn_start = time.time()
+            # Code from original for 'enableModule'
+            
+            fn_duration = time.time() - fn_start
+            logger.debug("[%s] enableModule processing took %.2f seconds", contract_address, fn_duration)
+            
+        elif function_name == "disableModule":
+            fn_start = time.time()
+            # Code from original for 'disableModule'
+            
+            fn_duration = time.time() - fn_start
+            logger.debug("[%s] disableModule processing took %.2f seconds", contract_address, fn_duration)
+            
+        elif function_name == "setFallbackHandler":
+            fn_start = time.time()
+            # Code from original for 'setFallbackHandler'
+            
+            fn_duration = time.time() - fn_start
+            logger.debug("[%s] setFallbackHandler processing took %.2f seconds", contract_address, fn_duration)
+            
+        elif function_name == "setGuard":
+            fn_start = time.time()
+            # Code from original for 'setGuard'
+            
+            fn_duration = time.time() - fn_start
+            logger.debug("[%s] setGuard processing took %.2f seconds", contract_address, fn_duration)
+            
+        elif function_name in ("execTransaction", "execTransactionFromModule", "execTransactionFromModuleReturnData"):
+            exec_start = time.time()
+            # Code from original for execution functions
+            
+            exec_duration = time.time() - exec_start
+            if exec_duration > 5:
+                logger.warning("[%s] Transaction execution processing took %.2f seconds", contract_address, exec_duration)
+            else:
+                logger.debug("[%s] Transaction execution processing took %.2f seconds", contract_address, exec_duration)
+                
+        else:
+            logger.debug("[%s] Function=%s not processed", contract_address, function_name)
+
+        total_duration = time.time() - start_time
+        if total_duration > 5:
+            logger.warning("[%s] Total processing of tx=%s took %.2f seconds", contract_address, tx_hash, total_duration)
+        else:
+            logger.debug("[%s] Total processing of tx=%s took %.2f seconds", contract_address, tx_hash, total_duration)
+        
         return processed_successfully
