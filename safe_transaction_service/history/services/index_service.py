@@ -454,31 +454,75 @@ class IndexService:
         :param safe_address:
         :return: Number of `InternalTxDecoded` processed
         """
-
+        import time
+        start_time = time.time()
+        logger.info("[%s] Starting process_decoded_txs", safe_address)
+        
         # Check if a new decoded tx appeared before other already processed (due to a reindex)
         if self.processing_enable_out_of_order_check:
-            if InternalTxDecoded.objects.out_of_order_for_safe(safe_address):
+            out_of_order_check_start = time.time()
+            out_of_order = InternalTxDecoded.objects.out_of_order_for_safe(safe_address)
+            logger.info("[%s] out_of_order_check took %.2f seconds, result=%s", 
+                        safe_address, time.time() - out_of_order_check_start, out_of_order)
+                        
+            if out_of_order:
                 logger.error("[%s] Found out of order transactions", safe_address)
+                fix_start_time = time.time()
+                first_pending = InternalTxDecoded.objects.pending_for_safe(safe_address)[0].internal_tx
+                logger.info("[%s] Retrieved first pending tx in %.2f seconds", 
+                          safe_address, time.time() - fix_start_time)
+                
                 self.fix_out_of_order(
                     safe_address,
-                    InternalTxDecoded.objects.pending_for_safe(safe_address)[
-                        0
-                    ].internal_tx,
+                    first_pending,
                 )
+                logger.info("[%s] fix_out_of_order completed in %.2f seconds", 
+                          safe_address, time.time() - fix_start_time)
 
         # Use chunks for memory issues
         total_processed_txs = 0
+        batch_counter = 0
         while True:
+            query_start_time = time.time()
             internal_txs_decoded_queryset = InternalTxDecoded.objects.pending_for_safe(
                 safe_address
             )[: self.eth_internal_tx_decoded_process_batch]
-            if not internal_txs_decoded_queryset:
+            query_duration = time.time() - query_start_time
+            
+            # Count results without evaluating the full queryset
+            count = len(internal_txs_decoded_queryset)
+            logger.info("[%s] Batch %d: Retrieved %d pending txs in %.2f seconds", 
+                      safe_address, batch_counter, count, query_duration)
+            
+            if not count:
                 break
-            total_processed_txs += len(
+                
+            process_start_time = time.time()
+            processed_count = len(
                 self.tx_processor.process_decoded_transactions(
                     internal_txs_decoded_queryset
                 )
             )
+            process_duration = time.time() - process_start_time
+            
+            total_processed_txs += processed_count
+            logger.info("[%s] Batch %d: Processed %d/%d txs in %.2f seconds (%.2f per tx)", 
+                      safe_address, batch_counter, processed_count, count, 
+                      process_duration, process_duration/max(processed_count, 1))
+            
+            batch_counter += 1
+            
+            # Check for timeout approaching
+            elapsed = time.time() - start_time
+            if elapsed > 800:  # 800 seconds = ~13.3 minutes (leaving buffer before 15 min timeout)
+                logger.warning("[%s] Approaching timeout after %.2f seconds, processed %d txs in %d batches", 
+                             safe_address, elapsed, total_processed_txs, batch_counter)
+                break
+                
+        total_duration = time.time() - start_time
+        logger.info("[%s] Completed processing %d txs in %.2f seconds across %d batches", 
+                  safe_address, total_processed_txs, total_duration, batch_counter)
+        
         return total_processed_txs
 
     def reprocess_addresses(self, addresses: List[ChecksumAddress]):
