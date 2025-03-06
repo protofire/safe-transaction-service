@@ -327,39 +327,79 @@ class EthereumIndexer(ABC):
             and (1 + to_block_number - from_block_number) == self.block_process_limit
         ):
             # Auto adjustment disabled
+            logger.debug(
+                "%s: Auto block limit adjustment disabled for blocks %d to %d, block_process_limit=%d, range=%d",
+                self.__class__.__name__,
+                from_block_number,
+                to_block_number,
+                self.block_process_limit,
+                (to_block_number - from_block_number + 1)
+            )
             yield
         else:
             start = int(time.time())
+            logger.info(
+                "%s: Starting timed block processing for blocks %d to %d (range of %d blocks)",
+                self.__class__.__name__,
+                from_block_number,
+                to_block_number,
+                (to_block_number - from_block_number + 1)
+            )
             yield
             delta = int(time.time()) - start
+            logger.info(
+                "%s: Completed processing blocks %d to %d in %d seconds",
+                self.__class__.__name__,
+                from_block_number,
+                to_block_number,
+                delta
+            )
+            
+            old_block_process_limit = self.block_process_limit
+            
             if delta > 30:
                 self.block_process_limit = max(self.block_process_limit // 2, 1)
                 logger.info(
-                    "%s: block_process_limit halved to %d",
+                    "%s: Processing took >30s (%ds), block_process_limit halved from %d to %d",
                     self.__class__.__name__,
+                    delta,
+                    old_block_process_limit,
                     self.block_process_limit,
                 )
             elif delta > 10:
                 new_block_process_limit = max(self.block_process_limit - 20, 1)
                 self.block_process_limit = new_block_process_limit
                 logger.info(
-                    "%s: block_process_limit decreased to %d",
+                    "%s: Processing took >10s (%ds), block_process_limit decreased from %d to %d",
                     self.__class__.__name__,
+                    delta,
+                    old_block_process_limit,
                     self.block_process_limit,
                 )
             elif delta < 2:
                 self.block_process_limit *= 2
                 logger.info(
-                    "%s: block_process_limit duplicated to %d",
+                    "%s: Processing took <2s (%ds), block_process_limit duplicated from %d to %d",
                     self.__class__.__name__,
+                    delta,
+                    old_block_process_limit,
                     self.block_process_limit,
                 )
             elif delta < 5:
                 self.block_process_limit += 20
                 logger.info(
-                    "%s: block_process_limit increased to %d",
+                    "%s: Processing took <5s (%ds), block_process_limit increased from %d to %d",
                     self.__class__.__name__,
+                    delta,
+                    old_block_process_limit,
                     self.block_process_limit,
+                )
+            else:
+                logger.info(
+                    "%s: Processing took %ds, block_process_limit unchanged at %d",
+                    self.__class__.__name__,
+                    delta,
+                    self.block_process_limit
                 )
 
             if (
@@ -378,56 +418,114 @@ class EthereumIndexer(ABC):
         self,
         addresses: set[ChecksumAddress],
         current_block_number: Optional[int] = None,
-    ) -> Tuple[Sequence[Any], Optional[int], int, bool]:
+    ) -> Tuple[List[Any], Optional[int], Optional[int], bool]:
         """
-        Find and process relevant data for `addresses`, then store and return it
+        Find and process relevant data for `addresses` from the last time they were processed until now
+        If a new entity (e.g. Safe) is created, it processes all the data from the beginning
 
         :param addresses: Addresses to process
         :param current_block_number: To prevent fetching it again
-        :return: Tuple with a sequence of `processed data`, `first_block_number` processed,`last_block_number` processed
-            and `True` if no more blocks to scan, `False` otherwise
+        :return: Tuple(List of elements processed, from_block_number, to_block_number, whether all addresses were processed or not)
         """
-        assert addresses, "Addresses cannot be empty!"
-
+        start_time = time.time()
+        logger.debug(
+            "%s: Processing %d addresses",
+            self.__class__.__name__,
+            len(addresses),
+        )
+        updated = True
         current_block_number = (
             current_block_number or self.ethereum_client.current_block_number
         )
-        parameters = self.get_block_numbers_for_search(addresses, current_block_number)
-        if parameters is None:
-            return [], None, current_block_number, True
-        from_block_number, to_block_number = parameters
 
-        updated = to_block_number == (current_block_number - self.confirmations)
+        block_numbers = self.get_block_numbers_for_search(
+            addresses, current_block_number=current_block_number
+        )
+        if not block_numbers:
+            logger.debug(
+                "%s: No addresses to process", self.__class__.__name__
+            )
+            return [], None, None, updated
 
+        from_block_number, to_block_number = block_numbers
+
+        logger.info(
+            "%s: Searching for events from block-number=%d to block-number=%d - %d blocks",
+            self.__class__.__name__,
+            from_block_number,
+            to_block_number,
+            to_block_number - from_block_number + 1,
+        )
+
+        # Optimize block range using binary search if there was an error
         try:
+            find_relevant_elements_start_time = time.time()
             elements = self.find_relevant_elements(
                 addresses,
                 from_block_number,
                 to_block_number,
                 current_block_number=current_block_number,
             )
-            processed_elements = self.process_elements(elements)
-        except (
-            FindRelevantElementsException,
-            SoftTimeLimitExceeded,
-            Timeout,
-            ValueError,
-        ) as e:
-            self.block_process_limit = 1  # Set back to the very minimum
+            find_relevant_elements_duration = time.time() - find_relevant_elements_start_time
             logger.info(
-                "%s: block_process_limit set back to %d",
+                "%s: find_relevant_elements took %.2f seconds for blocks %d to %d",
                 self.__class__.__name__,
-                self.block_process_limit,
+                find_relevant_elements_duration,
+                from_block_number,
+                to_block_number,
             )
-            raise e
+            if not elements:
+                logger.debug(
+                    "%s: No elements were found for addresses=%s from-block=%d to-block=%d",
+                    self.__class__.__name__,
+                    addresses,
+                    from_block_number,
+                    to_block_number,
+                )
+        except (FindRelevantElementsException, SoftTimeLimitExceeded) as e:
+            if (
+                from_block_number == to_block_number
+                or not self.block_auto_process_limit
+            ):  # Cannot be optimized anymore
+                raise e
+            else:
+                logger.warning(
+                    "%s: FindRelevantElementsException when processing from-block=%d to-block=%d: %s",
+                    self.__class__.__name__,
+                    from_block_number,
+                    to_block_number,
+                    e,
+                )
+                self.block_process_limit = self.block_process_limit // 2 or 1
+                logger.warning(
+                    "%s: Halving block_process_limit to %d",
+                    self.__class__.__name__,
+                    self.block_process_limit,
+                )
+                return [], None, None, False
 
-        if not self.update_monitored_addresses(
-            addresses, from_block_number, to_block_number
-        ):
-            raise ValueError(
-                "Possible reorg, indexed addresses were updated while indexer was running"
+        process_elements_start_time = time.time()
+        processed_elements = self.process_elements(elements)
+        process_elements_duration = time.time() - process_elements_start_time
+        logger.info(
+            "%s: process_elements took %.2f seconds for %d elements",
+            self.__class__.__name__,
+            process_elements_duration,
+            len(elements),
+        )
+
+        # Update the last indexed block for the addresses
+        if addresses and to_block_number:
+            self.database_queryset.filter(address__in=addresses).update(
+                **{self.database_field: to_block_number}
             )
 
+        process_addresses_duration = time.time() - start_time
+        logger.info(
+            "%s: process_addresses took %.2f seconds total",
+            self.__class__.__name__,
+            process_addresses_duration,
+        )
         return processed_elements, from_block_number, to_block_number, updated
 
     def start(self) -> Tuple[int, int]:
@@ -436,6 +534,7 @@ class EthereumIndexer(ABC):
 
         :return: (number of elements processed, number of blocks processed)
         """
+        start_time = time.time()
         current_block_number = self.ethereum_client.current_block_number
         logger.debug(
             "%s: Current RPC block number=%d",
@@ -448,15 +547,23 @@ class EthereumIndexer(ABC):
         to_block_number: Optional[int] = None
 
         # First process addresses that are almost updated (usually close to the `current_block_number`)
-        if almost_updated_addresses := self.get_almost_updated_addresses(
-            current_block_number
-        ):
+        almost_updated_addresses_start_time = time.time()
+        almost_updated_addresses = self.get_almost_updated_addresses(current_block_number)
+        logger.info(
+            "%s: Got %d almost updated addresses in %.2f seconds",
+            self.__class__.__name__,
+            len(almost_updated_addresses),
+            time.time() - almost_updated_addresses_start_time
+        )
+        
+        if almost_updated_addresses:
             logger.info(
                 "%s: Processing almost updated addresses",
                 self.__class__.__name__,
             )
             updated = False
             while not updated:
+                process_addresses_start_time = time.time()
                 (
                     processed_elements,
                     from_block_number,
@@ -466,11 +573,13 @@ class EthereumIndexer(ABC):
                     almost_updated_addresses,
                     current_block_number=current_block_number,
                 )
+                process_addresses_duration = time.time() - process_addresses_start_time
                 number_processed_elements = len(processed_elements)
-                logger.debug(
-                    "%s: Processed %d elements for almost updated addresses. From-block-number=%s to-block-number=%d",
+                logger.info(
+                    "%s: Processed %d elements for almost updated addresses in %.2f seconds. From-block-number=%s to-block-number=%d",
                     self.__class__.__name__,
                     number_processed_elements,
+                    process_addresses_duration,
                     from_block_number,  # Can be None
                     to_block_number,
                 )
@@ -484,9 +593,16 @@ class EthereumIndexer(ABC):
             )
 
         # Then process addresses that are not updated (usually far from the `current_block_number`)
-        if not_updated_addresses := self.get_not_updated_addresses(
-            current_block_number
-        ):
+        not_updated_addresses_start_time = time.time()
+        not_updated_addresses = self.get_not_updated_addresses(current_block_number)
+        logger.info(
+            "%s: Got %d not updated addresses in %.2f seconds",
+            self.__class__.__name__,
+            len(not_updated_addresses),
+            time.time() - not_updated_addresses_start_time
+        )
+        
+        if not_updated_addresses:
             logger.info(
                 "%s: Processing not updated addresses",
                 self.__class__.__name__,
@@ -494,6 +610,7 @@ class EthereumIndexer(ABC):
 
             updated = False
             while not updated:
+                process_addresses_start_time = time.time()
                 (
                     processed_elements,
                     from_block_number,
@@ -503,14 +620,16 @@ class EthereumIndexer(ABC):
                     not_updated_addresses,
                     current_block_number=current_block_number,
                 )
+                process_addresses_duration = time.time() - process_addresses_start_time
                 if start_block is None or from_block_number < start_block:
                     start_block = from_block_number
 
                 number_processed_elements = len(processed_elements)
-                logger.debug(
-                    "%s: Processed %d elements for not updated addresses. From-block-number=%s to-block-number=%d",
+                logger.info(
+                    "%s: Processed %d elements for not updated addresses in %.2f seconds. From-block-number=%s to-block-number=%d",
                     self.__class__.__name__,
                     number_processed_elements,
+                    process_addresses_duration,
                     from_block_number,  # Can be None
                     to_block_number,
                 )
@@ -527,4 +646,12 @@ class EthereumIndexer(ABC):
         else:
             number_of_blocks_processed = 0
 
+        total_time = time.time() - start_time
+        logger.info(
+            "%s: Total processing time: %.2f seconds, processed %d elements across %d blocks",
+            self.__class__.__name__,
+            total_time,
+            total_number_processed_elements,
+            number_of_blocks_processed
+        )
         return total_number_processed_elements, number_of_blocks_processed

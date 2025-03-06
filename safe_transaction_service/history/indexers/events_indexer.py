@@ -2,6 +2,7 @@ from abc import abstractmethod
 from functools import cached_property
 from logging import getLogger
 from typing import Any, Dict, List, Optional, OrderedDict, Sequence
+import time
 
 from django.conf import settings
 
@@ -94,6 +95,7 @@ class EventsIndexer(EthereumIndexer):
         :param to_block_number:
         :return:
         """
+        start_time = time.time()
         filter_topics = list(self.events_to_listen.keys())
         parameters: FilterParams = {
             "fromBlock": from_block_number,
@@ -101,13 +103,34 @@ class EventsIndexer(EthereumIndexer):
             "topics": [filter_topics],
         }
 
+        logger.info(
+            "%s: Making eth_getLogs request from block %d to %d - %d blocks, with %d topics",
+            self.__class__.__name__,
+            from_block_number,
+            to_block_number,
+            to_block_number - from_block_number + 1,
+            len(filter_topics)
+        )
+
         if not self.IGNORE_ADDRESSES_ON_LOG_FILTER:
             # Search logs only for the provided addresses, otherwise all the events will be
             # retrieved and then filtering will happen here
             if self.query_chunk_size:
                 addresses_chunks = chunks(list(addresses), self.query_chunk_size)
+                logger.info(
+                    "%s: Splitting %d addresses into %d chunks of size %d",
+                    self.__class__.__name__,
+                    len(addresses),
+                    len(list(addresses_chunks)),
+                    self.query_chunk_size
+                )
             else:
                 addresses_chunks = [addresses]
+                logger.info(
+                    "%s: Using all %d addresses in a single chunk",
+                    self.__class__.__name__,
+                    len(addresses)
+                )
 
             multiple_parameters = [
                 {**parameters, "address": addresses_chunk}
@@ -124,13 +147,65 @@ class EventsIndexer(EthereumIndexer):
 
             with self.auto_adjust_block_limit(from_block_number, to_block_number):
                 # Check how long the first job takes
+                first_job_start = time.time()
+                logger.info(
+                    "%s: Starting first eth_getLogs job out of %d total jobs",
+                    self.__class__.__name__,
+                    len(jobs)
+                )
                 gevent.joinall(jobs[:1])
+                first_job_duration = time.time() - first_job_start
+                logger.info(
+                    "%s: First eth_getLogs job completed in %.2f seconds",
+                    self.__class__.__name__,
+                    first_job_duration
+                )
 
-            gevent.joinall(jobs)
-            return [log_receipt for job in jobs for log_receipt in job.get()]
+            remaining_jobs_start = time.time()
+            logger.info(
+                "%s: Starting remaining %d eth_getLogs jobs",
+                self.__class__.__name__,
+                len(jobs) - 1
+            )
+            gevent.joinall(jobs[1:])
+            remaining_jobs_duration = time.time() - remaining_jobs_start
+            logger.info(
+                "%s: Remaining eth_getLogs jobs completed in %.2f seconds",
+                self.__class__.__name__,
+                remaining_jobs_duration
+            )
+
+            results = [log_receipt for job in jobs for log_receipt in job.get()]
+            total_time = time.time() - start_time
+            logger.info(
+                "%s: Total eth_getLogs query time: %.2f seconds, found %d log receipts",
+                self.__class__.__name__,
+                total_time,
+                len(results)
+            )
+            return results
         else:
+            start_query_time = time.time()
+            logger.info(
+                "%s: Making single eth_getLogs query without address filtering",
+                self.__class__.__name__
+            )
             with self.auto_adjust_block_limit(from_block_number, to_block_number):
-                return self.ethereum_client.slow_w3.eth.get_logs(parameters)
+                results = self.ethereum_client.slow_w3.eth.get_logs(parameters)
+            query_time = time.time() - start_query_time
+            logger.info(
+                "%s: Single eth_getLogs query completed in %.2f seconds, found %d log receipts",
+                self.__class__.__name__,
+                query_time,
+                len(results)
+            )
+            total_time = time.time() - start_time
+            logger.info(
+                "%s: Total eth_getLogs processing time: %.2f seconds",
+                self.__class__.__name__,
+                total_time
+            )
+            return results
 
     def _find_elements_using_topics(
         self,
@@ -148,8 +223,31 @@ class EventsIndexer(EthereumIndexer):
         """
 
         try:
-            return self._do_node_query(addresses, from_block_number, to_block_number)
+            start_time = time.time()
+            logger.info(
+                "%s: Finding elements using topics for %d addresses from block %d to %d",
+                self.__class__.__name__,
+                len(addresses),
+                from_block_number,
+                to_block_number
+            )
+            results = self._do_node_query(addresses, from_block_number, to_block_number)
+            total_time = time.time() - start_time
+            logger.info(
+                "%s: Found %d elements using topics in %.2f seconds",
+                self.__class__.__name__,
+                len(results),
+                total_time
+            )
+            return results
         except IOError as e:
+            logger.error(
+                "%s: IOError when retrieving events from block %d to %d: %s",
+                self.__class__.__name__,
+                from_block_number,
+                to_block_number,
+                str(e)
+            )
             raise FindRelevantElementsException(
                 f"Request error retrieving events "
                 f"from-block={from_block_number} to-block={to_block_number}"
@@ -199,19 +297,22 @@ class EventsIndexer(EthereumIndexer):
             to_block_number,
             len_addresses,
         )
+        start_time = time.time()
         log_receipts = self._find_elements_using_topics(
             addresses, from_block_number, to_block_number
         )
-
+        query_time = time.time() - start_time
+        
         len_log_receipts = len(log_receipts)
         logger_fn = logger.info if len_log_receipts else logger.debug
         logger_fn(
-            "%s: Found %d events from block-number=%d to block-number=%d for %d addresses",
+            "%s: Found %d events from block-number=%d to block-number=%d for %d addresses in %.2f seconds",
             self.__class__.__name__,
             len_log_receipts,
             from_block_number,
             to_block_number,
             len_addresses,
+            query_time
         )
         return log_receipts
 
@@ -243,10 +344,25 @@ class EventsIndexer(EthereumIndexer):
         :return: Decode `log_receipts` and return a list of `EventData`. If a `log_receipt` cannot be decoded
             `EventData` it will be skipped
         """
+        start_time = time.time()
+        logger.info(
+            "%s: Decoding %d log receipts",
+            self.__class__.__name__,
+            len(log_receipts)
+        )
         decoded_elements = []
         for log_receipt in log_receipts:
             if decoded_element := self.decode_element(log_receipt):
                 decoded_elements.append(decoded_element)
+        
+        decode_time = time.time() - start_time
+        logger.info(
+            "%s: Decoded %d elements out of %d log receipts in %.2f seconds",
+            self.__class__.__name__,
+            len(decoded_elements),
+            len(log_receipts),
+            decode_time
+        )
         return decoded_elements
 
     def _process_decoded_elements(self, decoded_elements: List[EventData]) -> List[Any]:
