@@ -22,7 +22,7 @@ class Migration(migrations.Migration):
             model_name="internaltxdecoded",
             index=models.Index(
                 fields=["processed", "internal_tx_id"],
-                name="history_decoded_processed_internal_tx_idx",
+                name="history_dec_proc_itx_idx",
             ),
         ),
         # Add index to optimize the subquery performance - with included id column
@@ -30,7 +30,7 @@ class Migration(migrations.Migration):
             model_name="internaltx",
             index=models.Index(
                 fields=["_from", "block_number"],
-                name="history_int_from_block_with_id_idx",
+                name="history_int_from_blk_id_idx",
                 include=["id"],
             ),
         ),

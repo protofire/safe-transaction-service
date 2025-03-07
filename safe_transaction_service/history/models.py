@@ -1063,7 +1063,7 @@ class InternalTx(models.Model):
             ),
             # Include id for better join performance
             Index(
-                name="history_int_from_block_with_id_idx",
+                name="history_int_from_blk_id_idx",
                 fields=["_from", "block_number"],
                 include=["id"],
             ),
@@ -1252,7 +1252,7 @@ class InternalTxDecoded(models.Model):
                 condition=Q(processed=False),
             ),
             models.Index(
-                name="history_decoded_processed_internal_tx_idx",
+                name="history_dec_proc_itx_idx",
                 fields=["processed", "internal_tx_id"],
             ),
         ]
