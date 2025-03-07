@@ -1056,6 +1056,17 @@ class InternalTx(models.Model):
                 include=["ethereum_tx_id", "block_number"],
                 condition=Q(call_type=0) & Q(value__gt=0),
             ),
+            # Optimize transaction processing on _from and block_number
+            Index(
+                name="history_int_from_block_idx",
+                fields=["_from", "block_number"],
+            ),
+            # Include id for better join performance
+            Index(
+                name="history_int_from_block_with_id_idx",
+                fields=["_from", "block_number"],
+                include=["id"],
+            ),
         ]
 
     def __str__(self):
@@ -1239,7 +1250,11 @@ class InternalTxDecoded(models.Model):
                 name="history_decoded_processed_idx",
                 fields=["processed"],
                 condition=Q(processed=False),
-            )
+            ),
+            models.Index(
+                name="history_decoded_processed_internal_tx_idx",
+                fields=["processed", "internal_tx_id"],
+            ),
         ]
         verbose_name_plural = "Internal txs decoded"
 
