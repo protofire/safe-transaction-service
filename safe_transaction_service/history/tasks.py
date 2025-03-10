@@ -5,6 +5,7 @@ import json
 import random
 from typing import Optional, Tuple
 
+from django.conf import settings
 from django.utils import timezone
 
 from celery import app
@@ -45,7 +46,7 @@ from .services.collectibles_service import (
     CollectibleWithMetadata,
     MetadataRetrievalExceptionTimeout,
 )
-from .services.notification_service import build_reorg_payload
+from .services.event_service import build_reorg_payload
 
 logger = get_task_logger(__name__)
 
@@ -450,6 +451,9 @@ def retry_get_metadata_task(
     :param address: collectible address
     :param token_id: collectible id
     """
+    if not settings.COLLECTIBLES_ENABLE_DOWNLOAD_METADATA:
+        logger.warning("Downloading collectibles metadata is disabled")
+        return None
 
     collectibles_service = CollectiblesServiceProvider()
     redis_key = collectibles_service.get_metadata_cache_key(address, token_id)
