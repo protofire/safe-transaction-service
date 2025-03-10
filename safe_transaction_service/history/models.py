@@ -1056,6 +1056,12 @@ class InternalTx(models.Model):
                 include=["ethereum_tx_id", "block_number"],
                 condition=Q(call_type=0) & Q(value__gt=0),
             ),
+            # Add a new index to optimize queries that filter by _from address and block_number
+            Index(
+                name="history_internal_from_block_id",
+                fields=["_from", "block_number"],
+                include=["id"],
+            ),
         ]
 
     def __str__(self):
@@ -1239,7 +1245,12 @@ class InternalTxDecoded(models.Model):
                 name="history_decoded_processed_idx",
                 fields=["processed"],
                 condition=Q(processed=False),
-            )
+            ),
+            # Add a composite index on processed and internal_tx_id to optimize the join
+            models.Index(
+                name="history_decoded_processed_itx",
+                fields=["processed", "internal_tx_id"],
+            ),
         ]
         verbose_name_plural = "Internal txs decoded"
 
