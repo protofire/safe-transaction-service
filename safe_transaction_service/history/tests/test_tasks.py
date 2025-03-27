@@ -9,7 +9,8 @@ from django.utils import timezone
 
 from eth_account import Account
 
-from ...events.services import QueueService
+from safe_transaction_service.events.services import QueueService
+
 from ...utils.redis import get_redis
 from ..indexers import (
     Erc20EventsIndexerProvider,
@@ -30,6 +31,7 @@ from ..services import (
     ReorgService,
 )
 from ..services.collectibles_service import CollectibleWithMetadata
+from ..services.index_service import SpecificIndexingStatus
 from ..tasks import (
     check_reorgs_task,
     check_sync_status_task,
@@ -128,16 +130,23 @@ class TestTasks(TestCase):
     def test_index_safe_events_task(self):
         self.assertEqual(index_safe_events_task.delay().result, (0, 0))
 
+    @patch.object(IndexService, "get_master_copies_indexing_status")
     @patch.object(IndexService, "reindex_master_copies")
     def test_reindex_mastercopies_last_hours_task(
-        self, reindex_master_copies_mock: MagicMock
+        self,
+        reindex_master_copies_mock: MagicMock,
+        get_master_copies_indexing_status_mock: MagicMock,
     ):
+        get_master_copies_indexing_status_mock.return_value = SpecificIndexingStatus(
+            0, 0, True
+        )
+
         now = timezone.now()
         one_hour_ago = now - datetime.timedelta(hours=1)
         one_day_ago = now - datetime.timedelta(days=1)
         one_week_ago = now - datetime.timedelta(weeks=1)
 
-        reindex_mastercopies_last_hours_task()
+        self.assertFalse(reindex_mastercopies_last_hours_task())
         reindex_master_copies_mock.assert_not_called()
 
         ethereum_block_0 = EthereumBlockFactory(timestamp=one_week_ago)
@@ -145,36 +154,51 @@ class TestTasks(TestCase):
         ethereum_block_2 = EthereumBlockFactory(timestamp=one_hour_ago)
         ethereum_block_3 = EthereumBlockFactory(timestamp=now)
 
-        reindex_mastercopies_last_hours_task()
+        self.assertTrue(reindex_mastercopies_last_hours_task())
         reindex_master_copies_mock.assert_called_once_with(
             ethereum_block_1.number,
             to_block_number=ethereum_block_3.number,
             addresses=None,
         )
 
+        get_master_copies_indexing_status_mock.return_value = SpecificIndexingStatus(
+            0, 0, False
+        )
+        self.assertFalse(reindex_mastercopies_last_hours_task())
+
+    @patch.object(IndexService, "get_erc20_indexing_status")
     @patch.object(IndexService, "reindex_erc20_events")
     def test_reindex_erc20_erc721_last_hours_task(
-        self, reindex_erc20_events: MagicMock
+        self,
+        reindex_erc20_events_mock: MagicMock,
+        get_erc20_indexing_status_mock: MagicMock,
     ):
+        get_erc20_indexing_status_mock.return_value = SpecificIndexingStatus(0, 0, True)
+
         now = timezone.now()
         one_hour_ago = now - datetime.timedelta(hours=1)
         one_day_ago = now - datetime.timedelta(days=1)
         one_week_ago = now - datetime.timedelta(weeks=1)
 
-        reindex_erc20_erc721_last_hours_task()
-        reindex_erc20_events.assert_not_called()
+        self.assertFalse(reindex_erc20_erc721_last_hours_task())
+        reindex_erc20_events_mock.assert_not_called()
 
         ethereum_block_0 = EthereumBlockFactory(timestamp=one_week_ago)
         ethereum_block_1 = EthereumBlockFactory(timestamp=one_day_ago)
         ethereum_block_2 = EthereumBlockFactory(timestamp=one_hour_ago)
         ethereum_block_3 = EthereumBlockFactory(timestamp=now)
 
-        reindex_erc20_erc721_last_hours_task()
-        reindex_erc20_events.assert_called_once_with(
+        self.assertTrue(reindex_erc20_erc721_last_hours_task())
+        reindex_erc20_events_mock.assert_called_once_with(
             ethereum_block_1.number,
             to_block_number=ethereum_block_3.number,
             addresses=None,
         )
+
+        get_erc20_indexing_status_mock.return_value = SpecificIndexingStatus(
+            0, 0, False
+        )
+        self.assertFalse(reindex_erc20_erc721_last_hours_task())
 
     def test_process_decoded_internal_txs_task(self):
         owner = Account.create().address
@@ -242,76 +266,81 @@ class TestTasks(TestCase):
 
     @patch.object(CollectiblesService, "get_metadata", autospec=True, return_value={})
     def test_retry_get_metadata_task(self, get_metadata_mock: MagicMock):
-        redis = get_redis()
-        collectibles_service = CollectiblesServiceProvider()
-
         collectible_address = Account.create().address
         collectible_id = 16
-        metadata_cache_key = collectibles_service.get_metadata_cache_key(
-            collectible_address, collectible_id
-        )
 
-        metadata = {
-            "name": "Octopus",
-            "description": "Atlantic Octopus",
-            "image": "http://random-address.org/logo-28.png",
-        }
-
+        # Shouldn't call get_metadata and return None with COLLECTIBLES_ENABLE_DOWNLOAD_METADATA by default
+        self.assertIsNone(retry_get_metadata_task(collectible_address, collectible_id))
         # Check metadata cannot be retrieved
         get_metadata_mock.assert_not_called()
-        self.assertEqual(
-            retry_get_metadata_task(collectible_address, collectible_id), None
-        )
-        # Collectible needs to be cached so metadata can be fetched
-        get_metadata_mock.assert_not_called()
 
-        get_metadata_mock.return_value = metadata
-        expected = CollectibleWithMetadata(
-            "Octopus",
-            "OCT",
-            "http://random-address.org/logo.png",
-            collectible_address,
-            collectible_id,
-            "http://random-address.org/info-28.json",
-            metadata,
-        )
-        redis.set(
-            metadata_cache_key,
-            json.dumps(dataclasses.asdict(expected)),
-            ex=300,
-        )
+        with self.settings(COLLECTIBLES_ENABLE_DOWNLOAD_METADATA=True):
+            redis = get_redis()
+            collectibles_service = CollectiblesServiceProvider()
 
-        self.assertEqual(
-            retry_get_metadata_task(collectible_address, collectible_id), expected
-        )
-        # As metadata was set, task is not requesting it
-        get_metadata_mock.assert_not_called()
+            metadata_cache_key = collectibles_service.get_metadata_cache_key(
+                collectible_address, collectible_id
+            )
 
-        collectible_without_metadata = CollectibleWithMetadata(
-            "Octopus",
-            "OCT",
-            "http://random-address.org/logo.png",
-            collectible_address,
-            collectible_id,
-            "http://random-address.org/info-28.json",
-            {},
-        )
-        redis.set(
-            metadata_cache_key,
-            json.dumps(dataclasses.asdict(collectible_without_metadata)),
-            ex=300,
-        )
+            metadata = {
+                "name": "Octopus",
+                "description": "Atlantic Octopus",
+                "image": "http://random-address.org/logo-28.png",
+            }
 
-        self.assertEqual(
-            retry_get_metadata_task(collectible_address, collectible_id), expected
-        )
-        # As metadata was not set, task requested it
-        get_metadata_mock.assert_called_once()
+            self.assertEqual(
+                retry_get_metadata_task(collectible_address, collectible_id), None
+            )
+            # Collectible needs to be cached so metadata can be fetched
+            get_metadata_mock.assert_not_called()
 
-        self.assertEqual(
-            json.loads(redis.get(metadata_cache_key)), dataclasses.asdict(expected)
-        )
-        redis.delete(metadata_cache_key)
+            get_metadata_mock.return_value = metadata
+            expected = CollectibleWithMetadata(
+                "Octopus",
+                "OCT",
+                "http://random-address.org/logo.png",
+                collectible_address,
+                collectible_id,
+                "http://random-address.org/info-28.json",
+                metadata,
+            )
+            redis.set(
+                metadata_cache_key,
+                json.dumps(dataclasses.asdict(expected)),
+                ex=300,
+            )
+
+            self.assertEqual(
+                retry_get_metadata_task(collectible_address, collectible_id), expected
+            )
+            # As metadata was set, task is not requesting it
+            get_metadata_mock.assert_not_called()
+
+            collectible_without_metadata = CollectibleWithMetadata(
+                "Octopus",
+                "OCT",
+                "http://random-address.org/logo.png",
+                collectible_address,
+                collectible_id,
+                "http://random-address.org/info-28.json",
+                {},
+            )
+            redis.set(
+                metadata_cache_key,
+                json.dumps(dataclasses.asdict(collectible_without_metadata)),
+                ex=300,
+            )
+
+            self.assertEqual(
+                retry_get_metadata_task(collectible_address, collectible_id), expected
+            )
+            # As metadata was not set, task requested it
+            get_metadata_mock.assert_called_once()
+
+            self.assertEqual(
+                json.loads(redis.get(metadata_cache_key)), dataclasses.asdict(expected)
+            )
+            redis.delete(metadata_cache_key)
 
     def test_remove_not_trusted_multisig_txs_task(self):
         self.assertEqual(remove_not_trusted_multisig_txs_task.delay().result, 0)

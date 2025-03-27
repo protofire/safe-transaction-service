@@ -1,5 +1,5 @@
 from logging import getLogger
-from typing import List, Optional, Type, Union
+from typing import Type, Union
 
 from django.conf import settings
 from django.db.models import Model
@@ -7,11 +7,8 @@ from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 from django.utils import timezone
 
-from eth_typing import ChecksumAddress
-
-from safe_transaction_service.notifications.tasks import send_notification_task
-
 from ..events.services.queue_service import get_queue_service
+from .cache import remove_cache_view_by_instance
 from .models import (
     ERC20Transfer,
     ERC721Transfer,
@@ -20,12 +17,18 @@ from .models import (
     MultisigConfirmation,
     MultisigTransaction,
     SafeContract,
+    SafeContractDelegate,
     SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
     TokenTransfer,
 )
-from .services.notification_service import build_event_payload, is_relevant_notification
+from .services.event_service import (
+    build_delete_delegate_payload,
+    build_event_payload,
+    build_save_delegate_payload,
+    is_relevant_event,
+)
 
 logger = getLogger(__name__)
 
@@ -114,39 +117,7 @@ def safe_master_copy_clear_cache(
     SafeMasterCopy.objects.get_version_for_address.cache_clear()
 
 
-def get_safe_addresses_involved_from_db_instance(
-    instance: Union[
-        TokenTransfer,
-        InternalTx,
-        MultisigConfirmation,
-        MultisigTransaction,
-    ]
-) -> List[Optional[ChecksumAddress]]:
-    """
-    Retrieves the Safe addresses involved in the provided database instance.
-
-    :param instance:
-    :return: List of Safe addresses from the provided instance
-    """
-    addresses = []
-    if isinstance(instance, TokenTransfer):
-        addresses.append(instance.to)
-        addresses.append(instance._from)
-        return addresses
-    elif isinstance(instance, MultisigTransaction):
-        addresses.append(instance.safe)
-        return addresses
-    elif isinstance(instance, MultisigConfirmation) and instance.multisig_transaction:
-        addresses.append(instance.multisig_transaction.safe)
-        return addresses
-    elif isinstance(instance, InternalTx):
-        addresses.append(instance.to)
-        return addresses
-
-    return addresses
-
-
-def _process_notification_event(
+def _process_event(
     sender: Type[Model],
     instance: Union[
         TokenTransfer,
@@ -166,13 +137,15 @@ def _process_notification_event(
     :param deleted:
     :return:
     """
-    if settings.DISABLE_NOTIFICATIONS_AND_EVENTS:
+    if settings.DISABLE_SERVICE_EVENTS:
         return None
 
     assert not (
         created and deleted
     ), "An instance cannot be created and deleted at the same time"
 
+    logger.debug("Removing cache for object=%s", instance)
+    remove_cache_view_by_instance(instance)
     logger.debug("Start building payloads for created=%s object=%s", created, instance)
     payloads = build_event_payload(sender, instance, deleted=deleted)
     logger.debug(
@@ -180,22 +153,19 @@ def _process_notification_event(
     )
     for payload in payloads:
         if address := payload.get("address"):
-            if is_relevant_notification(sender, instance, created):
+            if is_relevant_event(sender, instance, created):
                 logger.debug(
-                    "Triggering send_notification tasks for created=%s object=%s",
+                    "[%s] Triggering send_event tasks for created=%s object=%s",
+                    address,
                     created,
                     instance,
-                )
-                send_notification_task.apply_async(
-                    args=(address, payload),
-                    countdown=5,
-                    priority=2,  # Almost lowest priority
                 )
                 queue_service = get_queue_service()
                 queue_service.send_event(payload)
             else:
                 logger.debug(
-                    "Notification will not be sent for created=%s object=%s",
+                    "[%s] Event will not be sent for created=%s object=%s",
+                    address,
                     created,
                     instance,
                 )
@@ -204,37 +174,35 @@ def _process_notification_event(
 @receiver(
     post_save,
     sender=ModuleTransaction,
-    dispatch_uid="module_transaction.process_notification_event",
+    dispatch_uid="module_transaction.process_event",
 )
 @receiver(
     post_save,
     sender=MultisigConfirmation,
-    dispatch_uid="multisig_confirmation.process_notification_event",
+    dispatch_uid="multisig_confirmation.process_event",
 )
 @receiver(
     post_save,
     sender=MultisigTransaction,
-    dispatch_uid="multisig_transaction.process_notification_event",
+    dispatch_uid="multisig_transaction.process_event",
 )
 @receiver(
     post_save,
     sender=ERC20Transfer,
-    dispatch_uid="erc20_transfer.process_notification_event",
+    dispatch_uid="erc20_transfer.process_event",
 )
 @receiver(
     post_save,
     sender=ERC721Transfer,
-    dispatch_uid="erc721_transfer.process_notification_event",
+    dispatch_uid="erc721_transfer.process_event",
 )
-@receiver(
-    post_save, sender=InternalTx, dispatch_uid="internal_tx.process_notification_event"
-)
+@receiver(post_save, sender=InternalTx, dispatch_uid="internal_tx.process_event")
 @receiver(
     post_save,
     sender=SafeContract,
-    dispatch_uid="safe_contract.process_notification_event",
+    dispatch_uid="safe_contract.process_event",
 )
-def process_notification_event(
+def process_event(
     sender: Type[Model],
     instance: Union[
         TokenTransfer,
@@ -246,18 +214,18 @@ def process_notification_event(
     created: bool,
     **kwargs,
 ) -> None:
-    return _process_notification_event(sender, instance, created, False)
+    return _process_event(sender, instance, created, False)
 
 
 @receiver(
     post_delete,
     sender=MultisigTransaction,
-    dispatch_uid="multisig_transaction.process_delete_notification_event",
+    dispatch_uid="multisig_transaction.process_delete_multisig_transaction_event",
 )
-def process_delete_notification_event(
+def process_delete_multisig_transaction_event(
     sender: Type[Model], instance: MultisigTransaction, *args, **kwargs
 ):
-    return _process_notification_event(sender, instance, False, True)
+    return _process_event(sender, instance, False, True)
 
 
 @receiver(
@@ -288,3 +256,32 @@ def add_to_historical_table(
     safe_status = SafeStatus.from_status_instance(instance)
     safe_status.save()
     return safe_status
+
+
+@receiver(
+    post_save,
+    sender=SafeContractDelegate,
+    dispatch_uid="safe_contract_delegate.process_save_delegate_user_event",
+)
+def process_save_delegate_user_event(
+    sender: Type[Model],
+    instance: SafeContractDelegate,
+    created: bool,
+    **kwargs,
+):
+    payload_event = build_save_delegate_payload(instance, created)
+    queue_service = get_queue_service()
+    queue_service.send_event(payload_event)
+
+
+@receiver(
+    post_delete,
+    sender=SafeContractDelegate,
+    dispatch_uid="safe_contract_delegate.process_delete_delegate_user_event",
+)
+def process_delete_delegate_user_event(
+    sender: Type[Model], instance: SafeContractDelegate, *args, **kwargs
+):
+    payload_event = build_delete_delegate_payload(instance)
+    queue_service = get_queue_service()
+    queue_service.send_event(payload_event)

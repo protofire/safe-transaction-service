@@ -60,7 +60,7 @@ class TestCommands(TestCase):
         self.assertEqual(current_no_safe_contract_logo, previous_random_contract_logo)
 
         # Missing safe addresses should be added
-        self.assertEqual(Contract.objects.count(), 22)
+        self.assertEqual(Contract.objects.count(), 31)
 
         # Contract name and display name should be correctly generated
         safe_l2_130_address = "0x3E5c63644E683549055b9Be8653de26E0B4CD36E"
@@ -97,8 +97,8 @@ class TestCommands(TestCase):
         contract = Contract.objects.get(address=safe_to_l2_migration)
         self.assertEqual(contract.name, "SafeToL2Migration")
         self.assertEqual(contract.display_name, "SafeToL2Migration 1.4.1")
-        # SafeToL2Migration should be trusted for delegate calls
-        self.assertTrue(contract.trusted_for_delegate_call)
+        # SafeToL2Migration should be untrusted for delegate calls
+        self.assertFalse(contract.trusted_for_delegate_call)
 
         sign_message_lib = "0xd53cd0aB83D845Ac265BE939c57F53AD838012c9"
         contract = Contract.objects.get(address=sign_message_lib)
