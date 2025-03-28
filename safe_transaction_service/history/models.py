@@ -55,6 +55,7 @@ from safe_eth.eth.utils import fast_to_checksum_address
 from safe_eth.safe import SafeOperationEnum
 from safe_eth.safe.safe import SafeInfo
 from safe_eth.safe.safe_signature import SafeSignature, SafeSignatureType
+from safe_eth.util.util import to_0x_hex_str
 from web3.types import EventData
 
 from safe_transaction_service.account_abstraction.constants import (
@@ -250,8 +251,8 @@ class EthereumBlockManager(models.Manager):
                     timestamp=datetime.datetime.fromtimestamp(
                         block["timestamp"], datetime.timezone.utc
                     ),
-                    block_hash=block["hash"].hex(),
-                    parent_hash=block["parentHash"].hex(),
+                    block_hash=to_0x_hex_str(block["hash"]),
+                    parent_hash=to_0x_hex_str(block["parentHash"]),
                     confirmed=confirmed,
                 )
         except IntegrityError:
@@ -264,7 +265,7 @@ class EthereumBlockManager(models.Manager):
                 db_block.confirmed = False  # Will be taken care of by the reorg task
                 db_block.save(update_fields=["confirmed"])
                 raise IntegrityError(
-                    f"Error inserting block with hash={block['hash'].hex()}, "
+                    f"Error inserting block with hash={to_0x_hex_str(block['hash'])}, "
                     f"there is a block with the same number={block['number']} inserted. "
                     f"Marking block as not confirmed"
                 )
@@ -275,7 +276,8 @@ class EthereumBlockManager(models.Manager):
             return self.values("timestamp").get(block_hash=block_hash)["timestamp"]
         except self.model.DoesNotExist:
             logger.error(
-                "Block with hash=%s does not exist on database", block_hash.hex()
+                "Block with hash=%s does not exist on database",
+                to_0x_hex_str(block_hash),
             )
             raise
 
@@ -361,7 +363,7 @@ class EthereumTxManager(models.Manager):
 
         return super().create(
             block=ethereum_block,
-            tx_hash=HexBytes(tx["hash"]).hex(),
+            tx_hash=to_0x_hex_str(HexBytes(tx["hash"])),
             gas_used=tx_receipt and tx_receipt["gasUsed"],
             _from=tx["from"],
             gas=tx["gas"],
@@ -382,7 +384,7 @@ class EthereumTxManager(models.Manager):
         """
         :return: Transactions containing ERC4337 `UserOperation` event
         """
-        query = '{"topics": ["' + USER_OPERATION_EVENT_TOPIC.hex() + '"]}'
+        query = '{"topics": ["' + to_0x_hex_str(USER_OPERATION_EVENT_TOPIC) + '"]}'
 
         return self.raw(
             f"SELECT * FROM history_ethereumtx WHERE '{query}'::jsonb <@ ANY (logs)"
@@ -568,7 +570,7 @@ class TokenTransfer(models.Model):
         expected_topic = HexBytes(ERC20_721_TRANSFER_TOPIC)
         if topic != expected_topic:
             raise ValueError(
-                f"Not supported EventData, topic {topic.hex()} does not match expected {expected_topic.hex()}"
+                f"Not supported EventData, topic {to_0x_hex_str(topic)} does not match expected {to_0x_hex_str(expected_topic)}"
             )
 
         try:
@@ -1059,11 +1061,11 @@ class InternalTx(models.Model):
     def __str__(self):
         if self.to:
             return "Internal tx hash={} from={} to={}".format(
-                HexBytes(self.ethereum_tx_id).hex(), self._from, self.to
+                to_0x_hex_str(HexBytes(self.ethereum_tx_id)), self._from, self.to
             )
         else:
             return "Internal tx hash={} from={}".format(
-                HexBytes(self.ethereum_tx_id).hex(), self._from
+                to_0x_hex_str(HexBytes(self.ethereum_tx_id)), self._from
             )
 
     @property
@@ -1524,6 +1526,34 @@ class MultisigTransaction(TimeStampedModel):
     def __str__(self):
         return f"{self.safe} - {self.nonce} - {self.safe_tx_hash}"
 
+    def to_log(self, message: str) -> str:
+        """
+        :param message:
+        :return: MultisigTransaction ready to be printed in a log line
+        """
+        safe_tx_hash_str = to_0x_hex_str(HexBytes(self.safe_tx_hash))
+        return (
+            f"[MultisigTransaction {safe_tx_hash_str}] {message}. "
+            f"safe_tx_hash={safe_tx_hash_str} "
+            f"safe={self.safe} "
+            f"proposer={self.proposer} "
+            f"proposed_by_delegate={self.proposed_by_delegate} "
+            f"to={self.to} "
+            f"value={self.value} "
+            f"data={to_0x_hex_str(HexBytes(self.data)) if self.data else None} "
+            f"operation={self.operation} "
+            f"safe_tx_gas={self.safe_tx_gas} "
+            f"base_gas={self.base_gas} "
+            f"gas_price={self.gas_price} "
+            f"gas_token={self.gas_token} "
+            f"refund_receiver={self.refund_receiver} "
+            f"signatures={to_0x_hex_str(HexBytes(self.signatures)) if self.signatures else None} "
+            f"nonce={self.nonce} "
+            f"failed={self.failed} "
+            f"origin={self.origin} "
+            f"trusted={self.trusted} "
+        )
+
     @property
     def execution_date(self) -> Optional[datetime.datetime]:
         if self.ethereum_tx_id and self.ethereum_tx.block_id is not None:
@@ -1603,7 +1633,7 @@ class ModuleTransaction(TimeStampedModel):
         if self.value:
             return f"{self.safe} - {self.to} - {self.value}"
         else:
-            return f"{self.safe} - {self.to} - 0x{bytes(self.data).hex()[:6]}"
+            return f"{self.safe} - {self.to} - {to_0x_hex_str(bytes(self.data))[:6]}"
 
     @property
     def unique_id(self):
@@ -1682,6 +1712,28 @@ class MultisigConfirmation(TimeStampedModel):
             return f"Confirmation of owner={self.owner} for transaction-hash={self.multisig_transaction_hash}"
         else:
             return f"Confirmation of owner={self.owner} for existing transaction={self.multisig_transaction_hash}"
+
+    def to_log(self, message: str) -> str:
+        """
+        :param message:
+        :return: MultisigTransaction ready to be printed in a log line
+        """
+        multisig_transaction_hash_str = to_0x_hex_str(
+            HexBytes(
+                self.multisig_transaction_hash
+                if self.multisig_transaction_hash
+                else self.multisig_transaction_id
+            )
+        )
+        return (
+            f"[MultisigConfirmation for {multisig_transaction_hash_str}] {message}. "
+            f"ethereum_tx={to_0x_hex_str(HexBytes(self.ethereum_tx_id)) if self.ethereum_tx else None} "
+            f"multisig_transaction={'SET' if self.multisig_transaction else 'UNSET'} "
+            f"multisig_transaction-hash={multisig_transaction_hash_str} "
+            f"owner={self.owner} "
+            f"signature={to_0x_hex_str(bytes(self.signature)) if self.signature else None} "
+            f"signature_type={SafeSignatureType(self.signature_type).name} "
+        )
 
 
 class MonitoredAddress(models.Model):
@@ -2197,3 +2249,6 @@ class TransactionServiceEventType(Enum):
     MESSAGE_CONFIRMATION = 11
     DELETED_MULTISIG_TRANSACTION = 12
     REORG_DETECTED = 13
+    NEW_DELEGATE = 14
+    UPDATED_DELEGATE = 15
+    DELETED_DELEGATE = 16

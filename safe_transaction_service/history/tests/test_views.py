@@ -1,3 +1,4 @@
+import datetime
 import json
 import logging
 from unittest import mock
@@ -6,6 +7,7 @@ from unittest.mock import MagicMock
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
 from django.urls import reverse
+from django.utils import timezone
 
 import eth_abi
 from eth_account import Account
@@ -22,6 +24,7 @@ from safe_eth.safe import CannotEstimateGas, Safe, SafeOperationEnum
 from safe_eth.safe.safe_signature import SafeSignature, SafeSignatureType
 from safe_eth.safe.signatures import signature_to_bytes
 from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
+from safe_eth.util.util import to_0x_hex_str
 
 from safe_transaction_service.account_abstraction.tests import factories as aa_factories
 from safe_transaction_service.contracts.models import ContractQuerySet
@@ -35,13 +38,20 @@ from ...utils.redis import get_redis
 from ..helpers import DelegateSignatureHelper, DeleteMultisigTxSignatureHelper
 from ..models import (
     IndexingStatus,
+    InternalTx,
+    InternalTxType,
+    ModuleTransaction,
     MultisigConfirmation,
     MultisigTransaction,
     SafeContractDelegate,
     SafeMasterCopy,
 )
 from ..serializers import TransferType
-from ..views import SafeMultisigTransactionListView
+from ..views import (
+    SafeModuleTransactionListView,
+    SafeMultisigTransactionListView,
+    SafeTransferListView,
+)
 from .factories import (
     ERC20TransferFactory,
     ERC721TransferFactory,
@@ -91,7 +101,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
     def test_swagger_json_schema(self):
-        url = reverse("schema-json", args=(".json",))
+        url = reverse("schema-json") + "?format=json"
         response = self.client.get(url, format="json")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
@@ -359,6 +369,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 6)
         self.assertEqual(len(response.data["results"]), 3)
+        self.assertIsInstance(response.data["results"][0]["nonce"], int)
 
         response = self.client.get(
             reverse("v1:history:all-transactions", args=(safe_address,))
@@ -640,6 +651,19 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["count"], 1)
 
+        # Test that the result should be cached
+        # Mock get_queryset with empty queryset return value to get proper error in case of fail
+        with mock.patch.object(
+            SafeModuleTransactionListView,
+            "get_queryset",
+            return_value=ModuleTransaction.objects.none(),
+        ) as patched_queryset:
+            response = self.client.get(url, format="json")
+            # queryset shouldn't be called
+            patched_queryset.assert_not_called()
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], 1)
+
     def test_get_module_transaction(self):
         wrong_module_transaction_id = "wrong_module_transaction_id"
         url = reverse(
@@ -688,7 +712,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "module": module_transaction.module,
                 "to": module_transaction.to,
                 "value": str(module_transaction.value),
-                "data": module_transaction.data.hex(),
+                "data": to_0x_hex_str(module_transaction.data),
                 "operation": module_transaction.operation,
                 "dataDecoded": None,
                 "moduleTransactionId": module_transaction_id,
@@ -696,7 +720,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
 
     def test_get_multisig_confirmation(self):
-        random_safe_tx_hash = fast_keccak_text("enxebre").hex()
+        random_safe_tx_hash = to_0x_hex_str(fast_keccak_text("enxebre"))
         response = self.client.get(
             reverse(
                 "v1:history:multisig-transaction-confirmations",
@@ -722,11 +746,11 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["count"], 2)
 
     def test_post_multisig_confirmation(self):
-        random_safe_tx_hash = fast_keccak_text("enxebre").hex()
+        random_safe_tx_hash = to_0x_hex_str(fast_keccak_text("enxebre"))
         data = {
-            "signature": Account.create()
-            .signHash(random_safe_tx_hash)["signature"]
-            .hex()  # Not valid signature
+            "signature": to_0x_hex_str(
+                Account.create().unsafe_sign_hash(random_safe_tx_hash)["signature"]
+            )  # Not valid signature
         }
         response = self.client.post(
             reverse(
@@ -760,9 +784,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
         random_account = Account.create()
         data = {
-            "signature": random_account.signHash(safe_tx_hash)[
-                "signature"
-            ].hex()  # Not valid signature
+            "signature": to_0x_hex_str(
+                random_account.unsafe_sign_hash(safe_tx_hash)["signature"]
+            )  # Not valid signature
         }
         # Transaction was executed, confirmations cannot be added
         response = self.client.post(
@@ -794,7 +818,11 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             response.data["signature"][0],
         )
 
-        data = {"signature": owner_account_1.signHash(safe_tx_hash)["signature"].hex()}
+        data = {
+            "signature": to_0x_hex_str(
+                owner_account_1.unsafe_sign_hash(safe_tx_hash)["signature"]
+            )
+        }
         self.assertEqual(MultisigConfirmation.objects.count(), 0)
         response = self.client.post(
             reverse(
@@ -814,10 +842,10 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
         # Add multiple signatures
         data = {
-            "signature": (
-                owner_account_1.signHash(safe_tx_hash)["signature"]
-                + owner_account_2.signHash(safe_tx_hash)["signature"]
-            ).hex()
+            "signature": to_0x_hex_str(
+                owner_account_1.unsafe_sign_hash(safe_tx_hash)["signature"]
+                + owner_account_2.unsafe_sign_hash(safe_tx_hash)["signature"]
+            )
         }
         self.assertEqual(MultisigConfirmation.objects.count(), 1)
         response = self.client.post(
@@ -830,8 +858,47 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(MultisigConfirmation.objects.count(), 2)
 
+    def test_post_multisig_confirmation_banned(self):
+        owner_account_1 = Account.create()
+        owner_account_2 = Account.create()
+        safe = self.deploy_test_safe(
+            owners=[owner_account_1.address, owner_account_2.address]
+        )
+        safe_address = safe.address
+        multisig_transaction = MultisigTransactionFactory(
+            safe=safe_address, trusted=True, ethereum_tx=None
+        )
+        safe_tx_hash = multisig_transaction.safe_tx_hash
+        data = {
+            "signature": to_0x_hex_str(
+                owner_account_1.unsafe_sign_hash(safe_tx_hash)["signature"]
+            )
+        }
+        self.assertEqual(MultisigConfirmation.objects.count(), 0)
+        with self.settings(BANNED_EOAS={owner_account_1.address}):
+            response = self.client.post(
+                reverse(
+                    "v1:history:multisig-transaction-confirmations",
+                    args=(safe_tx_hash,),
+                ),
+                format="json",
+                data=data,
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+            self.assertEqual(
+                response.json(),
+                {
+                    "signature": [
+                        f"Signer={owner_account_1.address} is not authorized to interact with the service"
+                    ]
+                },
+            )
+            self.assertEqual(MultisigConfirmation.objects.count(), 0)
+
     def test_get_multisig_transaction(self):
-        safe_tx_hash = fast_keccak_text("gnosis").hex()
+        safe = self.deploy_test_safe()
+        safe_address = safe.address
+        safe_tx_hash = to_0x_hex_str(fast_keccak_text("gnosis"))
         response = self.client.get(
             reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
             format="json",
@@ -844,7 +911,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             "0000000001"
         )
 
-        multisig_tx = MultisigTransactionFactory(data=add_owner_with_threshold_data)
+        multisig_tx = MultisigTransactionFactory(
+            safe=safe_address, data=add_owner_with_threshold_data
+        )
         safe_tx_hash = multisig_tx.safe_tx_hash
         response = self.client.get(
             reverse("v1:history:multisig-transaction", args=(safe_tx_hash,)),
@@ -862,6 +931,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertIsNone(response.data["max_priority_fee_per_gas"])
         self.assertIsNone(response.data["proposer"])
         self.assertIsNone(response.data["proposed_by_delegate"])
+        self.assertIsInstance(response.data["nonce"], int)
 
         self.assertEqual(
             response.data["data_decoded"],
@@ -928,14 +998,17 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
     def test_delete_multisig_transaction(self):
         owner_account = Account.create()
-        safe_tx_hash = fast_keccak_text("random-tx").hex()
+        safe_tx_hash = to_0x_hex_str(fast_keccak_text("random-tx"))
         url = reverse("v1:history:multisig-transaction", args=(safe_tx_hash,))
         data = {"signature": "0x" + "1" * (130 * 2)}  # 2 signatures of 65 bytes
         response = self.client.delete(url, format="json", data=data)
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
         # Add our test MultisigTransaction to the database
-        multisig_transaction = MultisigTransactionFactory(safe_tx_hash=safe_tx_hash)
+        safe = SafeContractFactory()
+        multisig_transaction = MultisigTransactionFactory(
+            safe_tx_hash=safe_tx_hash, safe=safe.address
+        )
 
         # Add other MultisigTransactions to the database to make sure they are not deleted
         MultisigTransactionFactory()
@@ -1007,9 +1080,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         multisig_transaction.proposer = owner_account.address
         multisig_transaction.save(update_fields=["proposer"])
         data = {
-            "signature": owner_account.signHash(safe_tx_hash)[
-                "signature"
-            ].hex()  # Random signature
+            "signature": to_0x_hex_str(
+                owner_account.unsafe_sign_hash(safe_tx_hash)["signature"]
+            )  # Random signature
         }
         response = self.client.delete(url, format="json", data=data)
         self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
@@ -1018,24 +1091,110 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             {
                 "non_field_errors": [
                     ErrorDetail(
-                        string="Provided owner is not the proposer of the transaction",
+                        string="Provided signer is not the proposer or the delegate user who proposed the transaction",
                         code="invalid",
                     )
                 ]
             },
         )
 
-        # Use a proper signature
+        # Calculate a valid message_hash
         message_hash = DeleteMultisigTxSignatureHelper.calculate_hash(
-            multisig_transaction.safe,
+            safe.address,
             safe_tx_hash,
             self.ethereum_client.get_chain_id(),
             previous_totp=False,
         )
+
+        # Use an expired user delegate
+        safe_delegate = Account.create()
+        safe_contract_delegate = SafeContractDelegateFactory(
+            safe_contract_id=multisig_transaction.safe,
+            delegate=safe_delegate.address,
+            delegator=owner_account.address,
+            expiry_date=timezone.now() - datetime.timedelta(minutes=1),
+        )
+        multisig_transaction.proposer = owner_account.address
+        multisig_transaction.proposed_by_delegate = safe_delegate.address
+        multisig_transaction.save(update_fields=["proposer", "proposed_by_delegate"])
         data = {
-            "signature": owner_account.signHash(message_hash)[
-                "signature"
-            ].hex()  # Random signature
+            "signature": to_0x_hex_str(
+                safe_delegate.unsafe_sign_hash(message_hash)["signature"]
+            )
+        }
+        response = self.client.delete(url, format="json", data=data)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertDictEqual(
+            response.data,
+            {
+                "non_field_errors": [
+                    ErrorDetail(
+                        string="Provided signer is not the proposer or the delegate user who proposed the transaction",
+                        code="invalid",
+                    )
+                ]
+            },
+        )
+
+        # Use a deleted user delegate
+        safe_contract_delegate.delete()
+        multisig_transaction.proposer = owner_account.address
+        multisig_transaction.proposed_by_delegate = safe_delegate.address
+        multisig_transaction.save(update_fields=["proposer", "proposed_by_delegate"])
+        data = {
+            "signature": to_0x_hex_str(
+                safe_delegate.unsafe_sign_hash(message_hash)["signature"]
+            )
+        }
+        response = self.client.delete(url, format="json", data=data)
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertDictEqual(
+            response.data,
+            {
+                "non_field_errors": [
+                    ErrorDetail(
+                        string="Provided signer is not the proposer or the delegate user who proposed the transaction",
+                        code="invalid",
+                    )
+                ]
+            },
+        )
+
+        # Use a proper signature of an user delegate
+        SafeContractDelegateFactory(
+            safe_contract_id=multisig_transaction.safe,
+            delegate=safe_delegate.address,
+            delegator=owner_account.address,
+        )
+        multisig_transaction.proposer = owner_account.address
+        multisig_transaction.proposed_by_delegate = safe_delegate.address
+        multisig_transaction.save(update_fields=["proposer", "proposed_by_delegate"])
+        data = {
+            "signature": to_0x_hex_str(
+                safe_delegate.unsafe_sign_hash(message_hash)["signature"]
+            )
+        }
+        self.assertEqual(MultisigTransaction.objects.count(), 3)
+        self.assertTrue(
+            MultisigTransaction.objects.filter(safe_tx_hash=safe_tx_hash).exists()
+        )
+        response = self.client.delete(url, format="json", data=data)
+        self.assertEqual(response.status_code, status.HTTP_204_NO_CONTENT)
+        self.assertEqual(MultisigTransaction.objects.count(), 2)
+        self.assertFalse(
+            MultisigTransaction.objects.filter(safe_tx_hash=safe_tx_hash).exists()
+        )
+
+        # Use a proper signature of a proposer user
+        multisig_transaction = MultisigTransactionFactory(
+            safe_tx_hash=safe_tx_hash, safe=safe.address, ethereum_tx=None
+        )
+        multisig_transaction.proposer = owner_account.address
+        multisig_transaction.save(update_fields=["proposer"])
+        data = {
+            "signature": to_0x_hex_str(
+                owner_account.unsafe_sign_hash(message_hash)["signature"]
+            )
         }
         self.assertEqual(MultisigTransaction.objects.count(), 3)
         self.assertTrue(
@@ -1053,8 +1212,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
 
     def test_get_multisig_transactions(self):
-        safe_address = Account.create().address
-        proposer = Account.create().address
+        safe = self.deploy_test_safe()
+        safe_address = safe.address
+        proposer = safe.retrieve_owners()[0]
         response = self.client.get(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1084,6 +1244,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             response.data["results"][0]["transaction_hash"],
             multisig_tx.ethereum_tx.tx_hash,
         )
+        self.assertIsInstance(response.data["results"][0]["nonce"], int)
         # Test camelCase
         self.assertEqual(
             response.json()["results"][0]["transactionHash"],
@@ -1135,12 +1296,30 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["count"], 2)
         self.assertEqual(response.data["count_unique_nonce"], 1)
 
+        #
+        # Mock get_queryset with empty queryset return value to get proper error in case of fail
+        with mock.patch.object(
+            SafeMultisigTransactionListView,
+            "get_queryset",
+            return_value=MultisigTransaction.objects.none(),
+        ) as patched_queryset:
+            response = self.client.get(
+                reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                format="json",
+            )
+            # view shouldn't be called
+            patched_queryset.assert_not_called()
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], 2)
+            self.assertEqual(response.data["count_unique_nonce"], 1)
+
     def test_get_multisig_transactions_unique_nonce(self):
         """
         Unique nonce should follow the trusted filter
         """
 
-        safe_address = Account.create().address
+        safe = self.deploy_test_safe()
+        safe_address = safe.address
         url = reverse("v1:history:multisig-transactions", args=(safe_address,))
         response = self.client.get(
             url,
@@ -1177,11 +1356,15 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self, get_data_decoded_mock: MagicMock
     ):
         try:
+            safe = self.deploy_test_safe()
+            safe_address = safe.address
             ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
             multisig_transaction = MultisigTransactionFactory(
-                operation=SafeOperationEnum.CALL.value, data=b"abcd", trusted=True
+                safe=safe_address,
+                operation=SafeOperationEnum.CALL.value,
+                data=b"abcd",
+                trusted=True,
             )
-            safe_address = multisig_transaction.safe
             response = self.client.get(
                 reverse("v1:history:multisig-transactions", args=(safe_address,)),
                 format="json",
@@ -1200,23 +1383,31 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             self.assertEqual(response.status_code, status.HTTP_200_OK)
             self.assertIsNone(response.data["results"][0]["data_decoded"])
 
-            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
             ContractFactory(
                 address=multisig_transaction.to, trusted_for_delegate_call=True
             )
-            response = self.client.get(
-                reverse("v1:history:multisig-transactions", args=(safe_address,)),
-                format="json",
-            )
-            self.assertEqual(response.status_code, status.HTTP_200_OK)
-            self.assertEqual(
-                response.data["results"][0]["data_decoded"], {"param1": "value"}
-            )
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
+            # Force don't use cache because we are not cleaning the cache on contracts change
+            with mock.patch(
+                "safe_transaction_service.history.views.settings.CACHE_VIEW_DEFAULT_TIMEOUT",
+                0,
+            ):
+                response = self.client.get(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                )
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertEqual(
+                    response.data["results"][0]["data_decoded"], {"param1": "value"}
+                )
         finally:
             ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
 
     def test_get_multisig_transactions_filters(self):
-        safe_address = Account.create().address
+        safe_owner_1 = Account.create()
+        safe = self.deploy_test_safe(owners=[safe_owner_1.address])
+        safe_address = safe.address
+
         response = self.client.get(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1225,7 +1416,11 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.data["count"], 0)
 
         multisig_transaction = MultisigTransactionFactory(
-            safe=safe_address, nonce=0, ethereum_tx=None, trusted=True
+            safe=safe_address,
+            nonce=0,
+            ethereum_tx=None,
+            trusted=True,
+            enable_safe_tx_hash_calculation=True,
         )
         response = self.client.get(
             reverse("v1:history:multisig-transactions", args=(safe_address,))
@@ -1285,7 +1480,10 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(len(response.data["results"]), 0)
 
-        MultisigConfirmationFactory(multisig_transaction=multisig_transaction)
+        MultisigConfirmationFactory(
+            multisig_transaction=multisig_transaction,
+            force_sign_with_account=safe_owner_1,
+        )
         response = self.client.get(
             reverse("v1:history:multisig-transactions", args=(safe_address,))
             + "?has_confirmations=True",
@@ -1335,7 +1533,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1395,7 +1593,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1419,9 +1617,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertIsNone(response.data["proposed_by_delegate"])
 
         # Test confirmation with signature
-        data["signature"] = safe_owner_1.signHash(safe_tx.safe_tx_hash)[
-            "signature"
-        ].hex()
+        data["signature"] = to_0x_hex_str(
+            safe_owner_1.unsafe_sign_hash(safe_tx.safe_tx_hash)["signature"]
+        )
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1450,9 +1648,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
 
         # Sign with a different user that sender
         random_user_account = Account.create()
-        data["signature"] = random_user_account.signHash(safe_tx.safe_tx_hash)[
-            "signature"
-        ].hex()
+        data["signature"] = to_0x_hex_str(
+            random_user_account.unsafe_sign_hash(safe_tx.safe_tx_hash)["signature"]
+        )
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1516,7 +1714,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1560,7 +1758,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         safe_tx_hash_preimage = safe_tx.safe_tx_hash_preimage
 
         safe_owner_message_hash = safe_owner.get_message_hash(safe_tx_hash_preimage)
-        safe_owner_signature = account.signHash(safe_owner_message_hash)["signature"]
+        safe_owner_signature = account.unsafe_sign_hash(safe_owner_message_hash)[
+            "signature"
+        ]
         signature_1271 = (
             signature_to_bytes(
                 0, int.from_bytes(HexBytes(safe_owner.address), byteorder="big"), 65
@@ -1568,8 +1768,8 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             + eth_abi.encode(["bytes"], [safe_owner_signature])[32:]
         )
 
-        data["contractTransactionHash"] = safe_tx_hash.hex()
-        data["signature"] = signature_1271.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx_hash)
+        data["signature"] = to_0x_hex_str(signature_1271)
 
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe.address,)),
@@ -1577,6 +1777,14 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data=data,
         )
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        # Ensure right response is returned
+        response = self.client.get(
+            reverse("v1:history:multisig-transactions", args=(safe.address,)),
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
         multisig_transaction_db = MultisigTransaction.objects.get(
             safe_tx_hash=safe_tx_hash
         )
@@ -1589,7 +1797,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         response = self.client.post(
             reverse(
                 "v1:history:multisig-transaction-confirmations",
-                args=(safe_tx_hash.hex(),),
+                args=(to_0x_hex_str(safe_tx_hash),),
             ),
             format="json",
             data=confirmation_data,
@@ -1627,7 +1835,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
 
         factory = APIRequestFactory()
         request = factory.post(
@@ -1710,7 +1918,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1755,7 +1963,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1782,7 +1990,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1832,7 +2040,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1864,7 +2072,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             data["refundReceiver"],
             safe_nonce=data["nonce"],
         )
-        data["contractTransactionHash"] = safe_tx.safe_tx_hash.hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1919,13 +2127,15 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             safe_nonce=data["nonce"],
         )
         safe_tx_hash = safe_tx.safe_tx_hash
-        data["contractTransactionHash"] = safe_tx_hash.hex()
-        data["signature"] = b"".join(
-            [
-                safe_owner.signHash(safe_tx_hash)["signature"]
-                for safe_owner in safe_owners
-            ]
-        ).hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx_hash)
+        data["signature"] = to_0x_hex_str(
+            b"".join(
+                [
+                    safe_owner.unsafe_sign_hash(safe_tx_hash)["signature"]
+                    for safe_owner in safe_owners
+                ]
+            )
+        )
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -1990,8 +2200,10 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             safe_nonce=data["nonce"],
         )
         safe_tx_hash = safe_tx.safe_tx_hash
-        data["contractTransactionHash"] = safe_tx_hash.hex()
-        data["signature"] = safe_delegate.signHash(safe_tx_hash)["signature"].hex()
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx_hash)
+        data["signature"] = to_0x_hex_str(
+            safe_delegate.unsafe_sign_hash(safe_tx_hash)["signature"]
+        )
 
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
@@ -2055,6 +2267,147 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             "Just one signature is expected if using delegates",
             response.data["non_field_errors"][0],
         )
+
+    def test_post_multisig_transactions_with_banned_signatures(self):
+        safe_owners = [Account.create() for _ in range(4)]
+        safe_owner_addresses = [s.address for s in safe_owners]
+        safe = self.deploy_test_safe(owners=safe_owner_addresses, threshold=3)
+        safe_address = safe.address
+
+        data = {
+            "to": Account.create().address,
+            "value": 100000000000000000,
+            "data": None,
+            "operation": 0,
+            "nonce": 0,
+            "safeTxGas": 0,
+            "baseGas": 0,
+            "gasPrice": 0,
+            "gasToken": "0x0000000000000000000000000000000000000000",
+            "refundReceiver": "0x0000000000000000000000000000000000000000",
+            # "contractTransactionHash": "0x1c2c77b29086701ccdda7836c399112a9b715c6a153f6c8f75c84da4297f60d3",
+            "sender": safe_owners[0].address,
+            "origin": "Testing origin field",
+        }
+
+        safe_tx = safe.build_multisig_tx(
+            data["to"],
+            data["value"],
+            data["data"],
+            data["operation"],
+            data["safeTxGas"],
+            data["baseGas"],
+            data["gasPrice"],
+            data["gasToken"],
+            data["refundReceiver"],
+            safe_nonce=data["nonce"],
+        )
+        safe_tx_hash = safe_tx.safe_tx_hash
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx_hash)
+        data["signature"] = to_0x_hex_str(
+            b"".join(
+                [
+                    safe_owner.unsafe_sign_hash(safe_tx_hash)["signature"]
+                    for safe_owner in safe_owners
+                ]
+            )
+        )
+        with self.settings(BANNED_EOAS={safe_owners[0].address}):
+            response = self.client.post(
+                reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                format="json",
+                data=data,
+            )
+            self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+            self.assertEqual(
+                response.json(),
+                {
+                    "nonFieldErrors": [
+                        f"Signer={safe_owners[0].address} is not authorized to interact with the service"
+                    ]
+                },
+            )
+
+    def test_post_multisig_transaction_with_delegate_call(self):
+        safe_owner_1 = Account.create()
+        safe = self.deploy_test_safe(owners=[safe_owner_1.address])
+        safe_address = safe.address
+        try:
+            response = self.client.get(
+                reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                format="json",
+            )
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertEqual(response.data["count"], 0)
+
+            data = {
+                "to": Account.create().address,
+                "value": 0,
+                "data": "0x12121212",
+                "operation": SafeOperationEnum.DELEGATE_CALL.value,
+                "nonce": 0,
+                "safeTxGas": 0,
+                "baseGas": 0,
+                "gasPrice": 0,
+                "gasToken": "0x0000000000000000000000000000000000000000",
+                "refundReceiver": "0x0000000000000000000000000000000000000000",
+                "sender": safe_owner_1.address,
+            }
+            safe_tx = safe.build_multisig_tx(
+                data["to"],
+                data["value"],
+                data["data"],
+                data["operation"],
+                data["safeTxGas"],
+                data["baseGas"],
+                data["gasPrice"],
+                data["gasToken"],
+                data["refundReceiver"],
+                safe_nonce=data["nonce"],
+            )
+            data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
+
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
+            # Disable creation with delegate call and not trusted contract
+            with self.settings(
+                DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION=True
+            ):
+                response = self.client.post(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(
+                    response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY
+                )
+
+            # Enable creation with delegate call
+            with self.settings(
+                DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION=False
+            ):
+                response = self.client.post(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+                multisig_transaction_db = MultisigTransaction.objects.first()
+                self.assertEqual(multisig_transaction_db.operation, 1)
+
+            # Disable creation with delegate call and trusted contract
+            ContractFactory(address=data["to"], trusted_for_delegate_call=True)
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
+            with self.settings(
+                DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION=True
+            ):
+                response = self.client.post(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        finally:
+            ContractQuerySet.cache_trusted_addresses_for_delegate_call.clear()
 
     def test_safe_balances_view(self):
         safe_address = Account.create().address
@@ -2186,7 +2539,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             # Create delegate
             self.assertEqual(SafeContractDelegate.objects.count(), 0)
             hash_to_sign = DelegateSignatureHelper.calculate_hash(delegate.address)
-            data["signature"] = delegator.signHash(hash_to_sign)["signature"].hex()
+            data["signature"] = to_0x_hex_str(
+                delegator.unsafe_sign_hash(hash_to_sign)["signature"]
+            )
             response = self.client.post(url, format="json", data=data)
             self.assertEqual(response.status_code, status.HTTP_201_CREATED)
             safe_contract_delegate = SafeContractDelegate.objects.get()
@@ -2212,9 +2567,13 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             "label": another_label,
             "delegate": delegate.address,
             "delegator": delegator.address,
-            "signature": delegator.signHash(
-                DelegateSignatureHelper.calculate_hash(delegate.address, eth_sign=True)
-            )["signature"].hex(),
+            "signature": to_0x_hex_str(
+                delegator.unsafe_sign_hash(
+                    DelegateSignatureHelper.calculate_hash(
+                        delegate.address, eth_sign=True
+                    )
+                )["signature"]
+            ),
         }
         response = self.client.post(url, format="json", data=data)
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
@@ -2224,7 +2583,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         signature = signature_to_bytes(0, int(delegator.address, 16), 65) + HexBytes(
             "0" * 65
         )
-        data["signature"] = signature.hex()
+        data["signature"] = to_0x_hex_str(signature)
         response = self.client.post(url, format="json", data=data)
         self.assertIn(
             f"Signature of type=CONTRACT_SIGNATURE for delegator={delegator.address} is not valid",
@@ -2327,7 +2686,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                     delegate=delegate.address,  # random delegator, should not be deleted
                 )
                 data = {
-                    "signature": signer.signHash(hash_to_sign)["signature"].hex(),
+                    "signature": to_0x_hex_str(
+                        signer.unsafe_sign_hash(hash_to_sign)["signature"]
+                    ),
                     "delegator": delegator.address,
                 }
                 self.assertEqual(SafeContractDelegate.objects.count(), 3)
@@ -2352,7 +2713,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
         signer = Account.create()
         data = {
-            "signature": signer.signHash(hash_to_sign)["signature"].hex(),
+            "signature": to_0x_hex_str(
+                signer.unsafe_sign_hash(hash_to_sign)["signature"]
+            ),
             "delegator": delegator.address,
         }
         self.assertEqual(SafeContractDelegate.objects.count(), 1)
@@ -2435,7 +2798,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         hash_to_sign = DelegateSignatureHelper.calculate_hash(
             delegate_address, eth_sign=True
         )
-        data["signature"] = owner_account.signHash(hash_to_sign)["signature"].hex()
+        data["signature"] = to_0x_hex_str(
+            owner_account.unsafe_sign_hash(hash_to_sign)["signature"]
+        )
         response = self.client.delete(
             reverse("v1:history:safe-delegate", args=(safe_address, delegate_address)),
             format="json",
@@ -2450,7 +2815,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         hash_to_sign = DelegateSignatureHelper.calculate_hash(
             delegate_address, previous_totp=True
         )
-        data["signature"] = owner_account.signHash(hash_to_sign)["signature"].hex()
+        data["signature"] = to_0x_hex_str(
+            owner_account.unsafe_sign_hash(hash_to_sign)["signature"]
+        )
         response = self.client.delete(
             reverse("v1:history:safe-delegate", args=(safe_address, delegate_address)),
             format="json",
@@ -2462,7 +2829,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         )
 
         hash_to_sign = DelegateSignatureHelper.calculate_hash(delegate_address)
-        data["signature"] = owner_account.signHash(hash_to_sign)["signature"].hex()
+        data["signature"] = to_0x_hex_str(
+            owner_account.unsafe_sign_hash(hash_to_sign)["signature"]
+        )
         response = self.client.delete(
             reverse("v1:history:safe-delegate", args=(safe_address, delegate_address)),
             format="json",
@@ -2495,7 +2864,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             safe_contract=safe_contract, delegate=delegate_account.address
         )
         hash_to_sign = DelegateSignatureHelper.calculate_hash(delegate_account.address)
-        data["signature"] = delegate_account.signHash(hash_to_sign)["signature"].hex()
+        data["signature"] = to_0x_hex_str(
+            delegate_account.unsafe_sign_hash(hash_to_sign)["signature"]
+        )
         response = self.client.delete(
             reverse(
                 "v1:history:safe-delegate",
@@ -2990,13 +3361,26 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         for result in response.data["results"]:
             self.assertEqual(result["type"], TransferType.ETHER_TRANSFER.name)
 
-        response = self.client.get(
-            reverse("v1:history:transfers", args=(safe_address,)) + "?ether=false",
-            format="json",
-        )
+        url = reverse("v1:history:transfers", args=(safe_address,)) + "?ether=false"
+        response = self.client.get(url, format="json")
         self.assertGreater(len(response.data["results"]), 0)
         for result in response.data["results"]:
             self.assertNotEqual(result["type"], TransferType.ETHER_TRANSFER.name)
+
+        # Test that the result should be cached
+        # Mock get_queryset with empty queryset return value to get proper error in case of fail
+        with mock.patch.object(
+            SafeTransferListView,
+            "get_queryset",
+            return_value=InternalTx.objects.none(),
+        ) as patched_queryset:
+            response = self.client.get(url, format="json")
+            # queryset shouldn't be called
+            patched_queryset.assert_not_called()
+            self.assertEqual(response.status_code, status.HTTP_200_OK)
+            self.assertGreater(len(response.data["results"]), 0)
+            for result in response.data["results"]:
+                self.assertNotEqual(result["type"], TransferType.ETHER_TRANSFER.name)
 
     def test_get_transfer_view(self):
         # test wrong random transfer_id
@@ -3199,6 +3583,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 contract_address=safe_address,
                 trace_address="0,0",
                 ethereum_tx__status=1,
+                tx_type=InternalTxType.CREATE.value,
             )
             response = self.client.get(
                 reverse("v1:history:safe-creation", args=(safe_address,)),
@@ -3248,19 +3633,25 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected["user_operation"] = {
             "sender": safe_operation.user_operation.sender,
-            "nonce": safe_operation.user_operation.nonce,
+            "nonce": str(safe_operation.user_operation.nonce),
             "user_operation_hash": safe_operation.user_operation.hash,
             "ethereum_tx_hash": internal_tx.ethereum_tx_id,
             "init_code": "0x1234",
             "call_data": "0x",
-            "call_gas_limit": safe_operation.user_operation.call_gas_limit,
-            "verification_gas_limit": safe_operation.user_operation.verification_gas_limit,
-            "pre_verification_gas": safe_operation.user_operation.pre_verification_gas,
-            "max_fee_per_gas": safe_operation.user_operation.max_fee_per_gas,
-            "max_priority_fee_per_gas": safe_operation.user_operation.max_priority_fee_per_gas,
+            "call_gas_limit": str(safe_operation.user_operation.call_gas_limit),
+            "verification_gas_limit": str(
+                safe_operation.user_operation.verification_gas_limit
+            ),
+            "pre_verification_gas": str(
+                safe_operation.user_operation.pre_verification_gas
+            ),
+            "max_fee_per_gas": str(safe_operation.user_operation.max_fee_per_gas),
+            "max_priority_fee_per_gas": str(
+                safe_operation.user_operation.max_priority_fee_per_gas
+            ),
             "paymaster": safe_operation.user_operation.paymaster,
             "paymaster_data": "0x",
-            "signature": "0x" + safe_operation.user_operation.signature.hex(),
+            "signature": to_0x_hex_str(safe_operation.user_operation.signature),
             "entry_point": safe_operation.user_operation.entry_point,
             "safe_operation": {
                 "created": datetime_to_str(safe_operation.created),
@@ -3270,7 +3661,9 @@ class TestViews(SafeTestCaseMixin, APITestCase):
                 "valid_until": datetime_to_str(safe_operation.valid_until),
                 "module_address": safe_operation.module_address,
                 "confirmations": [],
-                "prepared_signature": HexBytes(safe_operation.build_signature()).hex(),
+                "prepared_signature": to_0x_hex_str(
+                    HexBytes(safe_operation.build_signature())
+                ),
             },
         }
 
@@ -3387,7 +3780,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
             response.data,
             {
                 "address": blockchain_safe.address,
-                "nonce": 0,
+                "nonce": "0",
                 "threshold": blockchain_safe.retrieve_threshold(),
                 "owners": blockchain_safe.retrieve_owners(),
                 "master_copy": blockchain_safe.retrieve_master_copy_address(),
@@ -3608,7 +4001,7 @@ class TestViews(SafeTestCaseMixin, APITestCase):
         response = self.client.post(
             reverse("v1:history:data-decoder"),
             format="json",
-            data={"data": add_owner_with_threshold_data.hex()},
+            data={"data": to_0x_hex_str(add_owner_with_threshold_data)},
         )
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 

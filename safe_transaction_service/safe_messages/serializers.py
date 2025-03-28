@@ -1,6 +1,8 @@
 import json
 from typing import Any, Dict, Optional, Sequence, Tuple, Union
 
+from django.conf import settings
+
 import safe_eth.eth.django.serializers as eth_serializers
 from eth_typing import ChecksumAddress, HexStr
 from hexbytes import HexBytes
@@ -9,6 +11,7 @@ from rest_framework.exceptions import ValidationError
 from safe_eth.eth import get_auto_ethereum_client
 from safe_eth.eth.eip712 import eip712_encode_hash
 from safe_eth.safe.safe_signature import SafeSignature, SafeSignatureType
+from safe_eth.util.util import to_0x_hex_str
 
 from safe_transaction_service.utils.serializers import get_safe_owners
 
@@ -40,7 +43,7 @@ class SafeMessageSignatureParserMixin:
         for safe_signature in safe_signatures:
             if not safe_signature.is_valid(ethereum_client, safe_address):
                 raise ValidationError(
-                    f"Signature={safe_signature.signature.hex()} for owner={safe_signature.owner} is not valid"
+                    f"Signature={to_0x_hex_str(safe_signature.signature)} for owner={safe_signature.owner} is not valid"
                 )
 
         owner = safe_signatures[0].owner
@@ -53,6 +56,11 @@ class SafeMessageSignatureParserMixin:
                 raise ValidationError(f"Signature for owner {owner} already exists")
 
         owners = get_safe_owners(safe_address)
+        if owner in settings.BANNED_EOAS:
+            raise ValidationError(
+                f"Signer={owner} is not authorized to interact with the service"
+            )
+
         if owner not in owners:
             raise ValidationError(f"{owner} is not an owner of the Safe")
 
@@ -108,7 +116,7 @@ class SafeMessageSerializer(SafeMessageSignatureParserMixin, serializers.Seriali
 
         if SafeMessage.objects.filter(message_hash=safe_message_hash).exists():
             raise ValidationError(
-                f"Message with hash {safe_message_hash.hex()} for safe {safe_address} already exists in DB"
+                f"Message with hash {to_0x_hex_str(safe_message_hash)} for safe {safe_address} already exists in DB"
             )
 
         safe_signatures = SafeSignature.parse_signature(
@@ -218,7 +226,7 @@ class SafeMessageResponseSerializer(serializers.Serializer):
         :return: Serialized queryset
         """
         signature = HexBytes(obj.build_signature())
-        return HexBytes(signature).hex() if signature else None
+        return to_0x_hex_str(HexBytes(signature)) if signature else None
 
     def get_origin(self, obj: SafeMessage) -> str:
         return obj.origin if isinstance(obj.origin, str) else json.dumps(obj.origin)
