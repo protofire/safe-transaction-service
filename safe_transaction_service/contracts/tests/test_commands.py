@@ -29,7 +29,7 @@ class TestCommands(TestCase):
         self.assertIn("Processing finished", buf.getvalue())
 
     @patch.object(EthereumClient, "get_chain_id", autospec=True, return_value=137)
-    def test_update_safe_contracts_logo(self, mock_chain_id: MagicMock):
+    def test_setup_safe_contracts(self, mock_chain_id: MagicMock):
         command = "setup_safe_contracts"
         buf = StringIO()
         random_contract = ContractFactory()
@@ -97,8 +97,8 @@ class TestCommands(TestCase):
         contract = Contract.objects.get(address=safe_to_l2_migration)
         self.assertEqual(contract.name, "SafeToL2Migration")
         self.assertEqual(contract.display_name, "SafeToL2Migration 1.4.1")
-        # SafeToL2Migration should be trusted for delegate calls
-        self.assertTrue(contract.trusted_for_delegate_call)
+        # SafeToL2Migration should be untrusted for delegate calls
+        self.assertFalse(contract.trusted_for_delegate_call)
 
         sign_message_lib = "0xd53cd0aB83D845Ac265BE939c57F53AD838012c9"
         contract = Contract.objects.get(address=sign_message_lib)
@@ -106,3 +106,29 @@ class TestCommands(TestCase):
         self.assertEqual(contract.display_name, "Safe: SignMessageLib 1.4.1")
         # SignMessageLib should be trusted for delegate calls
         self.assertTrue(contract.trusted_for_delegate_call)
+
+    @patch(
+        "safe_transaction_service.contracts.management.commands.setup_safe_contracts.EthereumClient.is_contract"
+    )
+    @patch.object(EthereumClient, "get_chain_id", autospec=True, return_value=2)
+    def test_setup_safe_contracts_from_chain(
+        self, mock_chain_id: MagicMock, mock_is_contract: MagicMock
+    ):
+        command = "setup_safe_contracts"
+        buf = StringIO()
+        mock_is_contract.return_value = False
+        self.assertEqual(Contract.objects.count(), 0)
+        call_command(command, stdout=buf)
+        self.assertEqual(Contract.objects.count(), 0)
+
+        # Mock is contract to return True in case of provided address is equal to MultiSend v1.4.1 address
+        mulsisend_address = "0x38869bf66a61cF6bDB996A6aE40D5853Fd43B526"
+        mock_is_contract.side_effect = lambda contract_address: (
+            True if contract_address == mulsisend_address else False
+        )
+        call_command(command, stdout=buf)
+        self.assertEqual(Contract.objects.count(), 1)
+        contract = Contract.objects.get(address=mulsisend_address)
+        self.assertIsNotNone(contract)
+        self.assertEqual(contract.name, "MultiSend")
+        self.assertEqual(contract.display_name, "Safe: MultiSend 1.4.1")
