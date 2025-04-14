@@ -1,8 +1,7 @@
 from django.test import TestCase
 
 from eth_account import Account
-
-from gnosis.eth.tests.ethereum_test_case import EthereumTestCaseMixin
+from safe_eth.eth.tests.ethereum_test_case import EthereumTestCaseMixin
 
 from safe_transaction_service.tokens.models import Token
 from safe_transaction_service.tokens.tests.factories import TokenFactory
@@ -31,7 +30,7 @@ class TestBalanceService(EthereumTestCaseMixin, TestCase):
         self.assertEqual(token_info.symbol, token_db.symbol)
         self.assertEqual(token_info.decimals, token_db.decimals)
 
-    def test_filter_addresses(self):
+    def test_filter_tokens(self):
         balance_service = self.balance_service
         db_not_trusted_addresses = [
             TokenFactory(trusted=False, spam=False).address for _ in range(3)
@@ -66,12 +65,12 @@ class TestBalanceService(EthereumTestCaseMixin, TestCase):
         )
 
         self.assertCountEqual(
-            balance_service._filter_addresses(addresses, False, False), expected_address
+            balance_service._filter_tokens(addresses, False, False), expected_address
         )
 
         expected_address = db_trusted_addresses
         self.assertCountEqual(
-            balance_service._filter_addresses(addresses, True, False), expected_address
+            balance_service._filter_tokens(addresses, True, False), expected_address
         )
 
         Token.objects.filter(address=db_events_bugged_erc20_address).update(
@@ -79,7 +78,7 @@ class TestBalanceService(EthereumTestCaseMixin, TestCase):
         )
         expected_address = db_trusted_addresses + [db_events_bugged_erc20_address]
         self.assertCountEqual(
-            balance_service._filter_addresses(addresses, True, False), expected_address
+            balance_service._filter_tokens(addresses, True, False), expected_address
         )
 
         expected_address = (
@@ -88,5 +87,5 @@ class TestBalanceService(EthereumTestCaseMixin, TestCase):
             + [db_events_bugged_erc20_address]
         )
         self.assertCountEqual(
-            balance_service._filter_addresses(addresses, False, True), expected_address
+            balance_service._filter_tokens(addresses, False, True), expected_address
         )

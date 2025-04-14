@@ -6,9 +6,8 @@ from django.core.management.base import BaseCommand
 from django.db.models import Min
 
 from django_celery_beat.models import CrontabSchedule, IntervalSchedule, PeriodicTask
-
-from gnosis.eth import get_auto_ethereum_client
-from gnosis.safe.addresses import MASTER_COPIES, PROXY_FACTORIES
+from safe_eth.eth import get_auto_ethereum_client
+from safe_eth.safe.addresses import MASTER_COPIES, PROXY_FACTORIES
 
 from ...models import IndexingStatus, IndexingStatusType, ProxyFactory, SafeMasterCopy
 
@@ -134,6 +133,11 @@ TASKS = [
         name="safe_transaction_service.history.tasks.remove_not_trusted_multisig_txs_task",
         description="Remove older than 1 month not trusted Multisig Txs (every day at 00:00)",
         cron=CronDefinition(minute=0, hour=0),  # Every day at 00:00 - 0 0 * * *
+    ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.history.tasks.delete_expired_delegates_task",
+        description="Remove expired Safe Contract Delegates (every hour at minute 0)",
+        cron=CronDefinition(minute=0),  # Every hour at minute 0 - 0 * * * *
     ),
     CeleryTaskConfiguration(
         name="safe_transaction_service.contracts.tasks.create_missing_contracts_with_metadata_task",

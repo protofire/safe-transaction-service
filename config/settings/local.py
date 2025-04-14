@@ -33,7 +33,11 @@ CACHES = {
             # http://niwinz.github.io/django-redis/latest/#_memcached_exceptions_behavior
             "IGNORE_EXCEPTIONS": True,
         },
-    }
+    },
+    "local_storage": {
+        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+        "LOCATION": "local_mem",
+    },
 }
 
 # django-debug-toolbar
@@ -55,3 +59,6 @@ DEBUG_TOOLBAR_CONFIG = {
 }
 # https://django-debug-toolbar.readthedocs.io/en/latest/installation.html#internal-ips
 INTERNAL_IPS = ["127.0.0.1", "10.0.2.2"]
+
+# Enable to get the host from header
+USE_X_FORWARDED_HOST = True

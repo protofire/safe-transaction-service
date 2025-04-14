@@ -6,9 +6,9 @@ from unittest.mock import MagicMock, PropertyMock
 from django.test import TestCase
 
 from eth_typing import HexStr
-
-from gnosis.eth import EthereumClient
-from gnosis.eth.ethereum_client import TracingManager
+from safe_eth.eth import EthereumClient
+from safe_eth.eth.ethereum_client import TracingManager
+from safe_eth.util.util import to_0x_hex_str
 
 from ..indexers import InternalTxIndexer, InternalTxIndexerProvider
 from ..indexers.internal_tx_indexer import InternalTxIndexerWithTraceBlock
@@ -66,7 +66,7 @@ class TestInternalTxIndexer(TestCase):
         :param hashes:
         :return:
         """
-        block_dict = {block["hash"].hex(): block for block in block_result}
+        block_dict = {to_0x_hex_str(block["hash"]): block for block in block_result}
         return [block_dict[provided_hash] for provided_hash in hashes]
 
     @mock.patch.object(

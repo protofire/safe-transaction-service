@@ -9,10 +9,10 @@ from django.http import HttpRequest
 
 from hexbytes import HexBytes
 from rest_framework.authtoken.admin import TokenAdmin
-
-from gnosis.eth import get_auto_ethereum_client
-from gnosis.eth.django.admin import AdvancedAdminSearchMixin
-from gnosis.safe import SafeTx
+from safe_eth.eth import get_auto_ethereum_client
+from safe_eth.eth.django.admin import AdvancedAdminSearchMixin
+from safe_eth.safe import SafeTx
+from safe_eth.util.util import to_0x_hex_str
 
 from .models import (
     Chain,
@@ -445,7 +445,7 @@ class ModuleTransactionAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     search_fields = ["==safe", "==module", "==to"]
 
     def data_hex(self, o: ModuleTransaction):
-        return HexBytes(o.data.tobytes()).hex() if o.data else None
+        return to_0x_hex_str(HexBytes(o.data)) if o.data else None
 
     def tx_hash(self, o: ModuleTransaction):
         return o.internal_tx.ethereum_tx_id
@@ -531,10 +531,11 @@ class SafeContractAdmin(AdvancedAdminSearchMixin, admin.ModelAdmin):
     inlines = (SafeContractDelegateInline,)
     list_display = (
         "created_block_number",
+        "banned",
         "address",
         "ethereum_tx_id",
     )
-    list_filter = (SafeContractERC20ListFilter,)
+    list_filter = (SafeContractERC20ListFilter, "banned")
     list_select_related = ("ethereum_tx",)
     ordering = ["-ethereum_tx__block_id"]
     raw_id_fields = ("ethereum_tx",)

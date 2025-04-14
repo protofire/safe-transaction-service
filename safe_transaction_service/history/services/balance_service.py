@@ -11,9 +11,8 @@ from cache_memoize import cache_memoize
 from cachetools import TTLCache, cachedmethod
 from eth_typing import ChecksumAddress
 from redis import Redis
-
-from gnosis.eth import EthereumClient, get_auto_ethereum_client
-from gnosis.eth.utils import fast_is_checksum_address
+from safe_eth.eth import EthereumClient, get_auto_ethereum_client
+from safe_eth.eth.utils import fast_is_checksum_address
 
 from safe_transaction_service.tokens.models import Token
 from safe_transaction_service.utils.redis import get_redis
@@ -86,17 +85,19 @@ class BalanceService:
             maxsize=4096, ttl=60 * 30
         )  # 2 hours of caching
 
-    def _filter_addresses(
+    def _filter_tokens(
         self,
         erc20_addresses: Sequence[ChecksumAddress],
         only_trusted: bool,
         exclude_spam: bool,
     ) -> List[ChecksumAddress]:
         """
+        Filter the provided `erc20_addresses` list and tokens with `events_bugged=True` by spam or trusted.
+
         :param erc20_addresses:
         :param only_trusted:
         :param exclude_spam:
-        :return: ERC20 tokens filtered by spam or trusted
+        :return: ERC20 tokens filtered.
         """
         base_queryset = Token.objects.filter(
             Q(address__in=erc20_addresses) | Q(events_bugged=True)
@@ -158,7 +159,7 @@ class BalanceService:
             .filter(safe=safe_address)
             .count()
         )
-        number_erc20_events = ERC20Transfer.objects.to_or_from(safe_address).count()
+        number_erc20_events = ERC20Transfer.objects.fast_count(safe_address)
         number_eth_events = InternalTx.objects.ether_txs_for_address(
             safe_address
         ).count()
@@ -187,28 +188,27 @@ class BalanceService:
         offset: int = 0,
     ) -> Tuple[List[ChecksumAddress], int]:
         """
-        Get the erc20 page for a given Safe if the limit is defined.
-
         :param safe_address:
         :param only_trusted:
         :param exclude_spam:
         :param limit:
         :param offset:
-        :return: list of ERC20 addresses and count of all ERC20 addresses for a given Safe
+        :return: List of ERC20 token addresses (paginated if `limit` is provided)
+            and count of all ERC20 addresses for a given Safe
         """
         all_erc20_addresses = ERC20Transfer.objects.tokens_used_by_address(safe_address)
         for address in all_erc20_addresses:
             # Store tokens in database if not present
             self.get_token_info(address)  # This is cached
-        erc20_addresses = self._filter_addresses(
+        erc20_addresses = self._filter_tokens(
             all_erc20_addresses, only_trusted, exclude_spam
         )
         # Total count should take into account the request filters
         erc20_count = len(erc20_addresses)
 
         if not limit:
-            # No pagination no limits
-            return erc20_addresses[0:None], erc20_count
+            # No limit, no pagination
+            return erc20_addresses, erc20_count
 
         if offset == 0:
             # First page will include also native token balance

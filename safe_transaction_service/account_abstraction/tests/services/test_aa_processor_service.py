@@ -4,20 +4,20 @@ from unittest.mock import MagicMock
 from django.test import TestCase
 
 from eth_account import Account
-
-from gnosis.eth import EthereumClient
-from gnosis.eth.account_abstraction import BundlerClient
-from gnosis.eth.account_abstraction import UserOperation as UserOperationClass
-from gnosis.eth.account_abstraction import (
+from safe_eth.eth import EthereumClient
+from safe_eth.eth.account_abstraction import BundlerClient
+from safe_eth.eth.account_abstraction import UserOperation as UserOperationClass
+from safe_eth.eth.account_abstraction import (
     UserOperationReceipt as UserOperationReceiptClass,
 )
-from gnosis.eth.tests.mocks.mock_bundler import (
+from safe_eth.eth.tests.mocks.mock_bundler import (
     safe_4337_user_operation_hash_mock,
     user_operation_mock,
     user_operation_receipt_mock,
     user_operation_v07_hash,
     user_operation_v07_mock,
 )
+from safe_eth.util.util import to_0x_hex_str
 
 from safe_transaction_service.account_abstraction.services import (
     get_aa_processor_service,
@@ -72,7 +72,8 @@ class TestAaProcessorService(TestCase):
         "get_user_operation_by_hash",
         autospec=True,
         return_value=UserOperationClass.from_bundler_response(
-            safe_4337_user_operation_hash_mock.hex(), user_operation_mock["result"]
+            to_0x_hex_str(safe_4337_user_operation_hash_mock),
+            user_operation_mock["result"],
         ),
     )
     @mock.patch.object(
@@ -98,10 +99,10 @@ class TestAaProcessorService(TestCase):
         user_operation_confirmation_model = SafeOperationConfirmationModel.objects.get()
 
         self.assertEqual(
-            user_operation_model.hash, aa_expected_user_operation_hash.hex()
+            user_operation_model.hash, to_0x_hex_str(aa_expected_user_operation_hash)
         )
         self.assertEqual(
-            safe_operation_model.hash, aa_expected_safe_operation_hash.hex()
+            safe_operation_model.hash, to_0x_hex_str(aa_expected_safe_operation_hash)
         )
         self.assertEqual(user_operation_receipt_model.deposited, 759940285250436)
         self.assertEqual(
@@ -129,7 +130,8 @@ class TestAaProcessorService(TestCase):
         "get_user_operation_by_hash",
         autospec=True,
         return_value=UserOperationClass.from_bundler_response(
-            user_operation_v07_hash.hex(), user_operation_v07_mock["result"]
+            to_0x_hex_str(user_operation_v07_hash),
+            user_operation_v07_mock["result"],
         ),
     )
     @mock.patch.object(

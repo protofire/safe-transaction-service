@@ -11,6 +11,7 @@ from eth_typing import ChecksumAddress, HexStr
 from eth_utils import event_abi_to_log_topic
 from gevent import pool
 from hexbytes import HexBytes
+from safe_eth.util.util import to_0x_hex_str
 from web3.contract.contract import ContractEvent
 from web3.exceptions import LogTopicError
 from web3.types import EventData, FilterParams, LogReceipt
@@ -75,7 +76,7 @@ class EventsIndexer(EthereumIndexer):
         """
         events_to_listen = {}
         for event in self.contract_events:
-            key = HexStr(HexBytes(event_abi_to_log_topic(event.abi)).hex())
+            key = to_0x_hex_str(HexBytes(event_abi_to_log_topic(event.abi)))
             events_to_listen.setdefault(key, []).append(event)
         return events_to_listen
 
@@ -221,7 +222,7 @@ class EventsIndexer(EthereumIndexer):
             or `None` if decoding was not possible
         """
         for event_to_listen in self.events_to_listen[
-            HexStr(log_receipt["topics"][0].hex())
+            to_0x_hex_str(log_receipt["topics"][0])
         ]:
             # Try to decode using all the existing ABIs
             # One topic can have multiple matching ABIs due to `indexed` elements changing how to decode it
@@ -247,6 +248,13 @@ class EventsIndexer(EthereumIndexer):
             if decoded_element := self.decode_element(log_receipt):
                 decoded_elements.append(decoded_element)
         return decoded_elements
+
+    def _process_decoded_elements(self, decoded_elements: List[EventData]) -> List[Any]:
+        processed_elements = []
+        for decoded_element in decoded_elements:
+            if processed_element := self._process_decoded_element(decoded_element):
+                processed_elements.append(processed_element)
+        return processed_elements
 
     def process_elements(self, log_receipts: Sequence[LogReceipt]) -> List[Any]:
         """
@@ -281,10 +289,7 @@ class EventsIndexer(EthereumIndexer):
         self.index_service.txs_create_or_update_from_tx_hashes(tx_hashes)
         logger.debug("End prefetching and storing of ethereum txs")
         logger.debug("Processing %d decoded events", len(decoded_elements))
-        processed_elements = []
-        for decoded_element in decoded_elements:
-            if processed_element := self._process_decoded_element(decoded_element):
-                processed_elements.append(processed_element)
+        processed_elements = self._process_decoded_elements(decoded_elements)
         logger.debug("End processing %d decoded events", len(decoded_elements))
 
         logger.debug("Marking events as processed")

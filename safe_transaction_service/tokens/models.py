@@ -16,10 +16,9 @@ from eth_abi.exceptions import DecodingError
 from eth_typing import ChecksumAddress
 from imagekit.models import ProcessedImageField
 from pilkit.processors import Resize
+from safe_eth.eth import InvalidERC20Info, InvalidERC721Info, get_auto_ethereum_client
+from safe_eth.eth.django.models import EthereumAddressBinaryField
 from web3.exceptions import Web3Exception
-
-from gnosis.eth import InvalidERC20Info, InvalidERC721Info, get_auto_ethereum_client
-from gnosis.eth.django.models import EthereumAddressBinaryField
 
 from .clients.zerion_client import (
     BalancerTokenAdapterClient,
@@ -87,6 +86,10 @@ class TokenManager(models.Manager):
     def create_from_blockchain(
         self, token_address: ChecksumAddress
     ) -> Optional["Token"]:
+        if TokenNotValid.objects.filter(address=token_address).exists():
+            # If token is not valid, ignore it
+            return None
+
         ethereum_client = get_auto_ethereum_client()
         if token_address in ENS_CONTRACTS_WITH_TLD:  # Special case for ENS
             return self.create(
@@ -119,6 +122,7 @@ class TokenManager(models.Manager):
                 logger.debug(
                     "Cannot find anything on blockchain for token=%s", token_address
                 )
+                TokenNotValid.objects.get_or_create(address=token_address)
                 return None
 
         # Ignore tokens with empty name or symbol
@@ -126,6 +130,7 @@ class TokenManager(models.Manager):
             logger.warning(
                 "Token with address=%s has not name or symbol", token_address
             )
+            TokenNotValid.objects.get_or_create(address=token_address)
             return None
 
         name_and_symbol: list[str] = []
@@ -222,6 +227,11 @@ class Token(models.Model):
         format="PNG",
         processors=[Resize(256, 256, upscale=False)],
     )
+    logo_uri = models.URLField(
+        default="",
+        blank=True,
+        help_text="If provided, return this URI instead of the stored logo",
+    )
     events_bugged = models.BooleanField(
         default=False,
         help_text="Set `True` if token does not send `Transfer` event sometimes (e.g. WETH on minting)",
@@ -279,27 +289,38 @@ class Token(models.Model):
     def get_full_logo_uri(self) -> str:
         if self.logo:
             return self.logo.url
-        elif settings.AWS_S3_PUBLIC_URL:
+
+        if self.logo_uri:
+            return self.logo_uri
+
+        if settings.AWS_S3_PUBLIC_URL:
             return urljoin(
                 settings.AWS_S3_PUBLIC_URL,
                 get_token_logo_path(
                     self, self.address + settings.TOKENS_LOGO_EXTENSION
                 ),
             )
-        else:
-            # Old behaviour
-            return urljoin(
-                settings.TOKENS_LOGO_BASE_URI,
-                get_token_logo_path(
-                    self, self.address + settings.TOKENS_LOGO_EXTENSION
-                ),
-            )
+
+        # Old behaviour
+        return urljoin(
+            settings.TOKENS_LOGO_BASE_URI,
+            get_token_logo_path(self, self.address + settings.TOKENS_LOGO_EXTENSION),
+        )
 
     def get_price_address(self) -> ChecksumAddress:
         """
         :return: Address to use to retrieve the token price
         """
         return self.copy_price or self.address
+
+
+class TokenNotValid(models.Model):
+    """
+    Stores information about tokens not valid (missing name or symbol, for example), so they are not requested
+    again to the RPC
+    """
+
+    address = EthereumAddressBinaryField(primary_key=True)
 
 
 class TokenListToken(TypedDict):

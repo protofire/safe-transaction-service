@@ -1,3 +1,4 @@
+import datetime
 import logging
 from datetime import timedelta
 from unittest import mock
@@ -9,9 +10,8 @@ from django.test import TestCase
 from django.utils import timezone
 
 from eth_account import Account
-
-from gnosis.eth.utils import fast_keccak_text
-from gnosis.safe.safe_signature import SafeSignatureType
+from safe_eth.eth.utils import fast_keccak_text
+from safe_eth.safe.safe_signature import SafeSignatureType
 
 from safe_transaction_service.account_abstraction.tests.mocks import aa_tx_receipt_mock
 from safe_transaction_service.contracts.models import ContractQuerySet
@@ -54,6 +54,7 @@ from .factories import (
 )
 from .mocks.mocks_ethereum_tx import type_0_tx, type_2_tx
 from .mocks.mocks_internal_tx_indexer import block_result
+from .mocks.mocks_safe_creation import multiple_safes_same_tx_creation_mock
 
 logger = logging.getLogger(__name__)
 
@@ -213,7 +214,7 @@ class TestMultisigTransaction(TestCase):
         self.assertEqual(multisig_transaction.owners, [])
 
         account = Account.create()
-        multisig_transaction.signatures = account.signHash(
+        multisig_transaction.signatures = account.unsafe_sign_hash(
             multisig_transaction.safe_tx_hash
         )["signature"]
         multisig_transaction.save()
@@ -377,8 +378,33 @@ class TestEthereumTx(TestCase):
         self.assertEqual(len(ethereum_txs), 1)
         self.assertEqual(ethereum_txs[0], ethereum_tx)
 
+    def test_get_deployed_proxies_from_logs(self):
+        ethereum_tx = EthereumTxFactory(
+            logs=[
+                clean_receipt_log(log)
+                for log in multiple_safes_same_tx_creation_mock["tx_logs"]
+            ]
+        )
+        self.assertEqual(
+            ethereum_tx.get_deployed_proxies_from_logs(),
+            multiple_safes_same_tx_creation_mock["proxies_deployed"],
+        )
+
 
 class TestTokenTransfer(TestCase):
+    def test_fast_count(self):
+        address = Account.create().address
+
+        ERC20TransferFactory(to=address)
+        self.assertEqual(ERC20Transfer.objects.fast_count(address), 1)
+
+        ERC20TransferFactory(_from=address)
+        self.assertEqual(ERC20Transfer.objects.fast_count(address), 2)
+
+        # Optimization uses a UNION, so it counts transfers with `from=to` twice
+        ERC20TransferFactory(_from=address, to=address)
+        self.assertEqual(ERC20Transfer.objects.fast_count(address), 4)
+
     def test_transfer_to_erc721(self):
         erc20_transfer = ERC20TransferFactory()
         self.assertEqual(ERC721Transfer.objects.count(), 0)
@@ -410,9 +436,9 @@ class TestTokenTransfer(TestCase):
         ERC20TransferFactory()  # This event should not appear
         self.assertEqual(ERC20Transfer.objects.to_or_from(safe_address).count(), 2)
 
-        self.assertSetEqual(
+        self.assertCountEqual(
             ERC20Transfer.objects.tokens_used_by_address(safe_address),
-            {e1.address, e2.address},
+            [e1.address, e2.address],
         )
 
     def test_erc721_events(self):
@@ -422,9 +448,9 @@ class TestTokenTransfer(TestCase):
         ERC721TransferFactory()  # This event should not appear
         self.assertEqual(ERC721Transfer.objects.to_or_from(safe_address).count(), 2)
 
-        self.assertSetEqual(
+        self.assertCountEqual(
             ERC721Transfer.objects.tokens_used_by_address(safe_address),
-            {e1.address, e2.address},
+            [e1.address, e2.address],
         )
 
     def test_incoming_tokens(self):
@@ -1082,6 +1108,31 @@ class TestSafeContractDelegate(TestCase):
             [safe_contract_delegate_another_safe, safe_contract_delegate_without_safe],
         )
 
+        # Check expired delegate
+        safe_contract_delegate_expired = SafeContractDelegateFactory(
+            expiry_date=timezone.now() - datetime.timedelta(hours=1)
+        )
+        safe_contract_delegate_not_expired = SafeContractDelegateFactory(
+            safe_contract=safe_contract_delegate_expired.safe_contract
+        )
+        safe_contract_delegate_not_expired_2 = SafeContractDelegateFactory(
+            safe_contract=safe_contract_delegate_expired.safe_contract
+        )
+        expired_delegate_safe_address = (
+            safe_contract_delegate_expired.safe_contract.address
+        )
+        self.assertCountEqual(
+            SafeContractDelegate.objects.get_for_safe(
+                expired_delegate_safe_address,
+                [
+                    safe_contract_delegate_expired.delegator,
+                    safe_contract_delegate_not_expired.delegator,
+                    safe_contract_delegate_not_expired_2.delegator,
+                ],
+            ),
+            [safe_contract_delegate_not_expired, safe_contract_delegate_not_expired_2],
+        )
+
     def test_get_for_safe_and_delegate(self):
         delegator = Account.create().address
         delegate = Account.create().address
@@ -1538,25 +1589,57 @@ class TestMultisigTransactions(TestCase):
     def test_with_confirmations_required(self):
         # This should never be picked, Safe not matching
         SafeStatusFactory(nonce=0, threshold=4)
-
         multisig_transaction = MultisigTransactionFactory(nonce=0)
-        self.assertIsNone(
+        safe_address = multisig_transaction.safe
+
+        self.assertEqual(
             MultisigTransaction.objects.with_confirmations_required()
             .first()
-            .confirmations_required
+            .confirmations_required,
+            0,
         )
 
         # SafeStatus not matching the nonce (looking for threshold in nonce=0)
-        safe_status = SafeStatusFactory(
-            address=multisig_transaction.safe, nonce=1, threshold=8
-        )
-        self.assertIsNone(
+        safe_status = SafeStatusFactory(address=safe_address, nonce=1, threshold=8)
+        self.assertEqual(
             MultisigTransaction.objects.with_confirmations_required()
             .first()
-            .confirmations_required
+            .confirmations_required,
+            0,
         )
 
-        safe_status.nonce = 0
+        # Add confirmations. Without SafeStatus, confirmations for the transaction are used
+        number_confirmations = 5
+        for _ in range(number_confirmations):
+            MultisigConfirmationFactory(multisig_transaction=multisig_transaction)
+
+        self.assertEqual(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required,
+            number_confirmations,
+        )
+
+        # If there's SafeLastStatus present, it should be returned
+        # Not matching SafeLastStatus should return the number of confirmations
+        SafeLastStatusFactory(nonce=2, threshold=16)
+        self.assertEqual(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required,
+            number_confirmations,
+        )
+
+        SafeLastStatusFactory(address=safe_address, nonce=2, threshold=15)
+        self.assertEqual(
+            MultisigTransaction.objects.with_confirmations_required()
+            .first()
+            .confirmations_required,
+            15,
+        )
+
+        # Update SafeStatus to match the Multisig Tx nonce
+        safe_status.nonce = multisig_transaction.nonce
         safe_status.save(update_fields=["nonce"])
 
         self.assertEqual(
@@ -1567,7 +1650,7 @@ class TestMultisigTransactions(TestCase):
         )
 
         # It will not be picked, as nonce is still matching the previous SafeStatus
-        SafeStatusFactory(address=multisig_transaction.safe, nonce=1, threshold=15)
+        new_safe_status = SafeStatusFactory(address=safe_address, nonce=1, threshold=15)
         self.assertEqual(
             MultisigTransaction.objects.with_confirmations_required()
             .first()
@@ -1575,33 +1658,8 @@ class TestMultisigTransactions(TestCase):
             8,
         )
 
-        multisig_transaction.nonce = 1
+        multisig_transaction.nonce = new_safe_status.nonce
         multisig_transaction.save(update_fields=["nonce"])
-        self.assertEqual(
-            MultisigTransaction.objects.with_confirmations_required()
-            .first()
-            .confirmations_required,
-            15,
-        )
-
-        # As EthereumTx is empty, the latest Safe Status will be used if available
-        multisig_transaction.ethereum_tx = None
-        multisig_transaction.save(update_fields=["ethereum_tx"])
-        self.assertIsNone(
-            MultisigTransaction.objects.with_confirmations_required()
-            .first()
-            .confirmations_required
-        )
-
-        # Not matching address should not return anything
-        SafeLastStatusFactory(nonce=2, threshold=16)
-        self.assertIsNone(
-            MultisigTransaction.objects.with_confirmations_required()
-            .first()
-            .confirmations_required
-        )
-
-        SafeLastStatusFactory(address=multisig_transaction.safe, nonce=2, threshold=15)
         self.assertEqual(
             MultisigTransaction.objects.with_confirmations_required()
             .first()
