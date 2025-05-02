@@ -39,6 +39,8 @@ from .pagination import KeysetPagination
 from .permissions import IsInternalApi
 # Import the new response serializer
 from .serializers import GlobalAllTransactionsResponseSerializer
+# Import our new service
+from .services import GlobalTransactionService
 
 logger = logging.getLogger(__name__)
 
@@ -267,7 +269,7 @@ def get_all_txs_from_identifiers_global(
 
 
 @extend_schema(
-    tags=["stats"], # Use a specific tag for internal API
+    tags=["stats"],
     parameters=[
         OpenApiParameter(
             "updated_after",
@@ -279,7 +281,7 @@ def get_all_txs_from_identifiers_global(
         OpenApiParameter(
             "limit",
             location="query",
-            description="Number of items to retrieve.",
+            description="Number of items to retrieve (default: 100, max: 1000).",
             required=False,
             type=OpenApiTypes.INT,
         ),
@@ -299,10 +301,6 @@ def get_all_txs_from_identifiers_global(
         400: OpenApiResponse(description="Invalid query parameter format (cursor, updated_after, limit)."),
         403: OpenApiResponse(description="Forbidden. Stats API not enabled or invalid/missing API key."),
     },
-    # exclude=True, # Option 1: Completely hide
-    # deprecated=True, # Option 2: Mark as deprecated - TEMPORARILY REMOVED FOR TESTING
-    # You can also add vendor extensions like x-internal
-    # extensions={"x-internal": True},
 )
 class AllTransactionsGlobalView(ListAPIView):
     """
@@ -311,49 +309,58 @@ class AllTransactionsGlobalView(ListAPIView):
 
     Requires `ENABLE_STATS_API=True` in settings and a valid `X-Internal-API-Key` header.
     """
-    # permission_classes = [IsInternalApi] # TEMPORARILY DISABLED FOR TESTING
+    permission_classes = [IsInternalApi]
     pagination_class = KeysetPagination
-    # serializer_class = AllTransactionsSchemaSerializerV2 # Serializer is applied manually after fetching
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.transaction_service = GlobalTransactionService()
 
     def get_queryset(self) -> QuerySet:
         """
-        Returns the base queryset of relevant transaction identifiers.
+        Returns the base queryset used for pagination. This efficiently gets just the
+        identifiers and timestamps needed for pagination without loading all transaction data.
         """
-        # We paginate based on SafeRelevantTransaction as it has the timestamp and tx id
-        # Ordering (timestamp, id) is handled by the pagination class
-        return SafeRelevantTransaction.objects.all().select_related("ethereum_tx")
+        # We only need to fetch minimal data for pagination
+        return (
+            SafeRelevantTransaction.objects
+            .select_related("ethereum_tx")
+            .only("id", "timestamp", "ethereum_tx_id")
+        )
 
     def list(self, request, *args, **kwargs):
+        """
+        Process the request and return paginated transaction data.
+        This implementation is optimized to minimize database queries and memory usage.
+        """
+        # Get the base queryset for pagination
         queryset = self.filter_queryset(self.get_queryset())
 
-        # Paginate the identifiers queryset
-        # The paginate_queryset method in KeysetPagination handles filtering by cursor/updated_after and ordering
-        page_identifiers = self.paginate_queryset(queryset)
-
-        if not page_identifiers:
+        # Get paginated identifiers using cursor pagination
+        page_items = self.paginate_queryset(queryset)
+        
+        if not page_items:
             # Return empty response with pagination structure
             return Response(OrderedDict([("next_cursor", None), ("data", [])]))
 
-        # Extract ethereum_tx_ids from the paginated relevant transactions
-        # These are needed to fetch the detailed transaction data
-        ethereum_tx_ids = [item.ethereum_tx_id for item in page_identifiers]
+        # Extract ethereum_tx_ids from the paginated items
+        ethereum_tx_ids = [item.ethereum_tx_id for item in page_items]
 
-        # Fetch and serialize the actual transaction data based on the IDs for the current page
-        # Using the reimplemented global fetching logic
-        all_txs_serialized = get_all_txs_from_identifiers_global(ethereum_tx_ids)
+        # Fetch full transaction data using our optimized service
+        transactions = self.transaction_service.get_transactions_with_transfers_from_tx_ids(
+            ethereum_tx_ids
+        )
 
-        # Determine the next cursor based on the last item of the identifier page
+        # Build response with pagination info
         next_cursor = None
-        paginator = self.paginator # Get the pagination instance used
-        if paginator.has_next:
-            # Use the last item from the *current* page of identifiers
-            last_identifier_item = page_identifiers[-1]
-            if last_identifier_item:
-                next_cursor = paginator.encode_cursor(last_identifier_item) # Use id for encoding
+        if self.paginator.has_next and page_items:
+            # Create cursor from the last item in current page
+            next_cursor = self.paginator.encode_cursor(page_items[-1])
 
+        # Return the final response
         return Response(
             OrderedDict([
                 ("next_cursor", next_cursor),
-                ("data", all_txs_serialized),
+                ("data", transactions),
             ])
         )
