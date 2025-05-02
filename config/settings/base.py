@@ -21,7 +21,7 @@ APPS_DIR = ROOT_DIR / "safe_transaction_service"
 
 env = environ.Env()
 
-READ_DOT_ENV_FILE = env.bool("DJANGO_READ_DOT_ENV_FILE", default=False)
+READ_DOT_ENV_FILE = env.bool("DJANGO_READ_DOT_ENV_FILE", default=True)
 DOT_ENV_FILE = env("DJANGO_DOT_ENV_FILE", default=None)
 if READ_DOT_ENV_FILE or DOT_ENV_FILE:
     DOT_ENV_FILE = DOT_ENV_FILE or ".env"
@@ -111,6 +111,7 @@ LOCAL_APPS = [
     "safe_transaction_service.analytics.apps.AnalyticsConfig",
     "safe_transaction_service.contracts.apps.ContractsConfig",
     "safe_transaction_service.events.apps.EventsConfig",
+    "safe_transaction_service.feed.apps.FeedConfig",
     "safe_transaction_service.history.apps.HistoryConfig",
     "safe_transaction_service.safe_messages.apps.SafeMessagesConfig",
     "safe_transaction_service.tokens.apps.TokensConfig",
@@ -213,6 +214,11 @@ FIXTURE_DIRS = (str(APPS_DIR / "fixtures"),)
 # ------------------------------------------------------------------------------
 # Django Admin URL regex.
 ADMIN_URL = "admin/"
+
+# Stats API
+# ------------------------------------------------------------------------------
+ENABLE_STATS_API = env.bool("ENABLE_STATS_API", default=True)
+INTERNAL_API_KEYS = env.list("INTERNAL_API_KEYS", default=[])
 
 # Celery
 # ------------------------------------------------------------------------------
