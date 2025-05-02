@@ -281,7 +281,7 @@ def get_all_txs_from_identifiers_global(
         OpenApiParameter(
             "limit",
             location="query",
-            description="Number of items to retrieve (default: 100, max: 1000).",
+            description="Number of items to retrieve (default: 1000, max: 10000).",
             required=False,
             type=OpenApiTypes.INT,
         ),

@@ -24,9 +24,9 @@ class KeysetPagination(BasePagination):
     Requires the queryset to be ordered by `("timestamp", "id")`.
     """
 
-    page_size = settings.REST_FRAMEWORK.get("PAGE_SIZE", 100)
+    page_size = settings.REST_FRAMEWORK.get("PAGE_SIZE", 1000)
     page_size_query_param = "limit"
-    max_page_size = 1000  # Maximum limit allowed
+    max_page_size = 10000  # Maximum limit allowed
     ordering = ("timestamp", "id") # Use id for ordering
     cursor_query_param = "cursor"
 
