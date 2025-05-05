@@ -22,6 +22,9 @@ from safe_transaction_service.tokens.models import Token
 
 logger = logging.getLogger(__name__)
 
+# Database query timeout in milliseconds
+QUERY_TIMEOUT_MS = getattr(settings, 'QUERY_TIMEOUT_MS', 5000)  # 5 seconds default
+
 # Recommended database indices to create for optimal performance:
 """
 -- IMPORTANT: Add these indices to dramatically improve query performance
@@ -118,6 +121,7 @@ class GlobalTransactionService:
             List of transaction data for this batch
         """
         batch_start = time.time()
+        logger.info(f"Starting batch processing for {len(ethereum_tx_ids)} tx_ids")
         
         # Use parallel execution for independent database queries
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
@@ -127,11 +131,26 @@ class GlobalTransactionService:
             ethereum_future = executor.submit(self._fetch_ethereum_transactions, ethereum_tx_ids)
             transfers_future = executor.submit(self._fetch_all_transfers, ethereum_tx_ids)
             
-            # Collect results as they complete
+            # Track when each future completes
+            logger.info("Waiting for parallel queries to complete...")
+            for i, future in enumerate(concurrent.futures.as_completed([multisig_future, module_future, ethereum_future, transfers_future])):
+                try:
+                    # Just check if it completed without error
+                    future.result()
+                    logger.info(f"Query {i+1}/4 completed in {time.time() - batch_start:.2f}s")
+                except Exception as e:
+                    logger.error(f"Query {i+1}/4 failed: {str(e)}")
+            
+            # Now collect all results (should be quick since they're done)
+            logger.info("All parallel queries finished, collecting results...")
             multisig_transactions = multisig_future.result()
+            logger.info(f"Multisig query returned {len(multisig_transactions)} tx groups")
             module_transactions = module_future.result()
+            logger.info(f"Module query returned {len(module_transactions)} tx groups")
             ethereum_transactions = ethereum_future.result()
+            logger.info(f"Ethereum query returned {len(ethereum_transactions)} txs")
             transfers_by_tx = transfers_future.result()
+            logger.info(f"Transfers query returned data for {len(transfers_by_tx)} txs")
         
         parallel_time = time.time() - batch_start
         self.performance_metrics["queries"].append({
@@ -141,13 +160,17 @@ class GlobalTransactionService:
         
         # These steps need to be processed sequentially
         token_start = time.time()
+        logger.info("Starting token lookups...")
         token_addresses = self._extract_token_addresses(transfers_by_tx)
+        logger.info(f"Found {len(token_addresses)} token addresses to look up")
         tokens_by_address = self._fetch_tokens_with_cache(token_addresses)
+        logger.info(f"Token lookup completed in {time.time() - token_start:.2f}s")
         self._map_tokens_to_transfers(transfers_by_tx, tokens_by_address)
         token_time = time.time() - token_start
         
         # Build final result
         build_start = time.time()
+        logger.info("Building final result...")
         result = self._build_final_result(
             ethereum_tx_ids,
             multisig_transactions,
@@ -155,6 +178,7 @@ class GlobalTransactionService:
             ethereum_transactions,
             transfers_by_tx
         )
+        logger.info(f"Result built with {len(result)} items in {time.time() - build_start:.2f}s")
         build_time = time.time() - build_start
         
         self.performance_metrics["queries"].append({
@@ -162,6 +186,10 @@ class GlobalTransactionService:
             "count": len(result),
             "time": time.time() - batch_start
         })
+        
+        # Overall timing
+        total_time = time.time() - batch_start
+        logger.info(f"Total batch processing time: {total_time:.2f}s")
         
         return result
 
@@ -188,56 +216,67 @@ class GlobalTransactionService:
         """
         start_time = time.time()
         
-        # Convert binary IDs to hex format if needed for consistent querying
-        normalized_ids = []
-        for tx_id in ethereum_tx_ids:
-            if isinstance(tx_id, bytes):
-                normalized_ids.append(tx_id)
-            elif tx_id.startswith('0x'):
-                # Convert hex string to bytes
-                normalized_ids.append(bytes.fromhex(tx_id[2:]))
-            else:
-                # Already hex string without prefix
-                normalized_ids.append(bytes.fromhex(tx_id))
+        # Set query timeout
+        with connection.cursor() as cursor:
+            cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
+            logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for multisig transactions query")
         
-        # Use select_related and prefetch_related to minimize database queries
-        queryset = (
-            MultisigTransaction.objects.filter(ethereum_tx_id__in=normalized_ids)
-            .with_confirmations_required()
-            .prefetch_related("confirmations")
-            .select_related("ethereum_tx__block")
-            .order_by("-nonce", "-created")
-        )
-        
-        # Force evaluation of queryset
-        multisig_txs = list(queryset)
-        query_count = len(multisig_txs)
-        
-        # Helper function for consistent tx_id format
-        def ensure_string_tx_id(tx_id):
-            return tx_id.hex() if isinstance(tx_id, bytes) else tx_id
-        
-        # Group by ethereum_tx_id for efficient lookups
-        result = {}
-        for tx in multisig_txs:
-            tx_id = ensure_string_tx_id(tx.ethereum_tx_id)
-            result.setdefault(tx_id, []).append(tx)
+        try:
+            # Convert binary IDs to hex format if needed for consistent querying
+            normalized_ids = []
+            for tx_id in ethereum_tx_ids:
+                if isinstance(tx_id, bytes):
+                    normalized_ids.append(tx_id)
+                elif tx_id.startswith('0x'):
+                    # Convert hex string to bytes
+                    normalized_ids.append(bytes.fromhex(tx_id[2:]))
+                else:
+                    # Already hex string without prefix
+                    normalized_ids.append(bytes.fromhex(tx_id))
             
-        elapsed = time.time() - start_time
-        self.performance_metrics["queries"].append({
-            "name": "Fetch multisig transactions",
-            "count": query_count,
-            "time": elapsed
-        })
-        
-        logger.debug(
-            "[%s] Fetched %d MultisigTransactions for %d ethereum_tx_ids",
-            __name__,
-            query_count,
-            len(ethereum_tx_ids),
-        )
-        
-        return result
+            logger.debug(f"Fetching multisig transactions with {len(normalized_ids)} tx IDs")
+            # Use select_related and prefetch_related to minimize database queries
+            queryset = (
+                MultisigTransaction.objects.filter(ethereum_tx_id__in=normalized_ids)
+                .with_confirmations_required()
+                .prefetch_related("confirmations")
+                .select_related("ethereum_tx__block")
+                .order_by("-nonce", "-created")
+            )
+            
+            # Force evaluation of queryset
+            multisig_txs = list(queryset)
+            query_count = len(multisig_txs)
+            
+            # Helper function for consistent tx_id format
+            def ensure_string_tx_id(tx_id):
+                return tx_id.hex() if isinstance(tx_id, bytes) else tx_id
+            
+            # Group by ethereum_tx_id for efficient lookups
+            result = {}
+            for tx in multisig_txs:
+                tx_id = ensure_string_tx_id(tx.ethereum_tx_id)
+                result.setdefault(tx_id, []).append(tx)
+                
+            elapsed = time.time() - start_time
+            self.performance_metrics["queries"].append({
+                "name": "Fetch multisig transactions",
+                "count": query_count,
+                "time": elapsed
+            })
+            
+            logger.debug(
+                "[%s] Fetched %d MultisigTransactions for %d ethereum_tx_ids",
+                __name__,
+                query_count,
+                len(ethereum_tx_ids),
+            )
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error fetching multisig transactions: {str(e)}")
+            # Return empty dict on error to allow processing to continue
+            return {}
 
     def _fetch_module_transactions(
         self, ethereum_tx_ids: List[str]
@@ -248,52 +287,63 @@ class GlobalTransactionService:
         """
         start_time = time.time()
         
-        # Convert binary IDs to hex format if needed for consistent querying
-        normalized_ids = []
-        for tx_id in ethereum_tx_ids:
-            if isinstance(tx_id, bytes):
-                normalized_ids.append(tx_id)
-            elif tx_id.startswith('0x'):
-                # Convert hex string to bytes
-                normalized_ids.append(bytes.fromhex(tx_id[2:]))
-            else:
-                # Already hex string without prefix
-                normalized_ids.append(bytes.fromhex(tx_id))
+        # Set query timeout
+        with connection.cursor() as cursor:
+            cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
+            logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for module transactions query")
         
-        queryset = (
-            ModuleTransaction.objects.filter(internal_tx__ethereum_tx_id__in=normalized_ids)
-            .select_related("internal_tx__ethereum_tx", "internal_tx__ethereum_tx__block")
-        )
-        
-        # Force evaluation of queryset
-        module_txs = list(queryset)
-        query_count = len(module_txs)
-        
-        # Helper function for consistent tx_id format
-        def ensure_string_tx_id(tx_id):
-            return tx_id.hex() if isinstance(tx_id, bytes) else tx_id
-        
-        # Group by ethereum_tx_id for efficient lookups
-        result = {}
-        for tx in module_txs:
-            eth_tx_id = ensure_string_tx_id(tx.internal_tx.ethereum_tx_id)
-            result.setdefault(eth_tx_id, []).append(tx)
-        
-        elapsed = time.time() - start_time
-        self.performance_metrics["queries"].append({
-            "name": "Fetch module transactions",
-            "count": query_count,
-            "time": elapsed
-        })
-        
-        logger.debug(
-            "[%s] Fetched %d ModuleTransactions for %d ethereum_tx_ids",
-            __name__,
-            query_count,
-            len(ethereum_tx_ids),
-        )
-        
-        return result
+        try:
+            # Convert binary IDs to hex format if needed for consistent querying
+            normalized_ids = []
+            for tx_id in ethereum_tx_ids:
+                if isinstance(tx_id, bytes):
+                    normalized_ids.append(tx_id)
+                elif tx_id.startswith('0x'):
+                    # Convert hex string to bytes
+                    normalized_ids.append(bytes.fromhex(tx_id[2:]))
+                else:
+                    # Already hex string without prefix
+                    normalized_ids.append(bytes.fromhex(tx_id))
+            
+            logger.debug(f"Fetching module transactions with {len(normalized_ids)} tx IDs")
+            queryset = (
+                ModuleTransaction.objects.filter(internal_tx__ethereum_tx_id__in=normalized_ids)
+                .select_related("internal_tx__ethereum_tx", "internal_tx__ethereum_tx__block")
+            )
+            
+            # Force evaluation of queryset
+            module_txs = list(queryset)
+            query_count = len(module_txs)
+            
+            # Helper function for consistent tx_id format
+            def ensure_string_tx_id(tx_id):
+                return tx_id.hex() if isinstance(tx_id, bytes) else tx_id
+            
+            # Group by ethereum_tx_id for efficient lookups
+            result = {}
+            for tx in module_txs:
+                eth_tx_id = ensure_string_tx_id(tx.internal_tx.ethereum_tx_id)
+                result.setdefault(eth_tx_id, []).append(tx)
+            
+            elapsed = time.time() - start_time
+            self.performance_metrics["queries"].append({
+                "name": "Fetch module transactions",
+                "count": query_count,
+                "time": elapsed
+            })
+            
+            logger.debug(
+                "[%s] Fetched %d ModuleTransactions for %d ethereum_tx_ids",
+                __name__,
+                query_count,
+                len(ethereum_tx_ids),
+            )
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error fetching module transactions: {str(e)}")
+            # Return empty dict on error to allow processing to continue
+            return {}
 
     def _fetch_ethereum_transactions(
         self, ethereum_tx_ids: List[str]
@@ -304,44 +354,55 @@ class GlobalTransactionService:
         """
         start_time = time.time()
         
-        # Convert binary IDs to hex format if needed for consistent querying
-        normalized_ids = []
-        for tx_id in ethereum_tx_ids:
-            if isinstance(tx_id, bytes):
-                normalized_ids.append(tx_id)
-            elif tx_id.startswith('0x'):
-                # Convert hex string to bytes
-                normalized_ids.append(bytes.fromhex(tx_id[2:]))
-            else:
-                # Already hex string without prefix
-                normalized_ids.append(bytes.fromhex(tx_id))
+        # Set query timeout
+        with connection.cursor() as cursor:
+            cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
+            logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for ethereum transactions query")
         
-        queryset = (
-            EthereumTx.objects.filter(tx_hash__in=normalized_ids)
-            .select_related("block")
-        )
-        
-        # Force evaluation and map by tx_hash
-        result = {}
-        for tx in queryset:
-            tx_id = tx.tx_hash.hex() if isinstance(tx.tx_hash, bytes) else tx.tx_hash
-            result[tx_id] = tx
-        
-        elapsed = time.time() - start_time
-        self.performance_metrics["queries"].append({
-            "name": "Fetch ethereum transactions",
-            "count": len(result),
-            "time": elapsed
-        })
-        
-        logger.debug(
-            "[%s] Fetched %d EthereumTxs for %d ethereum_tx_ids",
-            __name__,
-            len(result),
-            len(ethereum_tx_ids),
-        )
-        
-        return result
+        try:
+            # Convert binary IDs to hex format if needed for consistent querying
+            normalized_ids = []
+            for tx_id in ethereum_tx_ids:
+                if isinstance(tx_id, bytes):
+                    normalized_ids.append(tx_id)
+                elif tx_id.startswith('0x'):
+                    # Convert hex string to bytes
+                    normalized_ids.append(bytes.fromhex(tx_id[2:]))
+                else:
+                    # Already hex string without prefix
+                    normalized_ids.append(bytes.fromhex(tx_id))
+            
+            logger.debug(f"Fetching ethereum transactions with {len(normalized_ids)} tx IDs")
+            queryset = (
+                EthereumTx.objects.filter(tx_hash__in=normalized_ids)
+                .select_related("block")
+            )
+            
+            # Force evaluation and map by tx_hash
+            result = {}
+            for tx in queryset:
+                tx_id = tx.tx_hash.hex() if isinstance(tx.tx_hash, bytes) else tx.tx_hash
+                result[tx_id] = tx
+            
+            elapsed = time.time() - start_time
+            self.performance_metrics["queries"].append({
+                "name": "Fetch ethereum transactions",
+                "count": len(result),
+                "time": elapsed
+            })
+            
+            logger.debug(
+                "[%s] Fetched %d EthereumTxs for %d ethereum_tx_ids",
+                __name__,
+                len(result),
+                len(ethereum_tx_ids),
+            )
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error fetching ethereum transactions: {str(e)}")
+            # Return empty dict on error to allow processing to continue
+            return {}
 
     def _fetch_all_transfers(
         self, ethereum_tx_ids: List[str]
@@ -352,6 +413,7 @@ class GlobalTransactionService:
         """
         start_time = time.time()
         transfers_by_tx = {}
+        logger.info(f"Starting transfer fetching for {len(ethereum_tx_ids)} tx_ids")
         
         # Convert binary IDs to hex format if needed for consistent querying
         normalized_ids = []
@@ -366,6 +428,7 @@ class GlobalTransactionService:
                 normalized_ids.append(bytes.fromhex(tx_id))
         
         # Use parallel execution for fetching different transfer types
+        logger.info("Starting parallel transfer queries...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
             # Submit parallel tasks
             erc20_future = executor.submit(
@@ -378,7 +441,22 @@ class GlobalTransactionService:
                 self._fetch_ether_transfers, normalized_ids
             )
             
+            # Track completion of individual transfer futures
+            for i, (name, future) in enumerate([
+                ("ERC20", erc20_future), 
+                ("ERC721", erc721_future), 
+                ("Ether", ether_future)
+            ]):
+                try:
+                    logger.info(f"Waiting for {name} transfers...")
+                    start = time.time()
+                    result = future.result()
+                    logger.info(f"{name} transfers query completed in {time.time() - start:.2f}s with {len(result)} results")
+                except Exception as e:
+                    logger.error(f"{name} transfers query failed: {str(e)}")
+            
             # Process each type of transfer
+            logger.info("All transfer queries completed, processing results...")
             erc20_transfers = erc20_future.result()
             erc721_transfers = erc721_future.result()
             ether_transfers = ether_future.result()
@@ -387,6 +465,7 @@ class GlobalTransactionService:
         def ensure_string_tx_id(tx_id):
             return tx_id.hex() if isinstance(tx_id, bytes) else tx_id
         
+        logger.info("Processing ERC20 transfers...")
         # Process ERC20 transfers
         for transfer in erc20_transfers:
             tx_id = ensure_string_tx_id(transfer.ethereum_tx_id)
@@ -405,6 +484,7 @@ class GlobalTransactionService:
             }
             transfers_by_tx.setdefault(tx_id, []).append(transfer_data)
         
+        logger.info("Processing ERC721 transfers...")
         # Process ERC721 transfers
         for transfer in erc721_transfers:
             tx_id = ensure_string_tx_id(transfer.ethereum_tx_id)
@@ -423,6 +503,7 @@ class GlobalTransactionService:
             }
             transfers_by_tx.setdefault(tx_id, []).append(transfer_data)
         
+        logger.info("Processing Ether transfers...")
         # Process Ether transfers
         for transfer in ether_transfers:
             tx_id = ensure_string_tx_id(transfer.ethereum_tx_id)
@@ -450,6 +531,7 @@ class GlobalTransactionService:
             "time": elapsed
         })
         
+        logger.info(f"All transfer processing completed in {elapsed:.2f}s")
         logger.debug(
             "[%s] Fetched %d transfers for %d ethereum_tx_ids",
             __name__,
@@ -463,64 +545,94 @@ class GlobalTransactionService:
         """Fetch ERC20 transfers for the specified transaction IDs"""
         start_time = time.time()
         
-        erc20_transfers = (
-            ERC20Transfer.objects.filter(ethereum_tx_id__in=ethereum_tx_ids)
-            .select_related("ethereum_tx__block")
-        )
+        # Set query timeout
+        with connection.cursor() as cursor:
+            cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
+            logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for ERC20 transfers query")
         
-        # Force evaluation
-        erc20_list = list(erc20_transfers)
-        
-        elapsed = time.time() - start_time
-        self.performance_metrics["queries"].append({
-            "name": "Fetch ERC20 transfers",
-            "count": len(erc20_list),
-            "time": elapsed
-        })
-        
-        return erc20_list
+        try:
+            erc20_transfers = (
+                ERC20Transfer.objects.filter(ethereum_tx_id__in=ethereum_tx_ids)
+                .select_related("ethereum_tx__block")
+            )
+            
+            # Force evaluation
+            erc20_list = list(erc20_transfers)
+            
+            elapsed = time.time() - start_time
+            self.performance_metrics["queries"].append({
+                "name": "Fetch ERC20 transfers",
+                "count": len(erc20_list),
+                "time": elapsed
+            })
+            
+            return erc20_list
+        except Exception as e:
+            logger.error(f"Error fetching ERC20 transfers: {str(e)}")
+            # Return empty list on error to allow processing to continue
+            return []
     
     def _fetch_erc721_transfers(self, ethereum_tx_ids: List):
         """Fetch ERC721 transfers for the specified transaction IDs"""
         start_time = time.time()
         
-        erc721_transfers = (
-            ERC721Transfer.objects.filter(ethereum_tx_id__in=ethereum_tx_ids)
-            .select_related("ethereum_tx__block")
-        )
+        # Set query timeout
+        with connection.cursor() as cursor:
+            cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
+            logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for ERC721 transfers query")
         
-        # Force evaluation
-        erc721_list = list(erc721_transfers)
-        
-        elapsed = time.time() - start_time
-        self.performance_metrics["queries"].append({
-            "name": "Fetch ERC721 transfers",
-            "count": len(erc721_list),
-            "time": elapsed
-        })
-        
-        return erc721_list
+        try:
+            erc721_transfers = (
+                ERC721Transfer.objects.filter(ethereum_tx_id__in=ethereum_tx_ids)
+                .select_related("ethereum_tx__block")
+            )
+            
+            # Force evaluation
+            erc721_list = list(erc721_transfers)
+            
+            elapsed = time.time() - start_time
+            self.performance_metrics["queries"].append({
+                "name": "Fetch ERC721 transfers",
+                "count": len(erc721_list),
+                "time": elapsed
+            })
+            
+            return erc721_list
+        except Exception as e:
+            logger.error(f"Error fetching ERC721 transfers: {str(e)}")
+            # Return empty list on error to allow processing to continue
+            return []
     
     def _fetch_ether_transfers(self, ethereum_tx_ids: List):
         """Fetch Ether transfers for the specified transaction IDs"""
         start_time = time.time()
         
-        ether_transfers = (
-            InternalTx.objects.filter(ethereum_tx_id__in=ethereum_tx_ids, value__gt=0)
-            .select_related("ethereum_tx__block")
-        )
+        # Set query timeout
+        with connection.cursor() as cursor:
+            cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
+            logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for Ether transfers query")
         
-        # Force evaluation
-        ether_list = list(ether_transfers)
-        
-        elapsed = time.time() - start_time
-        self.performance_metrics["queries"].append({
-            "name": "Fetch Ether transfers",
-            "count": len(ether_list),
-            "time": elapsed
-        })
-        
-        return ether_list
+        try:
+            ether_transfers = (
+                InternalTx.objects.filter(ethereum_tx_id__in=ethereum_tx_ids, value__gt=0)
+                .select_related("ethereum_tx__block")
+            )
+            
+            # Force evaluation
+            ether_list = list(ether_transfers)
+            
+            elapsed = time.time() - start_time
+            self.performance_metrics["queries"].append({
+                "name": "Fetch Ether transfers",
+                "count": len(ether_list),
+                "time": elapsed
+            })
+            
+            return ether_list
+        except Exception as e:
+            logger.error(f"Error fetching Ether transfers: {str(e)}")
+            # Return empty list on error to allow processing to continue
+            return []
 
     def _extract_token_addresses(
         self, transfers_by_tx: Dict[str, List[Dict[str, Any]]]
@@ -560,13 +672,24 @@ class GlobalTransactionService:
         
         # Fetch only tokens that aren't in cache
         if addresses_to_fetch:
-            tokens = Token.objects.filter(address__in=addresses_to_fetch)
+            # Set query timeout
+            with connection.cursor() as cursor:
+                cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
+                logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for token information query")
             
-            # Update cache and result dict
-            for token in tokens:
-                tokens_by_address[token.address] = token
-                cache_key = f"token_info_{token.address}"
-                cache.set(cache_key, token, TOKEN_CACHE_TTL)
+            try:
+                logger.debug(f"Fetching {len(addresses_to_fetch)} tokens from database")
+                tokens = Token.objects.filter(address__in=addresses_to_fetch)
+                
+                # Update cache and result dict
+                for token in tokens:
+                    tokens_by_address[token.address] = token
+                    cache_key = f"token_info_{token.address}"
+                    cache.set(cache_key, token, TOKEN_CACHE_TTL)
+            except Exception as e:
+                logger.error(f"Error fetching token information: {str(e)}")
+                # Continue with whatever tokens we have from cache
+                pass
         
         elapsed = time.time() - start_time
         self.performance_metrics["queries"].append({
