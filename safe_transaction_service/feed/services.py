@@ -23,7 +23,7 @@ from safe_transaction_service.tokens.models import Token
 logger = logging.getLogger(__name__)
 
 # Database query timeout in milliseconds
-QUERY_TIMEOUT_MS = getattr(settings, 'QUERY_TIMEOUT_MS', 5000)  # 5 seconds default
+QUERY_TIMEOUT_MS = getattr(settings, 'QUERY_TIMEOUT_MS', 30000)  # 30 seconds default
 
 # Recommended database indices to create for optimal performance:
 """
@@ -76,7 +76,6 @@ class GlobalTransactionService:
         
         Args:
             ethereum_tx_ids: List of ethereum transaction hash strings
-            use_cache: Whether to use the cache for this request
             
         Returns:
             List of serializable transaction dictionaries with their associated transfers
@@ -87,8 +86,8 @@ class GlobalTransactionService:
         if not ethereum_tx_ids:
             return []
 
-        logger.debug(
-            "[%s] Fetching detailed transaction data for %d ethereum_tx_ids",
+        logger.info(
+            "[%s] Starting transaction processing for %d ethereum_tx_ids",
             __name__,
             len(ethereum_tx_ids),
         )
@@ -96,17 +95,27 @@ class GlobalTransactionService:
         # Process in batches to prevent excessive memory usage
         result = []
         batch_size = min(MAX_BATCH_SIZE, len(ethereum_tx_ids))
+        total_batches = (len(ethereum_tx_ids) + batch_size - 1) // batch_size
         
         for i in range(0, len(ethereum_tx_ids), batch_size):
             batch = ethereum_tx_ids[i:i+batch_size]
-            logger.debug(f"Processing batch {i//batch_size + 1} of {(len(ethereum_tx_ids) + batch_size - 1) // batch_size}")
-            batch_result = self._process_transaction_batch(batch)
-            result.extend(batch_result)
+            batch_num = i//batch_size + 1
+            logger.info(f"Processing batch {batch_num} of {total_batches} ({len(batch)} tx_ids)")
+            
+            try:
+                batch_result = self._process_transaction_batch(batch)
+                result.extend(batch_result)
+                logger.info(f"Batch {batch_num} completed successfully with {len(batch_result)} results")
+            except Exception as e:
+                logger.error(f"Error processing batch {batch_num}: {str(e)}", exc_info=True)
+                # Continue with next batch instead of failing completely
 
         self.performance_metrics["total_time"] = time.time() - start_total
         
         # Log performance metrics
         self._log_performance_metrics()
+        
+        logger.info(f"Processing completed successfully with {len(result)} total transactions")
         
         return result
         
@@ -123,6 +132,12 @@ class GlobalTransactionService:
         batch_start = time.time()
         logger.info(f"Starting batch processing for {len(ethereum_tx_ids)} tx_ids")
         
+        # Default empty results in case of failures
+        multisig_transactions = {}
+        module_transactions = {}
+        ethereum_transactions = {}
+        transfers_by_tx = {}
+        
         # Use parallel execution for independent database queries
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
             # Submit parallel tasks
@@ -131,32 +146,66 @@ class GlobalTransactionService:
             ethereum_future = executor.submit(self._fetch_ethereum_transactions, ethereum_tx_ids)
             transfers_future = executor.submit(self._fetch_all_transfers, ethereum_tx_ids)
             
-            # Track when each future completes
-            logger.info("Waiting for parallel queries to complete...")
-            for i, future in enumerate(concurrent.futures.as_completed([multisig_future, module_future, ethereum_future, transfers_future])):
-                try:
-                    # Just check if it completed without error
-                    future.result()
-                    logger.info(f"Query {i+1}/4 completed in {time.time() - batch_start:.2f}s")
-                except Exception as e:
-                    logger.error(f"Query {i+1}/4 failed: {str(e)}")
+            # Set timeout for each future
+            FUTURE_TIMEOUT = 30  # seconds
             
-            # Now collect all results (should be quick since they're done)
-            logger.info("All parallel queries finished, collecting results...")
-            multisig_transactions = multisig_future.result()
-            logger.info(f"Multisig query returned {len(multisig_transactions)} tx groups")
-            module_transactions = module_future.result()
-            logger.info(f"Module query returned {len(module_transactions)} tx groups")
-            ethereum_transactions = ethereum_future.result()
-            logger.info(f"Ethereum query returned {len(ethereum_transactions)} txs")
-            transfers_by_tx = transfers_future.result()
-            logger.info(f"Transfers query returned data for {len(transfers_by_tx)} txs")
+            # Track when each future completes
+            logger.info(f"Waiting for parallel queries to complete (timeout: {FUTURE_TIMEOUT}s per query)...")
+            try:
+                # Try to get multisig transactions with timeout
+                multisig_start = time.time()
+                multisig_transactions = multisig_future.result(timeout=FUTURE_TIMEOUT)
+                multisig_time = time.time() - multisig_start
+                logger.info(f"Multisig query returned {len(multisig_transactions)} tx groups in {multisig_time:.2f}s")
+            except concurrent.futures.TimeoutError:
+                logger.error(f"Multisig transactions query TIMED OUT after {FUTURE_TIMEOUT}s")
+            except Exception as e:
+                logger.error(f"Multisig transactions query failed: {str(e)}")
+                
+            try:
+                # Try to get module transactions with timeout
+                module_start = time.time()
+                module_transactions = module_future.result(timeout=FUTURE_TIMEOUT)
+                module_time = time.time() - module_start
+                logger.info(f"Module query returned {len(module_transactions)} tx groups in {module_time:.2f}s")
+            except concurrent.futures.TimeoutError:
+                logger.error(f"Module transactions query TIMED OUT after {FUTURE_TIMEOUT}s")
+            except Exception as e:
+                logger.error(f"Module transactions query failed: {str(e)}")
+                
+            try:
+                # Try to get ethereum transactions with timeout
+                ethereum_start = time.time()
+                ethereum_transactions = ethereum_future.result(timeout=FUTURE_TIMEOUT)
+                ethereum_time = time.time() - ethereum_start
+                logger.info(f"Ethereum query returned {len(ethereum_transactions)} txs in {ethereum_time:.2f}s")
+            except concurrent.futures.TimeoutError:
+                logger.error(f"Ethereum transactions query TIMED OUT after {FUTURE_TIMEOUT}s")
+            except Exception as e:
+                logger.error(f"Ethereum transactions query failed: {str(e)}")
+                
+            try:
+                # Try to get transfers with timeout
+                transfers_start = time.time()
+                transfers_by_tx = transfers_future.result(timeout=FUTURE_TIMEOUT)
+                transfers_time = time.time() - transfers_start
+                logger.info(f"Transfers query returned data for {len(transfers_by_tx)} txs in {transfers_time:.2f}s")
+            except concurrent.futures.TimeoutError:
+                logger.error(f"Transfers query TIMED OUT after {FUTURE_TIMEOUT}s")
+                # Continue with empty transfers
+            except Exception as e:
+                logger.error(f"Transfers query failed: {str(e)}")
         
         parallel_time = time.time() - batch_start
         self.performance_metrics["queries"].append({
             "name": "Parallel query execution",
             "time": parallel_time
         })
+        
+        # Process only if we have at least ethereum transactions data
+        if not ethereum_transactions:
+            logger.error("No ethereum transaction data available - unable to process batch")
+            return []
         
         # These steps need to be processed sequentially
         token_start = time.time()
@@ -409,7 +458,7 @@ class GlobalTransactionService:
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         Fetch all transfers (ERC20, ERC721, Ether) for the given ethereum_tx_ids.
-        Using optimized parallel fetching for different transfer types.
+        Using sequential fetching for different transfer types to avoid parallelization issues.
         """
         start_time = time.time()
         transfers_by_tx = {}
@@ -427,39 +476,38 @@ class GlobalTransactionService:
                 # Already hex string without prefix
                 normalized_ids.append(bytes.fromhex(tx_id))
         
-        # Use parallel execution for fetching different transfer types
-        logger.info("Starting parallel transfer queries...")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            # Submit parallel tasks
-            erc20_future = executor.submit(
-                self._fetch_erc20_transfers, normalized_ids
-            )
-            erc721_future = executor.submit(
-                self._fetch_erc721_transfers, normalized_ids
-            )
-            ether_future = executor.submit(
-                self._fetch_ether_transfers, normalized_ids
-            )
-            
-            # Track completion of individual transfer futures
-            for i, (name, future) in enumerate([
-                ("ERC20", erc20_future), 
-                ("ERC721", erc721_future), 
-                ("Ether", ether_future)
-            ]):
-                try:
-                    logger.info(f"Waiting for {name} transfers...")
-                    start = time.time()
-                    result = future.result()
-                    logger.info(f"{name} transfers query completed in {time.time() - start:.2f}s with {len(result)} results")
-                except Exception as e:
-                    logger.error(f"{name} transfers query failed: {str(e)}")
-            
-            # Process each type of transfer
-            logger.info("All transfer queries completed, processing results...")
-            erc20_transfers = erc20_future.result()
-            erc721_transfers = erc721_future.result()
-            ether_transfers = ether_future.result()
+        # Fetch transfers sequentially instead of in parallel
+        logger.info("Fetching transfers sequentially...")
+        
+        # Fetch ERC20 transfers
+        erc20_start = time.time()
+        logger.info("Fetching ERC20 transfers...")
+        try:
+            erc20_transfers = self._fetch_erc20_transfers(normalized_ids)
+            logger.info(f"ERC20 transfers fetched in {time.time() - erc20_start:.2f}s: {len(erc20_transfers)} results")
+        except Exception as e:
+            logger.error(f"Error fetching ERC20 transfers: {str(e)}")
+            erc20_transfers = []
+        
+        # Fetch ERC721 transfers
+        erc721_start = time.time()
+        logger.info("Fetching ERC721 transfers...")
+        try:
+            erc721_transfers = self._fetch_erc721_transfers(normalized_ids)
+            logger.info(f"ERC721 transfers fetched in {time.time() - erc721_start:.2f}s: {len(erc721_transfers)} results")
+        except Exception as e:
+            logger.error(f"Error fetching ERC721 transfers: {str(e)}")
+            erc721_transfers = []
+        
+        # Fetch Ether transfers
+        ether_start = time.time()
+        logger.info("Fetching Ether transfers...")
+        try:
+            ether_transfers = self._fetch_ether_transfers(normalized_ids)
+            logger.info(f"Ether transfers fetched in {time.time() - ether_start:.2f}s: {len(ether_transfers)} results")
+        except Exception as e:
+            logger.error(f"Error fetching Ether transfers: {str(e)}")
+            ether_transfers = []
         
         # Helper function to ensure consistent tx_id format
         def ensure_string_tx_id(tx_id):
@@ -526,7 +574,7 @@ class GlobalTransactionService:
         elapsed = time.time() - start_time
         
         self.performance_metrics["queries"].append({
-            "name": "Fetch all transfers (parallel)",
+            "name": "Fetch all transfers (sequential)",
             "count": total_transfers,
             "time": elapsed
         })
@@ -545,19 +593,40 @@ class GlobalTransactionService:
         """Fetch ERC20 transfers for the specified transaction IDs"""
         start_time = time.time()
         
-        # Set query timeout
-        with connection.cursor() as cursor:
-            cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
-            logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for ERC20 transfers query")
-        
         try:
+            # Set query timeout
+            with connection.cursor() as cursor:
+                cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
+                logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for ERC20 transfers query")
+            
+            # Add EXPLAIN query first to check execution plan
+            logger.debug("Running EXPLAIN for ERC20 transfers query")
+            with connection.cursor() as cursor:
+                try:
+                    cursor.execute(
+                        "EXPLAIN ANALYZE SELECT * FROM history_erc20transfer WHERE ethereum_tx_id IN %s",
+                        (tuple(ethereum_tx_ids),)
+                    )
+                    execution_plan = cursor.fetchall()
+                    for line in execution_plan:
+                        logger.debug(f"ERC20 EXPLAIN: {line[0]}")
+                except Exception as e:
+                    logger.error(f"Error running EXPLAIN for ERC20 transfers: {str(e)}")
+            
+            logger.info(f"Executing ERC20 transfers query for {len(ethereum_tx_ids)} tx_ids")
             erc20_transfers = (
                 ERC20Transfer.objects.filter(ethereum_tx_id__in=ethereum_tx_ids)
                 .select_related("ethereum_tx__block")
             )
             
             # Force evaluation
+            query_start = time.time()
             erc20_list = list(erc20_transfers)
+            query_time = time.time() - query_start
+            
+            logger.info(f"ERC20 transfers query execution completed in {query_time:.4f}s")
+            if query_time > 2.0:  # Flag slow queries
+                logger.warning(f"SLOW QUERY: ERC20 transfers took {query_time:.4f}s for {len(erc20_list)} records")
             
             elapsed = time.time() - start_time
             self.performance_metrics["queries"].append({
@@ -568,7 +637,7 @@ class GlobalTransactionService:
             
             return erc20_list
         except Exception as e:
-            logger.error(f"Error fetching ERC20 transfers: {str(e)}")
+            logger.error(f"Error fetching ERC20 transfers: {str(e)}", exc_info=True)
             # Return empty list on error to allow processing to continue
             return []
     
@@ -576,19 +645,40 @@ class GlobalTransactionService:
         """Fetch ERC721 transfers for the specified transaction IDs"""
         start_time = time.time()
         
-        # Set query timeout
-        with connection.cursor() as cursor:
-            cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
-            logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for ERC721 transfers query")
-        
         try:
+            # Set query timeout
+            with connection.cursor() as cursor:
+                cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
+                logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for ERC721 transfers query")
+            
+            # Add EXPLAIN query first to check execution plan
+            logger.debug("Running EXPLAIN for ERC721 transfers query")
+            with connection.cursor() as cursor:
+                try:
+                    cursor.execute(
+                        "EXPLAIN ANALYZE SELECT * FROM history_erc721transfer WHERE ethereum_tx_id IN %s",
+                        (tuple(ethereum_tx_ids),)
+                    )
+                    execution_plan = cursor.fetchall()
+                    for line in execution_plan:
+                        logger.debug(f"ERC721 EXPLAIN: {line[0]}")
+                except Exception as e:
+                    logger.error(f"Error running EXPLAIN for ERC721 transfers: {str(e)}")
+            
+            logger.info(f"Executing ERC721 transfers query for {len(ethereum_tx_ids)} tx_ids")
             erc721_transfers = (
                 ERC721Transfer.objects.filter(ethereum_tx_id__in=ethereum_tx_ids)
                 .select_related("ethereum_tx__block")
             )
             
             # Force evaluation
+            query_start = time.time()
             erc721_list = list(erc721_transfers)
+            query_time = time.time() - query_start
+            
+            logger.info(f"ERC721 transfers query execution completed in {query_time:.4f}s")
+            if query_time > 2.0:  # Flag slow queries
+                logger.warning(f"SLOW QUERY: ERC721 transfers took {query_time:.4f}s for {len(erc721_list)} records")
             
             elapsed = time.time() - start_time
             self.performance_metrics["queries"].append({
@@ -599,7 +689,7 @@ class GlobalTransactionService:
             
             return erc721_list
         except Exception as e:
-            logger.error(f"Error fetching ERC721 transfers: {str(e)}")
+            logger.error(f"Error fetching ERC721 transfers: {str(e)}", exc_info=True)
             # Return empty list on error to allow processing to continue
             return []
     
@@ -607,19 +697,40 @@ class GlobalTransactionService:
         """Fetch Ether transfers for the specified transaction IDs"""
         start_time = time.time()
         
-        # Set query timeout
-        with connection.cursor() as cursor:
-            cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
-            logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for Ether transfers query")
-        
         try:
+            # Set query timeout
+            with connection.cursor() as cursor:
+                cursor.execute(f'SET statement_timeout = {QUERY_TIMEOUT_MS};')
+                logger.debug(f"Set statement timeout to {QUERY_TIMEOUT_MS}ms for Ether transfers query")
+            
+            # Add EXPLAIN query first to check execution plan
+            logger.debug("Running EXPLAIN for Ether transfers query")
+            with connection.cursor() as cursor:
+                try:
+                    cursor.execute(
+                        "EXPLAIN ANALYZE SELECT * FROM history_internaltx WHERE ethereum_tx_id IN %s AND value > 0",
+                        (tuple(ethereum_tx_ids),)
+                    )
+                    execution_plan = cursor.fetchall()
+                    for line in execution_plan:
+                        logger.debug(f"Ether EXPLAIN: {line[0]}")
+                except Exception as e:
+                    logger.error(f"Error running EXPLAIN for Ether transfers: {str(e)}")
+            
+            logger.info(f"Executing Ether transfers query for {len(ethereum_tx_ids)} tx_ids")
             ether_transfers = (
                 InternalTx.objects.filter(ethereum_tx_id__in=ethereum_tx_ids, value__gt=0)
                 .select_related("ethereum_tx__block")
             )
             
             # Force evaluation
+            query_start = time.time()
             ether_list = list(ether_transfers)
+            query_time = time.time() - query_start
+            
+            logger.info(f"Ether transfers query execution completed in {query_time:.4f}s")
+            if query_time > 2.0:  # Flag slow queries
+                logger.warning(f"SLOW QUERY: Ether transfers took {query_time:.4f}s for {len(ether_list)} records")
             
             elapsed = time.time() - start_time
             self.performance_metrics["queries"].append({
@@ -630,7 +741,7 @@ class GlobalTransactionService:
             
             return ether_list
         except Exception as e:
-            logger.error(f"Error fetching Ether transfers: {str(e)}")
+            logger.error(f"Error fetching Ether transfers: {str(e)}", exc_info=True)
             # Return empty list on error to allow processing to continue
             return []
 
