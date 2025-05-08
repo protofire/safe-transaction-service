@@ -8,6 +8,7 @@ from django.db.models import Min, Q
 from eth_typing import ChecksumAddress
 from hexbytes import HexBytes
 from safe_eth.eth import EthereumClient, get_auto_ethereum_client
+from safe_eth.util.util import to_0x_hex_str
 
 from ..models import EthereumBlock, EthereumTx
 from ..models import IndexingStatus as IndexingStatusDb
@@ -26,20 +27,23 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
-class IndexingStatus:
+class AllIndexingStatus:
     current_block_number: int
+    current_block_timestamp: int
     erc20_block_number: int
+    erc20_block_timestamp: int
     erc20_synced: bool
     master_copies_block_number: int
+    master_copies_block_timestamp: int
     master_copies_synced: bool
     synced: bool
 
 
 @dataclass
-class ERC20IndexingStatus:
+class SpecificIndexingStatus:
     current_block_number: int
-    erc20_block_number: int
-    erc20_synced: bool
+    block_number: int
+    synced: bool
 
 
 class IndexingException(Exception):
@@ -67,6 +71,8 @@ class IndexServiceProvider:
                 get_auto_ethereum_client(),
                 settings.ETH_REORG_BLOCKS,
                 settings.ETH_L2_NETWORK,
+                settings.ETH_INTERNAL_TX_DECODED_PROCESS_BATCH,
+                settings.PROCESSING_ENABLE_OUT_OF_ORDER_CHECK,
             )
         return cls.instance
 
@@ -82,10 +88,21 @@ class IndexService:
         ethereum_client: EthereumClient,
         eth_reorg_blocks: int,
         eth_l2_network: bool,
+        eth_internal_tx_decoded_process_batch: int,
+        processing_enable_out_of_order_check: bool,
     ):
         self.ethereum_client = ethereum_client
         self.eth_reorg_blocks = eth_reorg_blocks
         self.eth_l2_network = eth_l2_network
+        self.eth_internal_tx_decoded_process_batch = (
+            eth_internal_tx_decoded_process_batch
+        )
+        self.processing_enable_out_of_order_check = processing_enable_out_of_order_check
+
+        # Prevent circular import
+        from ..indexers.tx_processor import SafeTxProcessor, SafeTxProcessorProvider
+
+        self.tx_processor: SafeTxProcessor = SafeTxProcessorProvider()
 
     def block_get_or_create_from_block_hash(self, block_hash: int):
         try:
@@ -110,15 +127,23 @@ class IndexService:
             min_master_copies_block_number=Min("tx_block_number")
         )["min_master_copies_block_number"]
 
-    def get_indexing_status(self) -> IndexingStatus:
-        current_block_number = self.ethereum_client.current_block_number
-
-        # Indexing points to the next block to be indexed, we need the previous ones
+    def get_erc20_indexing_status(
+        self, current_block_number: int
+    ) -> SpecificIndexingStatus:
         erc20_block_number = min(
             max(self.get_erc20_721_current_indexing_block_number() - 1, 0),
             current_block_number,
         )
+        erc20_synced = (
+            current_block_number - erc20_block_number <= self.eth_reorg_blocks
+        )
+        return SpecificIndexingStatus(
+            current_block_number, erc20_block_number, erc20_synced
+        )
 
+    def get_master_copies_indexing_status(
+        self, current_block_number: int
+    ) -> SpecificIndexingStatus:
         if (
             master_copies_current_indexing_block_number := self.get_master_copies_current_indexing_block_number()
         ) is None:
@@ -129,20 +154,50 @@ class IndexService:
                 current_block_number,
             )
 
-        erc20_synced = (
-            current_block_number - erc20_block_number <= self.eth_reorg_blocks
-        )
         master_copies_synced = (
             current_block_number - master_copies_block_number <= self.eth_reorg_blocks
         )
+        return SpecificIndexingStatus(
+            current_block_number, master_copies_block_number, master_copies_synced
+        )
 
-        return IndexingStatus(
+    def get_indexing_status(self) -> AllIndexingStatus:
+        current_block = self.ethereum_client.get_block("latest")
+        current_block_number = current_block["number"]
+
+        erc20_indexing_status = self.get_erc20_indexing_status(current_block_number)
+        master_copies_indexing_status = self.get_master_copies_indexing_status(
+            current_block_number
+        )
+
+        if (
+            erc20_indexing_status.block_number
+            == master_copies_indexing_status.block_number
+            == current_block_number
+        ):
+            erc20_block, master_copies_block = [current_block, current_block]
+        else:
+            erc20_block, master_copies_block = self.ethereum_client.get_blocks(
+                [
+                    erc20_indexing_status.block_number,
+                    master_copies_indexing_status.block_number,
+                ]
+            )
+        current_block_timestamp = current_block["timestamp"]
+        erc20_block_timestamp = erc20_block["timestamp"]
+        master_copies_block_timestamp = master_copies_block["timestamp"]
+
+        return AllIndexingStatus(
             current_block_number=current_block_number,
-            erc20_block_number=erc20_block_number,
-            erc20_synced=erc20_synced,
-            master_copies_block_number=master_copies_block_number,
-            master_copies_synced=master_copies_synced,
-            synced=erc20_synced and master_copies_synced,
+            current_block_timestamp=current_block_timestamp,
+            erc20_block_number=erc20_indexing_status.block_number,
+            erc20_block_timestamp=erc20_block_timestamp,
+            erc20_synced=erc20_indexing_status.synced,
+            master_copies_block_number=master_copies_indexing_status.block_number,
+            master_copies_block_timestamp=master_copies_block_timestamp,
+            master_copies_synced=master_copies_indexing_status.synced,
+            synced=erc20_indexing_status.synced
+            and master_copies_indexing_status.synced,
         )
 
     def is_service_synced(self) -> bool:
@@ -198,7 +253,7 @@ class IndexService:
         logger.debug("Don't retrieve existing txs on DB. Find them first")
         # Search first in database
         ethereum_txs_dict = OrderedDict.fromkeys(
-            [HexBytes(tx_hash).hex() for tx_hash in tx_hashes]
+            [to_0x_hex_str(HexBytes(tx_hash)) for tx_hash in tx_hashes]
         )
         db_ethereum_txs = EthereumTx.objects.filter(tx_hash__in=tx_hashes).exclude(
             block=None
@@ -229,13 +284,13 @@ class IndexService:
             )  # Retry fetching if failed
             if not tx_receipt:
                 raise TransactionNotFoundException(
-                    f"Cannot find tx-receipt with tx-hash={HexBytes(tx_hash).hex()}"
+                    f"Cannot find tx-receipt with tx-hash={to_0x_hex_str(HexBytes(tx_hash))}"
                 )
 
             if tx_receipt.get("blockHash") is None:
                 raise TransactionWithoutBlockException(
                     f"Cannot find blockHash for tx-receipt with "
-                    f"tx-hash={HexBytes(tx_hash).hex()}"
+                    f"tx-hash={to_0x_hex_str(HexBytes(tx_hash))}"
                 )
 
             tx_receipts.append(tx_receipt)
@@ -251,16 +306,16 @@ class IndexService:
             )  # Retry fetching if failed
             if not tx:
                 raise TransactionNotFoundException(
-                    f"Cannot find tx with tx-hash={HexBytes(tx_hash).hex()}"
+                    f"Cannot find tx with tx-hash={to_0x_hex_str(HexBytes(tx_hash))}"
                 )
 
             if tx.get("blockHash") is None:
                 raise TransactionWithoutBlockException(
                     f"Cannot find blockHash for tx with "
-                    f"tx-hash={HexBytes(tx_hash).hex()}"
+                    f"tx-hash={to_0x_hex_str(HexBytes(tx_hash))}"
                 )
 
-            block_hashes.add(tx["blockHash"].hex())
+            block_hashes.add(to_0x_hex_str(tx["blockHash"]))
             txs.append(tx)
         logger.debug("Got txs from RPC. Getting %d blocks", len(block_hashes))
 
@@ -274,7 +329,7 @@ class IndexService:
                 raise BlockNotFoundException(
                     f"Block with hash={block_hash} was not found"
                 )
-            assert block_hash == block["hash"].hex()
+            assert block_hash == to_0x_hex_str(block["hash"])
             block_dict[block["hash"]] = block
 
         logger.debug(
@@ -298,13 +353,16 @@ class IndexService:
                     ethereum_tx = EthereumTx.objects.create_from_tx_dict(
                         tx, tx_receipt=tx_receipt, ethereum_block=ethereum_block
                     )
-                ethereum_txs_dict[HexBytes(ethereum_tx.tx_hash).hex()] = ethereum_tx
+                ethereum_txs_dict[to_0x_hex_str(HexBytes(ethereum_tx.tx_hash))] = (
+                    ethereum_tx
+                )
             except IntegrityError:  # Tx exists
                 ethereum_tx = EthereumTx.objects.get(tx_hash=tx["hash"])
                 # For txs stored before being mined
                 ethereum_tx.update_with_block_and_receipt(ethereum_block, tx_receipt)
                 ethereum_txs_dict[ethereum_tx.tx_hash] = ethereum_tx
         logger.debug("Blocks, transactions and receipts were inserted")
+
         return list(ethereum_txs_dict.values())
 
     @transaction.atomic
@@ -358,7 +416,8 @@ class IndexService:
     ) -> None:
         """
         Fix a Safe that has transactions out of order (not processed transactions
-        in between processed ones, usually due a reindex), by reprocessing all of them
+        in between processed ones, usually due a reindex), by marking
+        them as not processed from the `internal_tx` where the issue was detected.
 
         :param address: Safe to fix
         :param internal_tx: Only reprocess transactions from `internal_tx` and newer
@@ -366,7 +425,7 @@ class IndexService:
         """
 
         timestamp = internal_tx.timestamp
-        tx_hash_hex = HexBytes(internal_tx.ethereum_tx_id).hex()
+        tx_hash_hex = to_0x_hex_str(HexBytes(internal_tx.ethereum_tx_id))
         logger.info(
             "[%s] Fixing out of order from tx %s with timestamp %s",
             address,
@@ -387,6 +446,40 @@ class IndexService:
         logger.info("[%s] Removing SafeLastStatus", address)
         SafeLastStatus.objects.filter(address=address).delete()
         logger.info("[%s] Ended fixing out of order", address)
+
+    def process_decoded_txs(self, safe_address: ChecksumAddress) -> int:
+        """
+        Process all the pending `InternalTxDecoded` for a Safe
+
+        :param safe_address:
+        :return: Number of `InternalTxDecoded` processed
+        """
+
+        # Check if a new decoded tx appeared before other already processed (due to a reindex)
+        if self.processing_enable_out_of_order_check:
+            if InternalTxDecoded.objects.out_of_order_for_safe(safe_address):
+                logger.error("[%s] Found out of order transactions", safe_address)
+                self.fix_out_of_order(
+                    safe_address,
+                    InternalTxDecoded.objects.pending_for_safe(safe_address)[
+                        0
+                    ].internal_tx,
+                )
+
+        # Use chunks for memory issues
+        total_processed_txs = 0
+        while True:
+            internal_txs_decoded_queryset = InternalTxDecoded.objects.pending_for_safe(
+                safe_address
+            )[: self.eth_internal_tx_decoded_process_batch]
+            if not internal_txs_decoded_queryset:
+                break
+            total_processed_txs += len(
+                self.tx_processor.process_decoded_transactions(
+                    internal_txs_decoded_queryset
+                )
+            )
+        return total_processed_txs
 
     def reprocess_addresses(self, addresses: List[ChecksumAddress]):
         """
@@ -475,7 +568,7 @@ class IndexService:
         addresses: Optional[ChecksumAddress] = None,
     ) -> int:
         """
-        Reindexes master copies in parallel with the current running indexer, so service will have no missing txs
+        Reindex master copies in parallel with the current running indexer, so service will have no missing txs
         while reindexing
 
         :param from_block_number: Block number to start indexing from
@@ -510,7 +603,7 @@ class IndexService:
         addresses: Optional[ChecksumAddress] = None,
     ) -> int:
         """
-        Reindexes erc20/721 events parallel with the current running indexer, so service will have no missing
+        Reindex erc20/721 events parallel with the current running indexer, so service will have no missing
         events while reindexing
 
         :param from_block_number: Block number to start indexing from

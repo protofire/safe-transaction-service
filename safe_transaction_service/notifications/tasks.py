@@ -80,6 +80,12 @@ def send_notification_task(
     if not (address and payload):  # Both must be present
         return 0, 0
 
+    # Hacky solution, don't send transaction `data` to firebase, as it can exceed maximum message size
+    if "data" in payload:
+        # Copy payload, don't modify dictionary passed as argument, as it's mutable
+        payload = dict(payload)
+        payload.pop("data")
+
     # Make sure notification has not been sent before
     if not mark_notification_as_processed(address, payload):
         # Notification was processed already
@@ -112,6 +118,8 @@ def send_notification_task(
         success_count, failure_count, invalid_tokens = firebase_client.send_message(
             tokens, payload
         )
+        if failure_count:
+            logger.error("Push notification failed for %i devices", failure_count)
         if invalid_tokens:
             logger.info(
                 "Removing invalid tokens for safe=%s. Tokens=%s",

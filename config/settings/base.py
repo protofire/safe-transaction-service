@@ -6,6 +6,9 @@ from pathlib import Path
 
 import environ
 from corsheaders.defaults import default_headers as default_cors_headers
+from eth_typing import ChecksumAddress, HexAddress, HexStr
+
+from safe_transaction_service import __version__
 
 from ..gunicorn import (
     gunicorn_request_timeout,
@@ -64,7 +67,7 @@ DATABASES = {
     "default": env.db("DATABASE_URL"),
 }
 DATABASES["default"]["ATOMIC_REQUESTS"] = False
-DATABASES["default"]["ENGINE"] = "django_db_geventpool.backends.postgresql_psycopg2"
+DATABASES["default"]["ENGINE"] = "django_db_geventpool.backends.postgresql_psycopg3"
 DATABASES["default"]["CONN_MAX_AGE"] = 0
 DB_MAX_CONNS = env.int("DB_MAX_CONNS", default=50)
 DATABASES["default"]["OPTIONS"] = {
@@ -99,9 +102,9 @@ THIRD_PARTY_APPS = [
     "django_extensions",
     "corsheaders",
     "rest_framework",
-    "drf_yasg",
     "django_s3_storage",
     "rest_framework.authtoken",
+    "drf_spectacular",
 ]
 LOCAL_APPS = [
     "safe_transaction_service.account_abstraction.apps.AccountAbstractionConfig",
@@ -225,7 +228,7 @@ CELERY_BROKER_URL = env("CELERY_BROKER_URL", default="django://")
 # Configured to 0 due to connection issues https://github.com/celery/celery/issues/4355
 CELERY_BROKER_POOL_LIMIT = env.int("CELERY_BROKER_POOL_LIMIT", default=0)
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#broker-heartbeat
-CELERY_BROKER_HEARTBEAT = env.int("CELERY_BROKER_HEARTBEAT", default=0)
+CELERY_BROKER_HEARTBEAT = env.int("CELERY_BROKER_HEARTBEAT", default=120)
 
 # https://docs.celeryq.dev/en/stable/userguide/configuration.html#std-setting-broker_connection_max_retries
 CELERY_BROKER_CONNECTION_MAX_RETRIES = (
@@ -281,6 +284,14 @@ CELERY_ROUTES = (
             {"queue": "indexing"},
         ),
         (
+            "safe_transaction_service.history.tasks.process_decoded_internal_txs_for_safe_task",
+            {"queue": "processing", "delivery_mode": "transient"},
+        ),
+        (
+            "safe_transaction_service.history.tasks.process_decoded_internal_txs_task",
+            {"queue": "processing", "delivery_mode": "transient"},
+        ),
+        (
             "safe_transaction_service.history.tasks.*",
             {"queue": "indexing", "delivery_mode": "transient"},
         ),
@@ -322,8 +333,39 @@ REST_FRAMEWORK = {
         "rest_framework.authentication.TokenAuthentication",
     ),
     "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.NamespaceVersioning",
+    "ALLOWED_VERSIONS": ["v1", "v2"],
     "EXCEPTION_HANDLER": "safe_transaction_service.history.exceptions.custom_exception_handler",
+    "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
 }
+
+# INDEXER LOG LEVEL
+ERC20_721_INDEXER_LOG_LEVEL = (
+    env("ERC20_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+PROXY_FACTORY_INDEXER_LOG_LEVEL = (
+    env("PROXY_FACTORY_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+SAFE_EVENTS_INDEXER_LOG_LEVEL = (
+    env("SAFE_EVENTS_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+INTERNAL_TX_INDEXER_LOG_LEVEL = (
+    env("INTERNAL_TX_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+# API LOG LEVEL
+API_LOG_LEVEL = env("API_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+BALANCES_API_LOG_LEVEL = (
+    env("BALANCES_API_LOG_LEVEL", default="WARNING") if not DEBUG else "DEBUG"
+)
+MESSAGES_API_LOG_LEVEL = (
+    env("MESSAGES_API_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+ALL_TRANSACTIONS_API_LOG_LEVEL = (
+    env("ALL_TRANSACTIONS_API_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
+COLLECTIBLES_API_LOG_LEVEL = (
+    env("COLLECTIBLES_API_LOG_LEVEL", default="WARNING") if not DEBUG else "DEBUG"
+)
+
 
 # LOGGING
 # ------------------------------------------------------------------------------
@@ -396,11 +438,58 @@ LOGGING = {
             "handlers": ["console"],
             "propagate": False,
         },
+        # BALANCES LOG
+        "safe_transaction_service.history.views.SafeBalanceView": {
+            "level": BALANCES_API_LOG_LEVEL,
+        },
         "safe_transaction_service.history.services.balance_service": {
-            "level": "DEBUG" if DEBUG else "WARNING",
+            "level": BALANCES_API_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.views_v2.SafeBalanceView": {
+            "level": BALANCES_API_LOG_LEVEL,
+        },
+        # COLLECTIBLES LOG
+        "safe_transaction_service.history.views_v2.SafeCollectiblesView": {
+            "level": COLLECTIBLES_API_LOG_LEVEL,
         },
         "safe_transaction_service.history.services.collectibles_service": {
-            "level": "DEBUG" if DEBUG else "WARNING",
+            "level": COLLECTIBLES_API_LOG_LEVEL,
+        },
+        # ALL-TRANSACTIONS LOG
+        "safe_transaction_service.history.views.AllTransactionsListView": {
+            "level": ALL_TRANSACTIONS_API_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.services.transaction_service": {
+            "level": ALL_TRANSACTIONS_API_LOG_LEVEL,
+        },
+        # MESSAGES_API_LOG_LEVEL: NO LOGS FOR NOW
+        # ERC20_721_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.erc20_events_indexer": {
+            "level": ERC20_721_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_erc20_events_task": {
+            "level": ERC20_721_INDEXER_LOG_LEVEL,
+        },
+        # PROXY_FACTORY_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.proxy_factory_indexer": {
+            "level": PROXY_FACTORY_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_new_proxies_task": {
+            "level": PROXY_FACTORY_INDEXER_LOG_LEVEL,
+        },
+        # SAFE_EVENTS_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.safe_events_indexer": {
+            "level": SAFE_EVENTS_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_safe_events_task": {
+            "level": SAFE_EVENTS_INDEXER_LOG_LEVEL,
+        },
+        # INTERNAL_TX_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.internal_tx_indexer": {
+            "level": INTERNAL_TX_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_internal_txs_task": {
+            "level": INTERNAL_TX_INDEXER_LOG_LEVEL,
         },
         "celery": {
             "handlers": ["console"],
@@ -497,6 +586,20 @@ ETH_REORG_BLOCKS_BATCH = env.int(
 ETH_REORG_BLOCKS = env.int(
     "ETH_REORG_BLOCKS", default=200 if ETH_L2_NETWORK else 10
 )  # Number of blocks from the current block number needed to consider a block valid/stable
+ETH_ERC20_LOAD_ADDRESSES_CHUNK_SIZE = env.int(
+    "ETH_ERC20_LOAD_ADDRESSES_CHUNK_SIZE", default=500_000
+)  # Load Safe addresses for the ERC20 indexer with a database iterator with the defined `chunk_size`
+
+# ENABLE/DISABLE COLLECTIBLES DOWNLOAD METADATA, enable=True, disabled by default
+COLLECTIBLES_ENABLE_DOWNLOAD_METADATA = env.bool(
+    "COLLECTIBLES_ENABLE_DOWNLOAD_METADATA", default=False
+)
+
+# Events processing
+# ------------------------------------------------------------------------------
+PROCESSING_ENABLE_OUT_OF_ORDER_CHECK = env.bool(
+    "PROCESSING_ENABLE_OUT_OF_ORDER_CHECK", default=True
+)  # Enable out of order check, in case some transactions appear after a reindex so Safes don't get corrupt. Disabling it can speed up processing
 
 # Tokens
 # ------------------------------------------------------------------------------
@@ -549,6 +652,12 @@ EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT = env.int(
     "EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT", default=0
 )
 
+# Events and notifications
+# ------------------------------------------------------------------------------
+DISABLE_NOTIFICATIONS_AND_EVENTS = env.bool(
+    "DISABLE_NOTIFICATIONS_AND_EVENTS", default=False
+)  # Increases indexing speed for initial sync by disabling sending notifications and events to the queue
+
 # Cache
 CACHE_ALL_TXS_VIEW = env.int(
     "CACHE_ALL_TXS_VIEW", default=10 * 60
@@ -572,13 +681,6 @@ AWS_CONFIGURED = bool(
 ETHERSCAN_API_KEY = env("ETHERSCAN_API_KEY", default=None)
 IPFS_GATEWAY = env("IPFS_GATEWAY", default="https://ipfs.io/ipfs/")
 
-SWAGGER_SETTINGS = {
-    "SECURITY_DEFINITIONS": {
-        "api_key": {"type": "apiKey", "in": "header", "name": "Authorization"}
-    },
-    "DEFAULT_AUTO_SCHEMA_CLASS": "safe_transaction_service.utils.swagger.CustomSwaggerSchema",
-}
-
 # Shell Plus
 # ------------------------------------------------------------------------------
 SHELL_PLUS_PRINT_SQL_TRUNCATE = env.int("SHELL_PLUS_PRINT_SQL_TRUNCATE", default=10_000)
@@ -587,3 +689,102 @@ SHELL_PLUS_PRINT_SQL_TRUNCATE = env.int("SHELL_PLUS_PRINT_SQL_TRUNCATE", default
 TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS = env.int(
     "TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS", default=1_000
 )  # Don't return more than 1_000 transfers
+
+# Compression level – an integer from 0 to 9. 0 means not compression
+CACHE_ALL_TXS_COMPRESSION_LEVEL = env.int("CACHE_ALL_TXS_COMPRESSION_LEVEL", default=0)
+CACHE_VIEW_DEFAULT_TIMEOUT = env.int(
+    "CACHE_VIEW_DEFAULT_TIMEOUT", default=0
+)  # 0 will disable the cache
+
+# Contracts reindex batch configuration
+# ------------------------------------------------------------------------------
+# The following configuration prevents overwhelming third-party data sources by controlling the rate of requests.
+# Defines the batch size to limit the number of reindex contracts tasks sent to Celery concurrently.
+REINDEX_CONTRACTS_METADATA_BATCH = env.int(
+    "REINDEX_CONTRACTS_METADATA_BATCH", default=100
+)
+# Defines the delay countdown between batches of reindex contract tasks.
+REINDEX_CONTRACTS_METADATA_COUNTDOWN = env.int(
+    "REINDEX_CONTRACTS_METADATA_COUNTDOWN", default=0
+)
+
+# DRF ESPECTACULAR
+SPECTACULAR_SETTINGS = {
+    "TITLE": "Safe Transaction Service",
+    "DESCRIPTION": "API to keep track of transactions sent via Safe smart contracts",
+    "VERSION": __version__,
+    "SWAGGER_UI_FAVICON_HREF": "static/safe/favicon.png",
+    "OAS_VERSION": "3.1.0",
+    "SERVE_INCLUDE_SCHEMA": False,
+    "SCHEMA_PATH_PREFIX": "/api/v[0-9]",
+    "DEFAULT_GENERATOR_CLASS": "safe_transaction_service.utils.swagger.IgnoreVersionSchemaGenerator",
+    "POSTPROCESSING_HOOKS": [
+        "drf_spectacular.contrib.djangorestframework_camel_case.camelize_serializer_fields"
+    ],
+    "SORT_OPERATION_PARAMETERS": False,
+}
+
+# Addresses not allowed to interact with the service
+# List taken from https://www.ic3.gov/PSA/2025/PSA250226
+BANNED_EOAS: set[ChecksumAddress] = {
+    ChecksumAddress(HexAddress(HexStr(address)))
+    for address in (
+        "0x51E9d833Ecae4E8D9D8Be17300AEE6D3398C135D",
+        "0x96244D83DC15d36847C35209bBDc5bdDE9bEc3D8",
+        "0x83c7678492D623fb98834F0fbcb2E7b7f5Af8950",
+        "0x83Ef5E80faD88288F770152875Ab0bb16641a09E",
+        "0xAF620E6d32B1c67f3396EF5d2F7d7642Dc2e6CE9",
+        "0x3A21F4E6Bbe527D347ca7c157F4233c935779847",
+        "0xfa3FcCCB897079fD83bfBA690E7D47Eb402d6c49",
+        "0xFc926659Dd8808f6e3e0a8d61B20B871F3Fa6465",
+        "0xb172F7e99452446f18FF49A71bfEeCf0873003b4",
+        "0x6d46bd3AfF100f23C194e5312f93507978a6DC91",
+        "0xf0a16603289eAF35F64077Ba3681af41194a1c09",
+        "0x23Db729908137cb60852f2936D2b5c6De0e1c887",
+        "0x40e98FeEEbaD7Ddb0F0534Ccaa617427eA10187e",
+        "0x140c9Ab92347734641b1A7c124ffDeE58c20C3E3",
+        "0x684d4b58Dc32af786BF6D572A792fF7A883428B9",
+        "0xBC3e5e8C10897a81b63933348f53f2e052F89a7E",
+        "0x5Af75eAB6BEC227657fA3E749a8BFd55f02e4b1D",
+        "0xBCA02B395747D62626a65016F2e64A20bd254A39",
+        "0x4C198B3B5F3a4b1Aa706daC73D826c2B795ccd67",
+        "0xCd7eC020121Ead6f99855cbB972dF502dB5bC63a",
+        "0xbdE2Cc5375fa9E0383309A2cA31213f2D6cabcbd",
+        "0xD3C611AeD139107DEC2294032da3913BC26507fb",
+        "0xB72334cB9D0b614D30C4c60e2bd12fF5Ed03c305",
+        "0x8c7235e1A6EeF91b980D0FcA083347FBb7EE1806",
+        "0x1bb0970508316DC735329752a4581E0a4bAbc6B4",
+        "0x1eB27f136BFe7947f80d6ceE3Cf0bfDf92b45e57",
+        "0xCd1a4A457cA8b0931c3BF81Df3CFa227ADBdb6E9",
+        "0x09278b36863bE4cCd3d0c22d643E8062D7a11377",
+        "0x660BfcEa3A5FAF823e8f8bF57dd558db034dea1d",
+        "0xE9bc552fdFa54b30296d95F147e3e0280FF7f7e6",
+        "0x30a822CDD2782D2B2A12a08526452e885978FA1D",
+        "0xB4a862A81aBB2f952FcA4C6f5510962e18c7f1A2",
+        "0x0e8C1E2881F35Ef20343264862A242FB749d6b35",
+        "0x9271EDdda0F0f2bB7b1A0c712bdF8dbD0A38d1Ab",
+        "0xe69753Ddfbedbd249E703EB374452E78dae1ae49",
+        "0x2290937A4498C96eFfb87b8371a33D108F8D433f",
+        "0x959c4CA19c4532C97A657D82d97acCBAb70e6fb4",
+        "0x52207Ec7B1b43AA5DB116931a904371ae2C1619e",
+        "0x9eF42873Ae015AA3da0c4354AeF94a18D2B3407b",
+        "0x1542368a03ad1f03d96D51B414f4738961Cf4443",
+        "0x21032176B43d9f7E9410fB37290a78f4fEd6044C",
+        "0xA4B2Fd68593B6F34E51cB9eDB66E71c1B4Ab449e",
+        "0x55CCa2f5eB07907696afe4b9Db5102bcE5feB734",
+        "0xA5A023E052243b7cce34Cbd4ba20180e8Dea6Ad6",
+        "0xdD90071D52F20e85c89802e5Dc1eC0A7B6475f92",
+        "0x1512fcb09463A61862B73ec09B9b354aF1790268",
+        "0xF302572594a68aA8F951faE64ED3aE7DA41c72Be",
+        "0x723a7084028421994d4a7829108D63aB44658315",
+        "0xf03AfB1c6A11A7E370920ad42e6eE735dBedF0b1",
+        "0xEB0bAA3A556586192590CAD296b1e48dF62a8549",
+        "0xD5b58Cf7813c1eDC412367b97876bD400ea5c489",
+    )
+}
+
+# Multisig Txs creation
+# ------------------------------------------------------------------------------
+DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION = env.bool(
+    "DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION", default=True
+)
