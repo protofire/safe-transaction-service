@@ -85,17 +85,19 @@ class BalanceService:
             maxsize=4096, ttl=60 * 30
         )  # 2 hours of caching
 
-    def _filter_addresses(
+    def _filter_tokens(
         self,
         erc20_addresses: Sequence[ChecksumAddress],
         only_trusted: bool,
         exclude_spam: bool,
     ) -> List[ChecksumAddress]:
         """
+        Filter the provided `erc20_addresses` list and tokens with `events_bugged=True` by spam or trusted.
+
         :param erc20_addresses:
         :param only_trusted:
         :param exclude_spam:
-        :return: ERC20 tokens filtered by spam or trusted
+        :return: ERC20 tokens filtered.
         """
         base_queryset = Token.objects.filter(
             Q(address__in=erc20_addresses) | Q(events_bugged=True)
@@ -186,28 +188,27 @@ class BalanceService:
         offset: int = 0,
     ) -> Tuple[List[ChecksumAddress], int]:
         """
-        Get the erc20 page for a given Safe if the limit is defined.
-
         :param safe_address:
         :param only_trusted:
         :param exclude_spam:
         :param limit:
         :param offset:
-        :return: list of ERC20 addresses and count of all ERC20 addresses for a given Safe
+        :return: List of ERC20 token addresses (paginated if `limit` is provided)
+            and count of all ERC20 addresses for a given Safe
         """
         all_erc20_addresses = ERC20Transfer.objects.tokens_used_by_address(safe_address)
         for address in all_erc20_addresses:
             # Store tokens in database if not present
             self.get_token_info(address)  # This is cached
-        erc20_addresses = self._filter_addresses(
+        erc20_addresses = self._filter_tokens(
             all_erc20_addresses, only_trusted, exclude_spam
         )
         # Total count should take into account the request filters
         erc20_count = len(erc20_addresses)
 
         if not limit:
-            # No pagination no limits
-            return erc20_addresses[0:None], erc20_count
+            # No limit, no pagination
+            return erc20_addresses, erc20_count
 
         if offset == 0:
             # First page will include also native token balance
