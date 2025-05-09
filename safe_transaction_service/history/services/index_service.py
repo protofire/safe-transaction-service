@@ -254,11 +254,33 @@ class IndexService:
         self, tx_hashes: Collection[Union[str, bytes]]
     ) -> List["EthereumTx"]:
         logger.debug("Don't retrieve existing txs on DB. Find them first")
+
+        # Filter out zero transaction hashes
+        # This is a zkSync Era specific workaround. At the end of every batch there's an empty block
+        # which sweeps the sequencer fees from that batch from the bootloader contract to the L2 operator address.
+        # This happens without a transaction (tx_hash=0x000...) because it's part of how the chain works.
+        ZERO_TX_HASH = "0x0000000000000000000000000000000000000000000000000000000000000000"
+        original_count = len(tx_hashes)
+        filtered_tx_hashes = [
+            tx_hash for tx_hash in tx_hashes
+            if to_0x_hex_str(HexBytes(tx_hash)) != ZERO_TX_HASH
+        ]
+
+        filtered_count = original_count - len(filtered_tx_hashes)
+        if filtered_count > 0:
+            logger.info(
+                "Filtered out %d zero-hash transactions (zkSync Era batch boundary markers)",
+                filtered_count
+            )
+
+        if not filtered_tx_hashes:
+            return []
+
         # Search first in database
         ethereum_txs_dict = OrderedDict.fromkeys(
-            [to_0x_hex_str(HexBytes(tx_hash)) for tx_hash in tx_hashes]
+            [to_0x_hex_str(HexBytes(tx_hash)) for tx_hash in filtered_tx_hashes]
         )
-        db_ethereum_txs = EthereumTx.objects.filter(tx_hash__in=tx_hashes).exclude(
+        db_ethereum_txs = EthereumTx.objects.filter(tx_hash__in=filtered_tx_hashes).exclude(
             block=None
         )
         for db_ethereum_tx in db_ethereum_txs:
