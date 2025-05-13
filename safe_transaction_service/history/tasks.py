@@ -5,6 +5,7 @@ import json
 import random
 from typing import Optional, Tuple
 
+from django.conf import settings
 from django.utils import timezone
 
 from celery import app
@@ -408,7 +409,7 @@ def reindex_master_copies_task(
                 addresses,
             )
             index_service.reindex_master_copies(
-                from_block_number, to_block_number=to_block_number, addresses=addresses
+                from_block_number, to_block_number=to_block_number, block_process_limit=20, addresses=addresses
             )
 
 
@@ -450,6 +451,9 @@ def retry_get_metadata_task(
     :param address: collectible address
     :param token_id: collectible id
     """
+    if not settings.COLLECTIBLES_ENABLE_DOWNLOAD_METADATA:
+        logger.warning("Downloading collectibles metadata is disabled")
+        return None
 
     collectibles_service = CollectiblesServiceProvider()
     redis_key = collectibles_service.get_metadata_cache_key(address, token_id)

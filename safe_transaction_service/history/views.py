@@ -40,6 +40,7 @@ from safe_transaction_service.utils.utils import parse_boolean_query_param
 
 from . import filters, pagination, serializers
 from .cache import CacheSafeTxsView, cache_txs_view_for_address
+from .exceptions import CannotGetSafeInfoFromBlockchain
 from .helpers import add_tokens_to_transfers, is_valid_unique_transfer_id
 from .models import (
     ERC20Transfer,
@@ -62,7 +63,6 @@ from .services import (
     SafeServiceProvider,
     TransactionServiceProvider,
 )
-from .services.safe_service import CannotGetSafeInfoFromBlockchain
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +76,8 @@ class AboutView(APIView):
 
     @method_decorator(cache_page(5 * 60))  # 5 minutes
     def get(self, request, format=None):
+        ethereum_node_url = settings.ETHEREUM_NODE_URL if not settings.HIDE_ETHEREUM_RPC else None
+
         content = {
             "name": "Safe Transaction Service",
             "version": __version__,
@@ -86,7 +88,7 @@ class AboutView(APIView):
             "settings": {
                 "AWS_CONFIGURED": settings.AWS_CONFIGURED,
                 "AWS_S3_PUBLIC_URL": settings.AWS_S3_PUBLIC_URL,
-                "ETHEREUM_NODE_URL": settings.ETHEREUM_NODE_URL,
+                "ETHEREUM_NODE_URL": ethereum_node_url,
                 "ETHEREUM_TRACING_NODE_URL": settings.ETHEREUM_TRACING_NODE_URL,
                 "ETH_EVENTS_BLOCK_PROCESS_LIMIT": settings.ETH_EVENTS_BLOCK_PROCESS_LIMIT,
                 "ETH_EVENTS_BLOCK_PROCESS_LIMIT_MAX": settings.ETH_EVENTS_BLOCK_PROCESS_LIMIT_MAX,
@@ -586,6 +588,21 @@ class SafeMultisigTransactionDetailView(RetrieveAPIView):
     lookup_field = "safe_tx_hash"
     lookup_url_kwarg = "safe_tx_hash"
 
+    def get_serializer_context(self):
+        """
+        Add current_nonce and current_owners from blockchain to data serializer
+        """
+        context = super().get_serializer_context()
+        if self.request.method == "GET":
+            multisig_transaction = self.get_object()
+            safe_info = SafeServiceProvider().get_safe_info_from_blockchain(
+                multisig_transaction.safe
+            )
+            context["current_nonce"] = safe_info.nonce
+            context["current_owners"] = safe_info.owners
+
+        return context
+
     def get_queryset(self):
         return (
             MultisigTransaction.objects.with_confirmations_required()
@@ -648,6 +665,20 @@ class SafeMultisigTransactionListView(ListAPIView):
     filterset_class = filters.MultisigTransactionFilter
     ordering_fields = ["nonce", "created", "modified"]
     pagination_class = pagination.DefaultPagination
+
+    def get_serializer_context(self):
+        """
+        Add current_nonce and current_owners from blockchain to data serializer
+        """
+        context = super().get_serializer_context()
+        if self.request.method == "GET":
+            safe_info = SafeServiceProvider().get_safe_info_from_blockchain(
+                self.kwargs["address"]
+            )
+            context["current_nonce"] = safe_info.nonce
+            context["current_owners"] = safe_info.owners
+
+        return context
 
     def get_queryset(self):
         if getattr(self, "swagger_fake_view", False):
