@@ -36,9 +36,18 @@ def _get_native_balance_batch(safe_addresses: List[str], balance_service) -> Tup
     
     for address in safe_addresses:
         try:
-            balance_wei = balance_service.ethereum_client.get_balance(address)
-            batch_total_balance += balance_wei
-            if balance_wei > 0:
+            # Use balance_service.get_balances to get native token balance
+            balances, _ = balance_service.get_balances(address)
+            
+            # Find the native token balance (token_address is None for native token)
+            native_balance = 0
+            for balance in balances:
+                if balance.token_address is None:  # Native token (ETH)
+                    native_balance = balance.balance
+                    break
+            
+            batch_total_balance += native_balance
+            if native_balance > 0:
                 batch_safes_with_balance += 1
         except Exception as e:
             logger.warning(f"Failed to get balance for Safe {address}: {e}")
