@@ -23,7 +23,7 @@ from safe_transaction_service.utils.utils import chunks
 logger = logging.getLogger(__name__)
 
 
-def _get_native_balance_batch(safe_addresses: List[str], balance_service) -> Tuple[int, int]:
+def _get_native_balance_batch(safe_addresses: List[str], balance_service: BalanceService) -> Tuple[int, int]:
     """
     Get native token balances for a batch of Safe addresses.
     
