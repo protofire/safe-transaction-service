@@ -178,6 +178,11 @@ TASKS = [
     CeleryTaskConfiguration(
         name="safe_transaction_service.analytics.tasks.get_safe_statistics_task",
         description="Calculate Safe statistics (every month at 00:00)",
+        cron=CronDefinition(minute=0, hour=0, day_of_month="2"),  # Every month at 00:00 - 0 0 1 * *
+    ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.update_safe_balances_task",
+        description="Calculate Safe Balances (every month at 00:00)",
         cron=CronDefinition(minute=0, hour=0, day_of_month="1"),  # Every month at 00:00 - 0 0 1 * *
     ),
 ]

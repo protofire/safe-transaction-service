@@ -2299,3 +2299,40 @@ class TransactionServiceEventType(Enum):
     NEW_DELEGATE = 14
     UPDATED_DELEGATE = 15
     DELETED_DELEGATE = 16
+
+
+class ProtofireSafeBalance(TimeStampedModel):
+    """
+    Stores native token balance for Safe accounts.
+    Updated periodically to avoid live RPC calls in analytics.
+    """
+    safe_contract = models.OneToOneField(
+        SafeContract,
+        on_delete=models.CASCADE,
+        related_name='protofire_balance',
+        help_text="The Safe contract this balance belongs to"
+    )
+    balance_wei = Uint256Field(
+        default=0,
+        help_text="Native token balance in wei"
+    )
+    last_updated = models.DateTimeField(
+        default=timezone.now,
+        help_text="When this balance was last fetched from blockchain"
+    )
+
+    class Meta:
+        db_table = 'protofire_safe_balance'
+        ordering = ['-last_updated']
+        indexes = [
+            models.Index(fields=['balance_wei'], name='pf_safebal_balance_wei_idx'),
+            models.Index(fields=['last_updated'], name='pf_safebal_last_upd_idx'),
+        ]
+
+    def __str__(self):
+        return f"ProtofireSafeBalance {self.pk} - {self.balance_wei} wei"
+
+    @property
+    def has_balance(self):
+        """Returns True if Safe has non-zero balance"""
+        return self.balance_wei > 0
