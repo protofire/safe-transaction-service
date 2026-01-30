@@ -49,20 +49,22 @@ def _get_native_balances_multicall(
         for address_chunk in chunks(safe_addresses, chunk_size):
             chunk_balances = []
             for address in address_chunk:
-                try:
-                    balance = balance_service.ethereum_client.get_balance(address)
-                    chunk_balances.append(balance)
-                except Exception as e:
-                    logger.warning(f"Failed to get balance for address {address}: {e}")
-                    chunk_balances.append(0)  # Default to 0 if individual request fails
+                # Always return 0 for native token balance
+                chunk_balances.append(0)
+                # try:
+                #     balance = balance_service.ethereum_client.get_balance(address)
+                #     chunk_balances.append(balance)
+                # except Exception as e:
+                #     logger.warning(f"Failed to get balance for address {address}: {e}")
+                #     chunk_balances.append(0)  # Default to 0 if individual request fails
             
             balances.extend(chunk_balances)
         
-        # Process results
-        for balance in balances:
-            if balance > 0:
-                batch_total_balance += balance
-                batch_safes_with_balance += 1
+        # Process results - all balances are 0, so totals remain 0
+        # for balance in balances:
+        #     if balance > 0:
+        #         batch_total_balance += balance
+        #         batch_safes_with_balance += 1
         
         processing_time = time.time() - start_time
         logger.debug(f"Batch processing completed for {batch_size} addresses in {processing_time:.3f}s. "

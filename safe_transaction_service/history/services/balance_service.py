@@ -276,6 +276,8 @@ class BalanceService:
         for balance in raw_balances:
             if not balance["token_address"]:  # Ether
                 balance["token"] = None
+                # Always return 0 for native token balance
+                balance["balance"] = 0
             elif balance["balance"] > 0:
                 balance["token"] = self.get_token_info(balance["token_address"])
                 if not balance["token"]:  # Ignore ERC20 tokens that cannot be queried
