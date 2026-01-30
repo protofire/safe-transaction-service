@@ -376,6 +376,10 @@ class EthereumTxManager(BulkCreateSignalMixin, models.Manager):
             or 0
         )
 
+        # Account Abstraction transactions (type 0x76) may have null value
+        # Ensure value is never null to avoid serialization issues with frontend libraries
+        tx_value = tx.get("value") or 0
+
         return EthereumTx(
             block_id=tx["blockNumber"],
             tx_hash=to_0x_hex_str(HexBytes(tx["hash"])),
@@ -391,7 +395,7 @@ class EthereumTxManager(BulkCreateSignalMixin, models.Manager):
             data=data if data else None,
             nonce=tx["nonce"],
             to=tx.get("to"),
-            value=tx["value"],
+            value=tx_value,
             type=tx.get("type", 0),
         )
 
