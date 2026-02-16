@@ -364,7 +364,8 @@ class EthereumTxManager(BulkCreateSignalMixin, models.Manager):
         if tx_receipt is None:
             raise ValueError("tx_receipt cannot be empty")
 
-        data = HexBytes(tx.get("data") or tx.get("input"))
+        data_value = tx.get("data") or tx.get("input")
+        data = HexBytes(data_value) if data_value else None
         logs = tx_receipt and [
             clean_receipt_log(log) for log in tx_receipt.get("logs", [])
         ]
