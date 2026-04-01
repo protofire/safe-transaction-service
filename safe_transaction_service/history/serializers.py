@@ -25,7 +25,12 @@ from safe_eth.eth.django.serializers import (
     Sha3HashField,
 )
 from safe_eth.safe import Safe, SafeOperationEnum
-from safe_eth.safe.safe_signature import EthereumBytes, SafeSignature, SafeSignatureType
+from safe_eth.safe.safe_signature import (
+    TRON_CHAIN_IDS,
+    EthereumBytes,
+    SafeSignature,
+    SafeSignatureType,
+)
 from safe_eth.safe.serializers import SafeMultisigTxSerializer
 from safe_eth.util.util import to_0x_hex_str
 
@@ -119,13 +124,31 @@ class SafeMultisigConfirmationSerializer(serializers.Serializer):
         )
 
         safe_owners = get_safe_owners(safe_address)
+        chain_id = ethereum_client.get_chain_id()
+        is_tron = chain_id in TRON_CHAIN_IDS
         parsed_signatures = SafeSignature.parse_signature(
-            signature, safe_tx_hash, safe_hash_preimage=safe_tx.safe_tx_hash_preimage
+            signature, safe_tx_hash, safe_hash_preimage=safe_tx.safe_tx_hash_preimage,
+            chain_id=chain_id,
         )
         signature_owners = []
         ethereum_client = get_auto_ethereum_client()
         for safe_signature in parsed_signatures:
             owner = safe_signature.owner
+            # Tron: if TRON-prefixed recovery gives a non-owner, try EOA fallback
+            if (
+                is_tron
+                and owner not in safe_owners
+                and hasattr(safe_signature, "_tron_eoa_fallback_owner")
+            ):
+                fallback = safe_signature._tron_eoa_fallback_owner
+                if fallback in safe_owners:
+                    logger.info(
+                        "Tron confirmation: using EOA fallback owner %s "
+                        "instead of TRON-prefix owner %s",
+                        fallback,
+                        owner,
+                    )
+                    owner = fallback
             if owner in settings.BANNED_EOAS:
                 raise ValidationError(
                     f"Signer={owner} is not authorized to interact with the service"
@@ -148,11 +171,37 @@ class SafeMultisigConfirmationSerializer(serializers.Serializer):
         safe_tx_hash = self.context["safe_tx_hash"]
         signature = self.validated_data["signature"]
         multisig_confirmations = []
-        parsed_signatures = SafeSignature.parse_signature(signature, safe_tx_hash)
+        ethereum_client = get_auto_ethereum_client()
+        chain_id = ethereum_client.get_chain_id()
+        is_tron = chain_id in TRON_CHAIN_IDS
+        parsed_signatures = SafeSignature.parse_signature(
+            signature, safe_tx_hash, chain_id=chain_id
+        )
+        safe_owners = None
         for safe_signature in parsed_signatures:
+            owner = safe_signature.owner
+            if is_tron and hasattr(safe_signature, "_tron_eoa_fallback_owner"):
+                if safe_owners is None:
+                    try:
+                        multisig_tx = MultisigTransaction.objects.get(
+                            safe_tx_hash=safe_tx_hash
+                        )
+                        safe_owners = get_safe_owners(multisig_tx.safe)
+                    except MultisigTransaction.DoesNotExist:
+                        safe_owners = []
+                if owner not in safe_owners:
+                    fallback = safe_signature._tron_eoa_fallback_owner
+                    if fallback in safe_owners:
+                        logger.info(
+                            "Tron confirmation save: using EOA fallback owner %s "
+                            "instead of TRON-prefix owner %s",
+                            fallback,
+                            owner,
+                        )
+                        owner = fallback
             multisig_confirmation, created = MultisigConfirmation.objects.get_or_create(
                 multisig_transaction_hash=safe_tx_hash,
-                owner=safe_signature.owner,
+                owner=owner,
                 defaults={
                     "multisig_transaction_id": safe_tx_hash,
                     "signature": safe_signature.export_signature(),
@@ -267,8 +316,11 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
         # TODO Make signature mandatory
         signature = attrs.get("signature", b"")
 
+        chain_id = ethereum_client.get_chain_id()
+        is_tron = chain_id in TRON_CHAIN_IDS
         parsed_signatures = SafeSignature.parse_signature(
-            signature, safe_tx_hash, safe_hash_preimage=safe_tx.safe_tx_hash_preimage
+            signature, safe_tx_hash, safe_hash_preimage=safe_tx.safe_tx_hash_preimage,
+            chain_id=chain_id,
         )
 
         attrs["parsed_signatures"] = parsed_signatures
@@ -276,6 +328,21 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
         attrs["trusted"] = bool(parsed_signatures)
         for safe_signature in parsed_signatures:
             owner = safe_signature.owner
+            if (
+                is_tron
+                and owner != attrs["sender"]
+                and hasattr(safe_signature, "_tron_eoa_fallback_owner")
+            ):
+                fallback = safe_signature._tron_eoa_fallback_owner
+                if fallback in allowed_senders:
+                    logger.info(
+                        "Tron: using EOA fallback owner %s instead of "
+                        "TRON-prefix owner %s for sender %s",
+                        fallback,
+                        owner,
+                        attrs["sender"],
+                    )
+                    owner = fallback
             if not safe_signature.is_valid(ethereum_client, safe_address):
                 raise ValidationError(
                     f"Signature={to_0x_hex_str(safe_signature.signature)} for owner={owner} is not valid"
@@ -372,12 +439,29 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
             },
         )
 
+        ethereum_client = get_auto_ethereum_client()
+        is_tron = ethereum_client.get_chain_id() in TRON_CHAIN_IDS
         for safe_signature in self.validated_data.get("parsed_signatures"):
-            if safe_signature.owner in self.validated_data["safe_owners"]:
+            sig_owner = safe_signature.owner
+            if (
+                is_tron
+                and sig_owner not in self.validated_data["safe_owners"]
+                and hasattr(safe_signature, "_tron_eoa_fallback_owner")
+            ):
+                fallback = safe_signature._tron_eoa_fallback_owner
+                if fallback in self.validated_data["safe_owners"]:
+                    logger.info(
+                        "Tron tx save: using EOA fallback owner %s "
+                        "instead of TRON-prefix owner %s",
+                        fallback,
+                        sig_owner,
+                    )
+                    sig_owner = fallback
+            if sig_owner in self.validated_data["safe_owners"]:
                 multisig_confirmation, created = (
                     MultisigConfirmation.objects.get_or_create(
                         multisig_transaction_hash=safe_tx_hash,
-                        owner=safe_signature.owner,
+                        owner=sig_owner,
                         defaults={
                             "multisig_transaction": multisig_transaction,
                             "signature": safe_signature.export_signature(),
@@ -466,7 +550,8 @@ class DelegateSerializerMixin:
                 )
             )
             safe_signatures = SafeSignature.parse_signature(
-                signature, message_hash, safe_hash_preimage=preimage
+                signature, message_hash, safe_hash_preimage=preimage,
+                chain_id=current_chain_id,
             )
             if not safe_signatures:
                 raise ValidationError("Signature is not valid")
@@ -600,7 +685,9 @@ class SafeMultisigTransactionDeleteSerializer(serializers.Serializer):
             message_hash = DeleteMultisigTxSignatureHelper.calculate_hash(
                 safe_address, safe_tx_hash, chain_id, previous_totp=previous_totp
             )
-            safe_signatures = SafeSignature.parse_signature(signature, message_hash)
+            safe_signatures = SafeSignature.parse_signature(
+                signature, message_hash, chain_id=chain_id
+            )
             if len(safe_signatures) != 1:
                 raise ValidationError(
                     f"1 owner signature was expected, {len(safe_signatures)} received"
@@ -1160,7 +1247,10 @@ class SafeDelegateDeleteSerializer(serializers.Serializer):
         :param valid_delegators:
         :return: Valid delegator address if found, None otherwise
         """
-        safe_signatures = SafeSignature.parse_signature(signature, operation_hash)
+        chain_id = ethereum_client.get_chain_id()
+        safe_signatures = SafeSignature.parse_signature(
+            signature, operation_hash, chain_id=chain_id
+        )
         if not safe_signatures:
             raise ValidationError("Signature is not valid")
 
@@ -1240,7 +1330,10 @@ class DelegateSignatureCheckerMixin:
         :param delegator:
         :return: `True` if signature is valid for the delegator, `False` otherwise
         """
-        safe_signatures = SafeSignature.parse_signature(signature, operation_hash)
+        chain_id = ethereum_client.get_chain_id()
+        safe_signatures = SafeSignature.parse_signature(
+            signature, operation_hash, chain_id=chain_id
+        )
         if not safe_signatures:
             raise ValidationError("Signature is not valid")
 
