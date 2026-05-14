@@ -3,7 +3,8 @@ import logging
 import time
 
 from django.conf import settings
-from django.db.models import Count, F, Q
+from django.db.models import Avg, Count, DecimalField, F, Q, Sum, Value
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from celery import app
@@ -12,7 +13,16 @@ from dateutil.relativedelta import relativedelta
 from safe_transaction_service.analytics.services.analytics_service import (
     AnalyticsService,
 )
-from safe_transaction_service.history.models import MultisigTransaction, SafeContract, SafeLastStatus
+from safe_transaction_service.history.models import (
+    ERC20Transfer,
+    InternalTx,
+    ModuleTransaction,
+    MultisigConfirmation,
+    MultisigTransaction,
+    SafeContract,
+    SafeLastStatus,
+    SafeStatus,
+)
 from safe_transaction_service.history.services.balance_service import BalanceService, BalanceServiceProvider
 from safe_transaction_service.utils.celery import task_timeout
 from safe_transaction_service.utils.redis import get_redis
@@ -308,3 +318,237 @@ def get_safe_statistics_task():
         # In case of any error, return False but don't raise
         # This prevents the task from failing completely
         return False
+
+
+@app.shared_task()
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def compute_active_safes_task():
+    """Compute active Safes for 7d, 30d, 90d windows and cache in Redis."""
+    redis = get_redis()
+    now = timezone.now()
+
+    for window_str, days in [("7d", 7), ("30d", 30), ("90d", 90)]:
+        cutoff = now - timezone.timedelta(days=days)
+
+        # Distinct Safe addresses from MultisigTransaction
+        multisig_safes = set(
+            MultisigTransaction.objects.filter(created__gte=cutoff)
+            .values_list("safe", flat=True)
+            .distinct()
+        )
+
+        # Distinct Safe addresses from ModuleTransaction
+        module_safes = set(
+            ModuleTransaction.objects.filter(created__gte=cutoff)
+            .values_list("safe", flat=True)
+            .distinct()
+        )
+
+        # Distinct Safe addresses from ERC20Transfer (to or from is a Safe)
+        safe_addresses = set(
+            SafeContract.objects.values_list("address", flat=True)
+        )
+        erc20_from = set(
+            ERC20Transfer.objects.filter(
+                timestamp__gte=cutoff, _from__in=safe_addresses
+            )
+            .values_list("_from", flat=True)
+            .distinct()
+        )
+        erc20_to = set(
+            ERC20Transfer.objects.filter(
+                timestamp__gte=cutoff, to__in=safe_addresses
+            )
+            .values_list("to", flat=True)
+            .distinct()
+        )
+
+        active = multisig_safes | module_safes | erc20_from | erc20_to
+        result = {
+            "window": window_str,
+            "active_safes": len(active),
+            "computed_at": now.isoformat(),
+        }
+        redis.set(
+            AnalyticsService.REDIS_ACTIVE_SAFES_PREFIX + window_str,
+            json.dumps(result),
+        )
+
+    logger.info("Active safes task completed for all windows")
+    return True
+
+
+@app.shared_task()
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def compute_active_owners_task():
+    """Compute active owners for 7d, 30d, 90d windows and cache in Redis."""
+    redis = get_redis()
+    now = timezone.now()
+
+    for window_str, days in [("7d", 7), ("30d", 30), ("90d", 90)]:
+        cutoff = now - timezone.timedelta(days=days)
+
+        active_owners = (
+            MultisigConfirmation.objects.filter(created__gte=cutoff)
+            .values_list("owner", flat=True)
+            .distinct()
+            .count()
+        )
+        result = {
+            "window": window_str,
+            "active_owners": active_owners,
+            "computed_at": now.isoformat(),
+        }
+        redis.set(
+            AnalyticsService.REDIS_ACTIVE_OWNERS_PREFIX + window_str,
+            json.dumps(result),
+        )
+
+    logger.info("Active owners task completed for all windows")
+    return True
+
+
+@app.shared_task()
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def compute_safe_segments_task():
+    """Compute Safe segments from latest SafeStatus per address, cache in Redis."""
+    redis = get_redis()
+    now = timezone.now()
+
+    # Get latest SafeStatus for each Safe address using DISTINCT ON
+    latest_statuses = SafeStatus.objects.last_for_every_address()
+
+    personal = 0
+    team = 0
+    enterprise = 0
+    with_modules = 0
+    total_threshold = 0
+    total_owners = 0
+    count = 0
+
+    for ss in latest_statuses.iterator():
+        n_owners = len(ss.owners) if ss.owners else 0
+        count += 1
+        total_threshold += ss.threshold
+        total_owners += n_owners
+
+        if n_owners <= 1:
+            personal += 1
+        elif n_owners <= 5:
+            team += 1
+        else:
+            enterprise += 1
+
+        if ss.enabled_modules:
+            with_modules += 1
+
+    result = {
+        "personal": personal,
+        "team": team,
+        "enterprise": enterprise,
+        "with_modules": with_modules,
+        "avg_threshold": round(total_threshold / count, 1) if count else 0.0,
+        "avg_owners": round(total_owners / count, 1) if count else 0.0,
+        "computed_at": now.isoformat(),
+    }
+    redis.set(AnalyticsService.REDIS_SAFE_SEGMENTS, json.dumps(result))
+    logger.info(f"Safe segments task completed: {count} Safes segmented")
+    return True
+
+
+@app.shared_task()
+@task_timeout(timeout_seconds=LOCK_TIMEOUT * 4)
+def compute_tvl_task():
+    """
+    Compute approximate TVL using ERC20Transfer net-flow (no RPC needed).
+    Native ETH from InternalTx net flow.
+    """
+    redis = get_redis()
+    now = timezone.now()
+
+    safe_addresses = set(
+        SafeContract.objects.values_list("address", flat=True)
+    )
+
+    # Native ETH: net flow from InternalTx
+    # Incoming: to is a Safe, outgoing: _from is a Safe
+    native_incoming = (
+        InternalTx.objects.filter(to__in=safe_addresses)
+        .aggregate(total=Coalesce(Sum("value"), Value(0), output_field=DecimalField()))
+    )["total"]
+    native_outgoing = (
+        InternalTx.objects.filter(_from__in=safe_addresses)
+        .aggregate(total=Coalesce(Sum("value"), Value(0), output_field=DecimalField()))
+    )["total"]
+    native_balance_wei = max(native_incoming - native_outgoing, 0)
+
+    # ERC20: net flow per token
+    # For each token address, sum incoming to Safes minus outgoing from Safes
+    erc20_incoming = (
+        ERC20Transfer.objects.filter(to__in=safe_addresses)
+        .values("address")
+        .annotate(total_in=Sum("value"))
+    )
+    erc20_outgoing = (
+        ERC20Transfer.objects.filter(_from__in=safe_addresses)
+        .values("address")
+        .annotate(total_out=Sum("value"))
+    )
+
+    token_balances = {}
+    token_safe_counts = {}
+
+    for row in erc20_incoming:
+        token_balances[row["address"]] = row["total_in"] or 0
+
+    for row in erc20_outgoing:
+        addr = row["address"]
+        token_balances[addr] = token_balances.get(addr, 0) - (row["total_out"] or 0)
+
+    # Count Safes per token (based on non-zero net balance)
+    # For efficiency we count distinct Safes that received each token
+    for token_addr in list(token_balances.keys()):
+        if token_balances[token_addr] <= 0:
+            del token_balances[token_addr]
+            continue
+        token_safe_counts[token_addr] = (
+            ERC20Transfer.objects.filter(to__in=safe_addresses, address=token_addr)
+            .values("to")
+            .distinct()
+            .count()
+        )
+
+    # Sort by balance descending, take top 20
+    top_tokens = sorted(
+        token_balances.items(), key=lambda x: x[1], reverse=True
+    )[:20]
+
+    safes_with_any_balance = set()
+    if native_balance_wei > 0:
+        # Count Safes with native balance (approximate: any Safe that received native)
+        safes_with_any_balance = set(
+            InternalTx.objects.filter(to__in=safe_addresses, value__gt=0)
+            .values_list("to", flat=True)
+            .distinct()
+        )
+
+    result = {
+        "total_safes_with_balance": len(safes_with_any_balance),
+        "native_balance_wei": str(native_balance_wei),
+        "erc20_token_count": len(token_balances),
+        "top_tokens": [
+            {
+                "address": addr,
+                "total_balance": str(bal),
+                "safe_count": token_safe_counts.get(addr, 0),
+            }
+            for addr, bal in top_tokens
+        ],
+        "computed_at": now.isoformat(),
+    }
+    redis.set(AnalyticsService.REDIS_TVL, json.dumps(result))
+    logger.info(
+        f"TVL task completed: native={native_balance_wei}, "
+        f"erc20_tokens={len(token_balances)}"
+    )
+    return True

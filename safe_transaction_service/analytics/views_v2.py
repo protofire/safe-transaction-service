@@ -1,3 +1,5 @@
+from django.utils.dateparse import parse_datetime
+
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.generics import ListAPIView
 from rest_framework.permissions import IsAuthenticated
@@ -48,3 +50,146 @@ class AnalyticsSafeStatisticsView(ListAPIView):
     def get(self, request, format=None):
         analytics_service = get_analytics_service()
         return Response(analytics_service.get_safe_statistics())
+
+
+class AnalyticsSummaryView(ListAPIView):
+    """A.1 — Fleet-level summary metrics (direct query)."""
+
+    pagination_class = None
+    swagger_schema = None
+    renderer_classes = (JSONRenderer,)
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(exclude=True)
+    def get(self, request, format=None):
+        analytics_service = get_analytics_service()
+        return Response(analytics_service.get_summary())
+
+
+class AnalyticsActiveSafesView(ListAPIView):
+    """A.2 — Active Safes count by window (Redis-cached)."""
+
+    pagination_class = None
+    swagger_schema = None
+    renderer_classes = (JSONRenderer,)
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(exclude=True)
+    def get(self, request, format=None):
+        window = request.query_params.get("window", "30d")
+        if window not in ("7d", "30d", "90d"):
+            return Response(
+                {"error": "window must be one of: 7d, 30d, 90d"}, status=400
+            )
+        analytics_service = get_analytics_service()
+        return Response(analytics_service.get_active_safes(window))
+
+
+class AnalyticsSafeCreationsView(ListAPIView):
+    """A.3 — Safe creations time series (direct query)."""
+
+    pagination_class = None
+    swagger_schema = None
+    renderer_classes = (JSONRenderer,)
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(exclude=True)
+    def get(self, request, format=None):
+        interval = request.query_params.get("interval", "day")
+        if interval not in ("day", "week", "month"):
+            return Response(
+                {"error": "interval must be one of: day, week, month"}, status=400
+            )
+        date_from = request.query_params.get("from")
+        date_to = request.query_params.get("to")
+        parsed_from = parse_datetime(date_from) if date_from else None
+        parsed_to = parse_datetime(date_to) if date_to else None
+        analytics_service = get_analytics_service()
+        return Response(
+            analytics_service.get_safe_creations(parsed_from, parsed_to, interval)
+        )
+
+
+class AnalyticsActiveOwnersView(ListAPIView):
+    """A.4 — Active owners by window (Redis-cached)."""
+
+    pagination_class = None
+    swagger_schema = None
+    renderer_classes = (JSONRenderer,)
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(exclude=True)
+    def get(self, request, format=None):
+        window = request.query_params.get("window", "30d")
+        if window not in ("7d", "30d", "90d"):
+            return Response(
+                {"error": "window must be one of: 7d, 30d, 90d"}, status=400
+            )
+        analytics_service = get_analytics_service()
+        return Response(analytics_service.get_active_owners(window))
+
+
+class AnalyticsTxVolumeView(ListAPIView):
+    """A.5 — TX volume metrics by window (direct query)."""
+
+    pagination_class = None
+    swagger_schema = None
+    renderer_classes = (JSONRenderer,)
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(exclude=True)
+    def get(self, request, format=None):
+        window = request.query_params.get("window", "30d")
+        analytics_service = get_analytics_service()
+        return Response(analytics_service.get_tx_volume(window))
+
+
+class AnalyticsSafeSegmentsView(ListAPIView):
+    """A.6 — Safe segments by owner count (Redis-cached)."""
+
+    pagination_class = None
+    swagger_schema = None
+    renderer_classes = (JSONRenderer,)
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(exclude=True)
+    def get(self, request, format=None):
+        analytics_service = get_analytics_service()
+        return Response(analytics_service.get_safe_segments())
+
+
+class AnalyticsTvlView(ListAPIView):
+    """A.7 — TVL (approximate via net-flow, Redis-cached)."""
+
+    pagination_class = None
+    swagger_schema = None
+    renderer_classes = (JSONRenderer,)
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(exclude=True)
+    def get(self, request, format=None):
+        analytics_service = get_analytics_service()
+        return Response(analytics_service.get_tvl())
+
+
+class AnalyticsTokenVolumeView(ListAPIView):
+    """A.8 — Token volume metrics by window (direct query)."""
+
+    pagination_class = None
+    swagger_schema = None
+    renderer_classes = (JSONRenderer,)
+    authentication_classes = [TokenAuthentication]
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(exclude=True)
+    def get(self, request, format=None):
+        window = request.query_params.get("window", "30d")
+        analytics_service = get_analytics_service()
+        return Response(analytics_service.get_token_volume(window))
