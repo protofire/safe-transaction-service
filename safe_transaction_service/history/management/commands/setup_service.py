@@ -17,6 +17,19 @@ from safe_eth.safe.addresses import (
 
 from ...models import IndexingStatus, IndexingStatusType, ProxyFactory, SafeMasterCopy
 
+# Push Network (Donut testnet, chainId 42101) — non-canonical Safe v1.3.0
+# deployment via a self-installed mock Safe Singleton Factory. Remove this
+# override once the official Safe Singleton Factory is deployed on Push and
+# contracts land at canonical addresses + in safe-eth-py.
+PUSH_DONUT_CHAIN_ID = 42101
+PUSH_DONUT_MASTER_COPIES: list[tuple[str, int, str]] = [
+    ("0xd6C8A29565168288cAEA51fEE946A1014f4d8809", 15425737, "1.3.0+L2"),
+    ("0x4cf6773D4C56d82129BdC1187A62972AD0805aD7", 15425740, "1.3.0"),
+]
+PUSH_DONUT_PROXY_FACTORIES: list[tuple[str, int]] = [
+    ("0x40D84e121f9C9F0d834a12577764FcAa4D428278", 15425705),
+]
+
 
 @dataclass
 class CronDefinition:
@@ -192,6 +205,18 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS("Setting up Safe Contract Addresses"))
         ethereum_client = get_auto_ethereum_client()
         ethereum_network = ethereum_client.get_network()
+
+        if ethereum_client.get_chain_id() == PUSH_DONUT_CHAIN_ID:
+            self.stdout.write(
+                self.style.SUCCESS(
+                    "Setting up Push Donut (chainId 42101) non-canonical Safe v1.3.0 addresses"
+                )
+            )
+            self._setup_safe_singleton_addresses(PUSH_DONUT_MASTER_COPIES)
+            self._setup_erc20_indexing()
+            self._setup_safe_proxy_factories(PUSH_DONUT_PROXY_FACTORIES)
+            return
+
         if ethereum_network in MASTER_COPIES:
             self.stdout.write(
                 self.style.SUCCESS(f"Setting up {ethereum_network.name} safe addresses")

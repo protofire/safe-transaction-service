@@ -17,6 +17,25 @@ TRUSTED_FOR_DELEGATE_CALL = [
     "SafeMigration",
 ]
 
+# Push Donut (chainId 42101) non-canonical v1.3.0 deployment.
+# See setup_service.py for the matching master copy / proxy factory override.
+# Remove this when the official Safe Singleton Factory lands on Push and
+# Safe contracts are redeployed at canonical addresses.
+PUSH_DONUT_CHAIN_ID = 42101
+PUSH_DONUT_V1_3_0_DEPLOYMENTS: list[tuple[str, str, str]] = [
+    # (version, contract_name, address)
+    ("1.3.0", "GnosisSafe", "0x4cf6773D4C56d82129BdC1187A62972AD0805aD7"),
+    ("1.3.0", "GnosisSafeL2", "0xd6C8A29565168288cAEA51fEE946A1014f4d8809"),
+    ("1.3.0", "ProxyFactory", "0x40D84e121f9C9F0d834a12577764FcAa4D428278"),
+    ("1.3.0", "CompatibilityFallbackHandler", "0x2d8083FB02BD152b04411B6400F3dCb15eC57fD5"),
+    ("1.3.0", "DefaultCallbackHandler", "0x13a8Ac34441925f02637b22eD951E026F2AA9f00"),
+    ("1.3.0", "MultiSend", "0xcEB6813f410Ab1c13a5e7B988219c8EB1334D69d"),
+    ("1.3.0", "MultiSendCallOnly", "0x960A2D8e6E30668B35314a183B158b652b275c38"),
+    ("1.3.0", "SignMessageLib", "0x55F1DaDFD75Ae576E37A59e7e523bec62CF1274F"),
+    ("1.3.0", "CreateCall", "0xC6F80f7E4593AB6180691DbE7699A850b39eE893"),
+    ("1.3.0", "SimulateTxAccessor", "0x06F839F3D47Ba3FAFcbC033994D5cd4244116D5A"),
+]
+
 
 def generate_safe_contract_display_name(contract_name: str, version: str) -> str:
     """
@@ -87,6 +106,20 @@ class Command(BaseCommand):
             queryset = Contract.objects.get_or_create
 
         logger.info("Creating default Safe contracts from chain")
+
+        if chain_id == PUSH_DONUT_CHAIN_ID:
+            logger.info(
+                "Push Donut (chainId 42101) detected — using non-canonical v1.3.0 addresses"
+            )
+            chain_deployments = [
+                (v, n, a)
+                for (v, n, a) in PUSH_DONUT_V1_3_0_DEPLOYMENTS
+                if v in versions
+            ]
+            self._create_or_update_contracts_from_deployments(
+                chain_deployments, queryset, force_update_contracts, logo_file
+            )
+            return
 
         chain_deployments = self._get_default_deployments_by_version_on_chain(
             versions, ethereum_client
