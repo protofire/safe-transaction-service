@@ -33,5 +33,5 @@ class AnalyticsService:
                 "unique_owners": 0,
                 "balance_wei": 0,
                 "safes_with_balance": 0,
-                "timestamp": None
+                "timestamp": None,
             }
