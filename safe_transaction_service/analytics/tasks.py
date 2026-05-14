@@ -12,7 +12,11 @@ from dateutil.relativedelta import relativedelta
 from safe_transaction_service.analytics.services.analytics_service import (
     AnalyticsService,
 )
-from safe_transaction_service.history.models import MultisigTransaction, SafeContract, SafeLastStatus
+from safe_transaction_service.history.models import (
+    MultisigTransaction,
+    SafeContract,
+    SafeLastStatus,
+)
 from safe_transaction_service.utils.celery import task_timeout
 from safe_transaction_service.utils.redis import get_redis
 from safe_transaction_service.utils.tasks import LOCK_TIMEOUT
@@ -151,7 +155,7 @@ def get_safe_statistics_task():
     try:
         task_start_time = time.time()
         logger.info("Starting Safe statistics task...")
-        
+
         # Total number of created Safes (all proxy factories included)
         safes_count_start = time.time()
         total_safes = SafeContract.objects.count()
@@ -161,11 +165,15 @@ def get_safe_statistics_task():
         # Get all owners from SafeLastStatus to get current state
         # This gives us the most up-to-date owner information for each Safe
         owners_query_start = time.time()
-        owners_data = SafeLastStatus.objects.exclude(owners__isnull=True).exclude(
-            owners=[]
-        ).values_list("owners", flat=True)
+        owners_data = (
+            SafeLastStatus.objects.exclude(owners__isnull=True)
+            .exclude(owners=[])
+            .values_list("owners", flat=True)
+        )
         owners_query_time = time.time() - owners_query_start
-        logger.info(f"Fetched owner data from SafeLastStatus in {owners_query_time:.2f}s")
+        logger.info(
+            f"Fetched owner data from SafeLastStatus in {owners_query_time:.2f}s"
+        )
 
         # Count total owners and unique owners
         owners_processing_start = time.time()
@@ -178,20 +186,24 @@ def get_safe_statistics_task():
 
         unique_owners = len(all_owners)
         owners_processing_time = time.time() - owners_processing_start
-        
-        logger.info(f"Processed owner statistics in {owners_processing_time:.2f}s: "
-                   f"total_owners={total_owners_count}, unique_owners={unique_owners}")
+
+        logger.info(
+            f"Processed owner statistics in {owners_processing_time:.2f}s: "
+            f"total_owners={total_owners_count}, unique_owners={unique_owners}"
+        )
 
         # Calculate native token balances for all Safes using the optimized function
         logger.info(f"Starting balance calculation for {total_safes} Safes")
-        
+
         total_balance_wei = 0
         total_safes_with_balance = 0
-        
+
         if total_safes > 0:
             balance_calculation_start = time.time()
             try:
-                total_balance_wei, total_safes_with_balance = _calculate_native_balances_from_db()
+                total_balance_wei, total_safes_with_balance = (
+                    _calculate_native_balances_from_db()
+                )
                 balance_calculation_time = time.time() - balance_calculation_start
                 logger.info(
                     f"Balance calculation completed in {balance_calculation_time:.2f}s. "
@@ -200,7 +212,9 @@ def get_safe_statistics_task():
                 )
             except Exception as e:
                 balance_calculation_time = time.time() - balance_calculation_start
-                logger.error(f"Failed to calculate balances after {balance_calculation_time:.2f}s: {e}")
+                logger.error(
+                    f"Failed to calculate balances after {balance_calculation_time:.2f}s: {e}"
+                )
                 # Continue without balance data rather than failing the entire task
 
         # Create and store statistics
@@ -221,19 +235,23 @@ def get_safe_statistics_task():
         redis = get_redis()
         redis.set(redis_key, json.dumps(statistics))
         redis_storage_time = time.time() - redis_storage_start
-        
+
         total_task_time = time.time() - task_start_time
-        
-        logger.info(f"Safe statistics task completed successfully in {total_task_time:.2f}s. "
-                   f"Breakdown: statistics creation: {statistics_creation_time:.3f}s, "
-                   f"redis storage: {redis_storage_time:.3f}s. "
-                   f"Data saved to Redis key '{redis_key}'.")
-        
+
+        logger.info(
+            f"Safe statistics task completed successfully in {total_task_time:.2f}s. "
+            f"Breakdown: statistics creation: {statistics_creation_time:.3f}s, "
+            f"redis storage: {redis_storage_time:.3f}s. "
+            f"Data saved to Redis key '{redis_key}'."
+        )
+
         return True
     except Exception as e:
-        if 'task_start_time' in locals():
+        if "task_start_time" in locals():
             total_task_time = time.time() - task_start_time
-            logger.error(f"Safe statistics task failed after {total_task_time:.2f}s: {e}")
+            logger.error(
+                f"Safe statistics task failed after {total_task_time:.2f}s: {e}"
+            )
         else:
             logger.error(f"Safe statistics task failed: {e}")
         # In case of any error, return False but don't raise
