@@ -2,8 +2,8 @@ import json
 import logging
 import time
 
-from django.conf import settings
-from django.db.models import Avg, Count, DecimalField, F, Q, Sum, Value
+from django.db import connection
+from django.db.models import Count, DecimalField, F, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
@@ -23,167 +23,101 @@ from safe_transaction_service.history.models import (
     SafeLastStatus,
     SafeStatus,
 )
-from safe_transaction_service.history.services.balance_service import BalanceService, BalanceServiceProvider
 from safe_transaction_service.utils.celery import task_timeout
 from safe_transaction_service.utils.redis import get_redis
 from safe_transaction_service.utils.tasks import LOCK_TIMEOUT
-from safe_transaction_service.utils.utils import chunks
 
 logger = logging.getLogger(__name__)
 
+BALANCE_BATCH_SQL = """
+    SELECT
+        COALESCE(SUM(CASE WHEN balance > 0 THEN balance ELSE 0 END), 0),
+        COUNT(*) FILTER (WHERE balance > 0)
+    FROM (
+        SELECT
+            addr,
+            SUM(CASE WHEN direction = 1 THEN value ELSE -value END) AS balance
+        FROM (
+            SELECT it."to" AS addr, it.value, 1 AS direction
+            FROM history_internaltx it
+            WHERE it."to" = ANY(%s)
+              AND it.call_type = 0 AND it.value > 0 AND it.error IS NULL
+            UNION ALL
+            SELECT it."_from" AS addr, it.value, -1 AS direction
+            FROM history_internaltx it
+            WHERE it."_from" = ANY(%s)
+              AND it.call_type = 0 AND it.value > 0 AND it.error IS NULL
+        ) transfers
+        GROUP BY addr
+    ) safe_balances
+"""
 
-def _get_native_balances_multicall(
-    safe_addresses: list[str], balance_service: BalanceService
-) -> tuple[int, int]:
+
+def _calculate_native_balances_from_db() -> tuple[int, int]:
     """
-    Get native token balances for a batch of Safe addresses using batch RPC calls.
-
-    :param safe_addresses: List of Safe addresses to get balances for
-    :param balance_service: BalanceService instance
-    :return: Tuple of (total_balance_wei, safes_with_balance_count)
+    Calculate native token balances using DB aggregation on InternalTx,
+    processed in batches to stay within the 50-second statement timeout.
     """
     start_time = time.time()
-    batch_size = len(safe_addresses)
-    logger.debug(f"Starting batch balance processing for {batch_size} addresses")
-    
-    batch_total_balance = 0
-    batch_safes_with_balance = 0
-    
-    try:
-        # Use the existing ethereum client to get balances
-        # This will use the client's internal connection pooling and retries
-        balances = []
-        
-        # Process in smaller chunks to avoid overwhelming the RPC endpoint
-        chunk_size = 100  # Smaller chunks for better reliability
-        for address_chunk in chunks(safe_addresses, chunk_size):
-            chunk_balances = []
-            for address in address_chunk:
-                try:
-                    balance = balance_service.ethereum_client.get_balance(address)
-                    chunk_balances.append(balance)
-                except Exception as e:
-                    logger.warning(f"Failed to get balance for address {address}: {e}")
-                    chunk_balances.append(0)  # Default to 0 if individual request fails
-            
-            balances.extend(chunk_balances)
-        
-        # Process results
-        for balance in balances:
-            if balance > 0:
-                batch_total_balance += balance
-                batch_safes_with_balance += 1
-        
-        processing_time = time.time() - start_time
-        logger.debug(f"Batch processing completed for {batch_size} addresses in {processing_time:.3f}s. "
-                    f"Total balance: {batch_total_balance} wei, Safes with balance: {batch_safes_with_balance}")
-        
-    except Exception as e:
-        processing_time = time.time() - start_time
-        logger.error(
-            f"Batch processing failed for a batch of {len(safe_addresses)} addresses after {processing_time:.3f}s: {e}"
-        )
-        # Return zeros on complete failure
-        batch_total_balance = 0
-        batch_safes_with_balance = 0
-    
-    return batch_total_balance, batch_safes_with_balance
-
-
-def _calculate_native_balances_batched() -> tuple[int, int]:
-    """
-    Calculate native token balances for all Safes using database iterators and chunked RPC calls.
-    This approach is optimized for both memory efficiency and RPC endpoint reliability.
-
-    :return: Tuple of (total_balance_wei, total_safes_with_balance)
-    """
-    function_start_time = time.time()
-    
-    # Use a more conservative batch size to avoid overwhelming RPC endpoints
-    # This balances between efficiency and reliability
-    db_batch_size = 100  # Reduced from 500 for better RPC endpoint compatibility
-    balance_service = BalanceServiceProvider()
+    batch_size = 5000
     total_balance_wei = 0
     total_safes_with_balance = 0
-    processed_count = 0
+    processed = 0
 
-    # Get total count for progress tracking
-    count_start_time = time.time()
     total_safes = SafeContract.objects.count()
-    count_time = time.time() - count_start_time
-    logger.info(f"Total Safes count: {total_safes} (query took {count_time:.2f}s)")
-    
     logger.info(
-        f"Starting chunked RPC-based balance calculation for {total_safes} Safes with batch size {db_batch_size}"
+        f"Starting DB balance calculation for {total_safes} Safes "
+        f"in batches of {batch_size}"
     )
 
-    # Use .iterator() for memory efficiency. It fetches addresses from the DB in chunks.
     queryset = SafeContract.objects.values_list("address", flat=True).order_by("pk")
-    
-    # Process addresses in batches using database slicing for better memory management
     offset = 0
     batch_number = 0
-    
+
     while True:
-        batch_start_time = time.time()
         batch_number += 1
-        
-        # Fetch a batch of addresses from the database
-        db_fetch_start = time.time()
-        address_batch = list(queryset[offset:offset + db_batch_size])
-        db_fetch_time = time.time() - db_fetch_start
-        
-        if not address_batch:
-            break  # No more addresses to process
+        addresses = list(queryset[offset : offset + batch_size])
+        if not addresses:
+            break
 
-        batch_size = len(address_batch)
-        processed_count += batch_size
-        
-        logger.info(
-            f"Processing batch {batch_number} with {batch_size} addresses "
-            f"(fetched in {db_fetch_time:.2f}s, {processed_count}/{total_safes} total)..."
-        )
+        offset += len(addresses)
+        processed += len(addresses)
+        batch_start = time.time()
 
-        # Get balances for the entire batch with chunked RPC calls
+        # Convert checksummed address strings to bytes for bytea comparison
+        address_bytes = [bytes.fromhex(addr[2:]) for addr in addresses]
+
         try:
-            batch_rpc_start = time.time()
-            (
-                batch_balance,
-                batch_safes_with_balance,
-            ) = _get_native_balances_multicall(address_batch, balance_service)
+            with connection.cursor() as cursor:
+                cursor.execute(BALANCE_BATCH_SQL, [address_bytes, address_bytes])
+                row = cursor.fetchone()
 
+            batch_balance = int(row[0]) if row[0] else 0
+            batch_count = int(row[1]) if row[1] else 0
             total_balance_wei += batch_balance
-            total_safes_with_balance += batch_safes_with_balance
-            
-            batch_rpc_time = time.time() - batch_rpc_start
-            batch_time = time.time() - batch_start_time
-            progress_percent = (processed_count / total_safes) * 100 if total_safes > 0 else 0
-            
+            total_safes_with_balance += batch_count
+
             logger.info(
-                f"Completed batch {batch_number} in {batch_time:.2f}s "
-                f"(RPC processing: {batch_rpc_time:.2f}s). "
-                f"Progress: {progress_percent:.1f}% ({processed_count}/{total_safes}). "
-                f"Running totals - Balance: {total_balance_wei} wei, "
-                f"Safes with balance: {total_safes_with_balance}"
+                f"Batch {batch_number}: {processed}/{total_safes} "
+                f"({time.time() - batch_start:.2f}s). "
+                f"Running total: {total_balance_wei} wei, "
+                f"{total_safes_with_balance} with balance"
             )
         except Exception as e:
-            batch_time = time.time() - batch_start_time
-            logger.error(f"Batch {batch_number} processing failed after {batch_time:.2f}s: {e}")
-            # Continue with next batch rather than failing completely
-        
-        offset += db_batch_size
+            logger.error(
+                f"Batch {batch_number} failed after "
+                f"{time.time() - batch_start:.2f}s, "
+                f"addresses[0]={addresses[0] if addresses else 'N/A'}, "
+                f"addresses[-1]={addresses[-1] if addresses else 'N/A'}: {e}"
+            )
+            # Continue with next batch — partial results still useful
 
-    total_function_time = time.time() - function_start_time
-    avg_time_per_safe = total_function_time / processed_count if processed_count > 0 else 0
-
+    elapsed = time.time() - start_time
     logger.info(
-        f"Chunked RPC-based balance calculation completed in {total_function_time:.2f}s. "
-        f"Final results: Total balance: {total_balance_wei} wei, "
-        f"Safes with balance: {total_safes_with_balance}/{processed_count}. "
-        f"Average time per Safe: {avg_time_per_safe:.4f}s. "
-        f"Processed {processed_count} Safes in {batch_number} batches."
+        f"DB balance calculation completed in {elapsed:.2f}s. "
+        f"Total balance: {total_balance_wei} wei, "
+        f"Safes with balance: {total_safes_with_balance}/{processed}"
     )
-
     return total_balance_wei, total_safes_with_balance
 
 
@@ -219,18 +153,15 @@ def get_transactions_per_safe_app_task():
 @task_timeout(timeout_seconds=LOCK_TIMEOUT * 6)
 def get_safe_statistics_task():
     """
-    Calculate Safe statistics using efficient batch RPC calls for balance checking.
-    
-    This optimized version uses:
-    - Batch RPC requests instead of individual balance calls
-    - Larger batch sizes (5000 addresses per batch)
-    - Memory-efficient database iteration
-    - Better error handling and logging
+    Calculate Safe statistics using DB aggregation on InternalTx for balance checking.
+
+    Uses batched SQL queries instead of individual RPC calls to avoid timeouts
+    on networks with 100K+ Safes.
     """
     try:
         task_start_time = time.time()
         logger.info("Starting Safe statistics task...")
-        
+
         # Total number of created Safes (all proxy factories included)
         safes_count_start = time.time()
         total_safes = SafeContract.objects.count()
@@ -240,11 +171,15 @@ def get_safe_statistics_task():
         # Get all owners from SafeLastStatus to get current state
         # This gives us the most up-to-date owner information for each Safe
         owners_query_start = time.time()
-        owners_data = SafeLastStatus.objects.exclude(owners__isnull=True).exclude(
-            owners=[]
-        ).values_list("owners", flat=True)
+        owners_data = (
+            SafeLastStatus.objects.exclude(owners__isnull=True)
+            .exclude(owners=[])
+            .values_list("owners", flat=True)
+        )
         owners_query_time = time.time() - owners_query_start
-        logger.info(f"Fetched owner data from SafeLastStatus in {owners_query_time:.2f}s")
+        logger.info(
+            f"Fetched owner data from SafeLastStatus in {owners_query_time:.2f}s"
+        )
 
         # Count total owners and unique owners
         owners_processing_start = time.time()
@@ -257,20 +192,24 @@ def get_safe_statistics_task():
 
         unique_owners = len(all_owners)
         owners_processing_time = time.time() - owners_processing_start
-        
-        logger.info(f"Processed owner statistics in {owners_processing_time:.2f}s: "
-                   f"total_owners={total_owners_count}, unique_owners={unique_owners}")
+
+        logger.info(
+            f"Processed owner statistics in {owners_processing_time:.2f}s: "
+            f"total_owners={total_owners_count}, unique_owners={unique_owners}"
+        )
 
         # Calculate native token balances for all Safes using the optimized function
         logger.info(f"Starting balance calculation for {total_safes} Safes")
-        
+
         total_balance_wei = 0
         total_safes_with_balance = 0
-        
+
         if total_safes > 0:
             balance_calculation_start = time.time()
             try:
-                total_balance_wei, total_safes_with_balance = _calculate_native_balances_batched()
+                total_balance_wei, total_safes_with_balance = (
+                    _calculate_native_balances_from_db()
+                )
                 balance_calculation_time = time.time() - balance_calculation_start
                 logger.info(
                     f"Balance calculation completed in {balance_calculation_time:.2f}s. "
@@ -279,7 +218,9 @@ def get_safe_statistics_task():
                 )
             except Exception as e:
                 balance_calculation_time = time.time() - balance_calculation_start
-                logger.error(f"Failed to calculate balances after {balance_calculation_time:.2f}s: {e}")
+                logger.error(
+                    f"Failed to calculate balances after {balance_calculation_time:.2f}s: {e}"
+                )
                 # Continue without balance data rather than failing the entire task
 
         # Create and store statistics
@@ -300,19 +241,23 @@ def get_safe_statistics_task():
         redis = get_redis()
         redis.set(redis_key, json.dumps(statistics))
         redis_storage_time = time.time() - redis_storage_start
-        
+
         total_task_time = time.time() - task_start_time
-        
-        logger.info(f"Safe statistics task completed successfully in {total_task_time:.2f}s. "
-                   f"Breakdown: statistics creation: {statistics_creation_time:.3f}s, "
-                   f"redis storage: {redis_storage_time:.3f}s. "
-                   f"Data saved to Redis key '{redis_key}'.")
-        
+
+        logger.info(
+            f"Safe statistics task completed successfully in {total_task_time:.2f}s. "
+            f"Breakdown: statistics creation: {statistics_creation_time:.3f}s, "
+            f"redis storage: {redis_storage_time:.3f}s. "
+            f"Data saved to Redis key '{redis_key}'."
+        )
+
         return True
     except Exception as e:
-        if 'task_start_time' in locals():
+        if "task_start_time" in locals():
             total_task_time = time.time() - task_start_time
-            logger.error(f"Safe statistics task failed after {total_task_time:.2f}s: {e}")
+            logger.error(
+                f"Safe statistics task failed after {total_task_time:.2f}s: {e}"
+            )
         else:
             logger.error(f"Safe statistics task failed: {e}")
         # In case of any error, return False but don't raise

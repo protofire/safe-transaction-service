@@ -1,11 +1,11 @@
 from django.utils.dateparse import parse_datetime
 
+from drf_spectacular.utils import extend_schema
 from rest_framework.authentication import TokenAuthentication
 from rest_framework.generics import ListAPIView
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.renderers import JSONRenderer
 from rest_framework.response import Response
-from drf_spectacular.utils import extend_schema
 
 from safe_transaction_service.analytics.services.analytics_service import (
     get_analytics_service,
@@ -34,12 +34,13 @@ class AnalyticsSafeStatisticsView(ListAPIView):
     - balance_wei: Total native token balance across all Safes (in Wei)
     - safes_with_balance: Number of Safes with non-zero native token balance
     - timestamp: ISO timestamp of when the statistics were last calculated
-    
+
     This endpoint:
     - Requires token authentication
     - Does not appear in Swagger documentation
     - Returns cached data updated by periodic tasks
     """
+
     pagination_class = None
     swagger_schema = None
     renderer_classes = (JSONRenderer,)
