@@ -68,6 +68,28 @@ def _write_snapshot(name: str, payload: dict) -> None:
     )
 
 
+def _iter_safe_addresses_keyset(batch_size: int = 5000):
+    """Yield batches of ``SafeContract.address`` using keyset pagination.
+
+    ``SafeContract.address`` is the bytea PK (``EthereumAddressBinaryField``),
+    so ``address__gt=last`` produces an indexed range scan and each fetch
+    stays O(log N + batch_size). The old ``queryset[offset:offset+batch_size]``
+    form compiled to ``OFFSET/LIMIT``, which on a multi-million-Safe chain
+    forced PG to scan and discard every preceding row on every batch —
+    quadratic over the loop, multi-minute per call once the offset crossed
+    ~500k.
+    """
+    base_qs = SafeContract.objects.values_list("address", flat=True).order_by("pk")
+    last: str | None = None
+    while True:
+        qs = base_qs.filter(address__gt=last) if last is not None else base_qs
+        chunk = list(qs[:batch_size])
+        if not chunk:
+            return
+        yield chunk
+        last = chunk[-1]
+
+
 BALANCE_BATCH_SQL = """
     SELECT
         COALESCE(SUM(CASE WHEN balance > 0 THEN balance ELSE 0 END), 0),
@@ -118,8 +140,6 @@ def _calculate_native_balances_from_db_sequential() -> tuple[int, int]:
         batch_size,
     )
 
-    queryset = SafeContract.objects.values_list("address", flat=True).order_by("pk")
-    offset = 0
     batch_number = 0
 
     # Open the relaxed timeout once for the whole batch loop. Each batch
@@ -128,13 +148,8 @@ def _calculate_native_balances_from_db_sequential() -> tuple[int, int]:
     # flips at scale. Per-batch try/except still isolates individual
     # failures from the rest of the run.
     with relaxed_statement_timeout():
-        while True:
+        for addresses in _iter_safe_addresses_keyset(batch_size):
             batch_number += 1
-            addresses = list(queryset[offset : offset + batch_size])
-            if not addresses:
-                break
-
-            offset += len(addresses)
             processed += len(addresses)
             batch_start = time.time()
 
@@ -380,21 +395,24 @@ _ERC20_ACTIVE_BATCH_SQL = """
     )
 """
 
-# Closed-interval variant for per-day DAU computations (C7): bounds the
-# search to `[start, end)` so the index probe stays tight even when the
-# day is deep in history. Same EXISTS shape as the open-ended form.
-_ERC20_ACTIVE_BETWEEN_BATCH_SQL = """
-    SELECT a.addr
-    FROM unnest(%s::bytea[]) AS a(addr)
-    WHERE EXISTS (
-        SELECT 1 FROM history_erc20transfer
-        WHERE "_from" = a.addr AND timestamp >= %s AND timestamp < %s
-        LIMIT 1
-    ) OR EXISTS (
-        SELECT 1 FROM history_erc20transfer
-        WHERE "to" = a.addr AND timestamp >= %s AND timestamp < %s
-        LIMIT 1
-    )
+# Closed-interval variant for per-day DAU computations (C7).
+#
+# Scans only the day's transfers (bounded by the `timestamp` index range)
+# and joins back to `history_safecontract` — one query, two index range
+# scans, zero per-Safe probes. The old form looped over all Safes in
+# batches of 5000 and ran a paired EXISTS per Safe, which on a 1.5M-Safe
+# chain meant ~2M btree probes and ~200 round-trips for what is now a
+# single statement.
+_ERC20_ACTIVE_BETWEEN_JOIN_SQL = """
+    SELECT sc.address
+    FROM history_safecontract sc
+    JOIN (
+        SELECT "_from" AS address FROM history_erc20transfer
+        WHERE timestamp >= %s AND timestamp < %s
+        UNION
+        SELECT "to" AS address FROM history_erc20transfer
+        WHERE timestamp >= %s AND timestamp < %s
+    ) t ON sc.address = t.address
 """
 
 
@@ -423,13 +441,7 @@ def _erc20_active_safe_addrs(cutoff, batch_size: int = 5000) -> set[str]:
     budget on multi-hundred-thousand-Safe chains.
     """
     seen: set[str] = set()
-    queryset = SafeContract.objects.values_list("address", flat=True).order_by("pk")
-    offset = 0
-    while True:
-        addresses = list(queryset[offset : offset + batch_size])
-        if not addresses:
-            break
-        offset += len(addresses)
+    for addresses in _iter_safe_addresses_keyset(batch_size):
         addr_bytes = [bytes.fromhex(a[2:]) for a in addresses]
         with connection.cursor() as cursor:
             cursor.execute(_ERC20_ACTIVE_BATCH_SQL, [addr_bytes, cutoff, cutoff])
@@ -875,26 +887,17 @@ def compute_safe_creations_task(self):
 # history loads on a fresh chain.
 
 
-def _erc20_active_safe_addrs_between(start, end, batch_size: int = 5000) -> set[str]:
-    """Per-anchor EXISTS probe bounded to `[start, end)`. Same batching
-    contract as `_erc20_active_safe_addrs`."""
-    seen: set[str] = set()
-    queryset = SafeContract.objects.values_list("address", flat=True).order_by("pk")
-    offset = 0
-    while True:
-        addresses = list(queryset[offset : offset + batch_size])
-        if not addresses:
-            break
-        offset += len(addresses)
-        addr_bytes = [bytes.fromhex(a[2:]) for a in addresses]
-        with connection.cursor() as cursor:
-            cursor.execute(
-                _ERC20_ACTIVE_BETWEEN_BATCH_SQL,
-                [addr_bytes, start, end, start, end],
-            )
-            for row in cursor:
-                seen.add(_normalize_addr(row[0]))
-    return seen
+def _erc20_active_safe_addrs_between(start, end) -> set[str]:
+    """Set of Safe addresses with an ERC20 transfer in `[start, end)`.
+
+    Single JOIN: index-range-scan the day's transfers and join back to
+    `history_safecontract`. Replaces the prior per-Safe EXISTS batch loop
+    that issued ~200 round-trips and ~2M btree probes on a 1.5M-Safe
+    chain.
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(_ERC20_ACTIVE_BETWEEN_JOIN_SQL, [start, end, start, end])
+        return {_normalize_addr(row[0]) for row in cursor}
 
 
 def _safes_active_between(start, end) -> int:

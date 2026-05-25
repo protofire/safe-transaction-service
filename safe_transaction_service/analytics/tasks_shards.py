@@ -52,25 +52,23 @@ BACKFILL_CURSOR_KEY = "analytics_backfill_cursor"
 
 
 def _safe_addresses_for_prefix(prefix: str) -> list[bytes]:
-    """Return the address-bytes for every SafeContract whose checksum
-    address starts with ``prefix`` after the ``0x`` prefix (i.e. first
-    nibble of the binary representation).
+    """Return the address-bytes for every SafeContract whose first hex
+    nibble equals ``prefix``.
 
-    Doing the prefix filter in Python keeps the SQL surface unchanged —
-    ``BALANCE_BATCH_SQL`` continues to use the proven covering-index
-    plan on ``ANY(%s)``. The cost is one all-Safes scan per shard, but
-    `address` is a small fixed-width column and the scan is bounded by
-    ``LIMIT`` in Django's iterator (no full materialisation in memory).
+    ``SafeContract.address`` is the bytea PK, so the first hex nibble is
+    the high 4 bits of byte 0. Filter by an indexed PK range
+    ``[N0…00, NF…FF]`` and PG does a single range-scan of ~N/16 rows —
+    the prior form iterated every row of ``history_safecontract`` and
+    filtered in Python, costing 16 full table scans (one per shard) per
+    TVL run.
     """
-    addresses = SafeContract.objects.values_list("address", flat=True)
-    prefix = prefix.lower()
-    out: list[bytes] = []
-    for addr in addresses.iterator(chunk_size=10_000):
-        # `address` is a checksum string `0x...`. The byte at position 0
-        # is hex chars [2:4]; first nibble is char [2].
-        if addr[2].lower() == prefix:
-            out.append(bytes.fromhex(addr[2:]))
-    return out
+    nibble = int(prefix, 16)
+    lo = bytes([nibble << 4]) + b"\x00" * 19
+    hi = bytes([(nibble << 4) | 0x0F]) + b"\xff" * 19
+    qs = SafeContract.objects.filter(address__gte=lo, address__lte=hi).values_list(
+        "address", flat=True
+    )
+    return [bytes.fromhex(addr[2:]) for addr in qs.iterator(chunk_size=10_000)]
 
 
 def _balance_for_addresses(address_bytes: list[bytes]) -> tuple[int, int]:

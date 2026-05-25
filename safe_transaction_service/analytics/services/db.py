@@ -14,7 +14,7 @@ import logging
 from contextlib import contextmanager
 
 from django.conf import settings
-from django.db import OperationalError, connection
+from django.db import DatabaseError, ProgrammingError, connection
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +58,14 @@ def relaxed_statement_timeout(ms: int = 1_800_000):
         try:
             with connection.cursor() as cursor:
                 cursor.execute(f"SET statement_timeout = {int(default_ms)}")
-        except OperationalError:
+        except DatabaseError as exc:
+            # Catch DatabaseError (parent of OperationalError, InternalError,
+            # …) so an aborted-transaction state from a body-side failure
+            # cannot raise on the reset SET and mask the original exception.
             logger.warning(
-                "relaxed_statement_timeout: connection busy on exit; "
-                "closing to reset statement_timeout via reconnect",
+                "relaxed_statement_timeout: failed to reset statement_timeout "
+                "(%s); closing connection to guarantee clean state",
+                exc,
             )
             try:
                 connection.close()
@@ -83,12 +87,20 @@ def approx_count_or_exact(model, table_name: str, threshold: int = 1000) -> int:
     fixture (no ANALYZE has run, reltuples is 0) still get correct numbers
     — and the cost of `COUNT(*)` on a tiny table is negligible anyway.
     """
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT reltuples::bigint FROM pg_class WHERE relname = %s",
-            [table_name],
-        )
-        row = cursor.fetchone()
+    # `oid = %s::regclass` resolves the name through PG's search_path and is
+    # unique per table — filtering by `relname` alone can collide across
+    # schemas (multi-tenant partitions, test schemas, …) and return the
+    # wrong row. `regclass` raises if the table doesn't exist, so fall back
+    # to the exact count for not-yet-created tables (e.g. mid-migration).
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT reltuples::bigint FROM pg_class WHERE oid = %s::regclass",
+                [table_name],
+            )
+            row = cursor.fetchone()
+    except ProgrammingError:
+        return model.objects.count()
     approx = int(row[0]) if row and row[0] is not None else 0
     if approx < threshold:
         return model.objects.count()

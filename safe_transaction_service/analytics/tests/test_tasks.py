@@ -901,10 +901,14 @@ class TestNativeBalanceShards(TestCase):
         seq_balance, seq_count = _calculate_native_balances_from_db_sequential()
         # Eager mode runs the chord inline; bypass the fire-and-forget
         # `dispatch_tvl_chord` so we can read the reduced result back here.
-        reduced = chord(
-            (compute_native_balance_shard.s(p) for p in HEX_PREFIXES),
-            reduce_native_balance_shards.s(),
-        ).apply_async().get()
+        reduced = (
+            chord(
+                (compute_native_balance_shard.s(p) for p in HEX_PREFIXES),
+                reduce_native_balance_shards.s(),
+            )
+            .apply_async()
+            .get()
+        )
         self.assertEqual(seq_balance, reduced["balance_wei"])
         self.assertEqual(seq_count, reduced["safes_with_balance"])
         self.assertGreater(reduced["balance_wei"], 0)
@@ -934,6 +938,100 @@ class TestNativeBalanceShards(TestCase):
             total += shard["safes_with_balance"]
         # Each seeded Safe lands in exactly one shard.
         self.assertEqual(total, 4)
+
+
+class TestKeysetPagination(TestCase):
+    """`_iter_safe_addresses_keyset` is the load-bearing replacement for
+    the old OFFSET/LIMIT loop. The bug it fixes is silent (correctness
+    holds, performance collapses on multi-million-Safe chains), so the
+    unit guarantee that survives is: every Safe is yielded exactly once,
+    in PK order, regardless of how small the batch is."""
+
+    def test_yields_every_address_exactly_once(self):
+        from safe_transaction_service.analytics.tasks import (
+            _iter_safe_addresses_keyset,
+        )
+
+        # Seed 7 Safes; iterate with batch_size=2 to force `address__gt`
+        # boundary crossings and exercise the keyset cursor explicitly.
+        for _ in range(7):
+            SafeContractFactory()
+        expected = list(
+            SafeContract.objects.values_list("address", flat=True).order_by("pk")
+        )
+
+        seen = []
+        for chunk in _iter_safe_addresses_keyset(batch_size=2):
+            self.assertLessEqual(len(chunk), 2)
+            seen.extend(chunk)
+
+        self.assertEqual(seen, expected)
+
+    def test_empty_safe_contracts_terminates(self):
+        from safe_transaction_service.analytics.tasks import (
+            _iter_safe_addresses_keyset,
+        )
+
+        self.assertEqual(list(_iter_safe_addresses_keyset(batch_size=10)), [])
+
+
+class TestErc20ActiveSafeAddrsBetween(TestCase):
+    """The bounded-window helper used to issue ~200 batched EXISTS probes
+    per call; it now resolves to a single JOIN over the day's transfers.
+    Behaviour contract: returns the set of Safe addresses with any
+    ERC20 transfer (_from OR to) strictly inside `[start, end)`."""
+
+    def test_includes_safes_with_transfer_inside_window(self):
+        from django.utils import timezone
+
+        from safe_transaction_service.analytics.tasks import (
+            _erc20_active_safe_addrs_between,
+        )
+
+        start = timezone.now() - timezone.timedelta(hours=1)
+        end = start + timezone.timedelta(days=1)
+
+        safe_in = SafeContractFactory()
+        ERC20TransferFactory(to=safe_in.address)
+
+        result = _erc20_active_safe_addrs_between(start, end)
+        self.assertIn(safe_in.address.lower(), {a.lower() for a in result})
+
+    def test_excludes_safes_with_no_transfers(self):
+        from django.utils import timezone
+
+        from safe_transaction_service.analytics.tasks import (
+            _erc20_active_safe_addrs_between,
+        )
+
+        start = timezone.now() - timezone.timedelta(hours=1)
+        end = start + timezone.timedelta(days=1)
+
+        SafeContractFactory()  # no transfers — must not appear
+        safe_in = SafeContractFactory()
+        ERC20TransferFactory(_from=safe_in.address)
+
+        result = {a.lower() for a in _erc20_active_safe_addrs_between(start, end)}
+        self.assertEqual(len(result), 1)
+        self.assertIn(safe_in.address.lower(), result)
+
+    def test_excludes_non_safe_addresses(self):
+        """Transfers whose endpoints are not SafeContracts must not be
+        returned — the JOIN against `history_safecontract` is what
+        enforces this."""
+        from django.utils import timezone
+
+        from safe_transaction_service.analytics.tasks import (
+            _erc20_active_safe_addrs_between,
+        )
+
+        start = timezone.now() - timezone.timedelta(hours=1)
+        end = start + timezone.timedelta(days=1)
+
+        # Transfer between two non-Safe addresses: the JOIN drops it.
+        ERC20TransferFactory()
+
+        self.assertEqual(_erc20_active_safe_addrs_between(start, end), set())
 
 
 class TestDailyActiveOwnersPopulator(TestCase):
