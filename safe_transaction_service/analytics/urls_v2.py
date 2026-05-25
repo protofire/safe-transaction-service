@@ -11,11 +11,6 @@ urlpatterns = [
         name="analytics-multisig-txs-by-origin",
     ),
     path(
-        "safe-statistics/",
-        views_v2.AnalyticsSafeStatisticsView.as_view(),
-        name="analytics-safe-statistics",
-    ),
-    path(
         "summary/",
         views_v2.AnalyticsSummaryView.as_view(),
         name="analytics-summary",
