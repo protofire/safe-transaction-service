@@ -77,6 +77,10 @@ class AboutView(APIView):
 
     @method_decorator(cache_page(5 * 60))  # 5 minutes
     def get(self, request, format=None):
+        ethereum_node_url = (
+            settings.ETHEREUM_NODE_URL if not settings.HIDE_ETHEREUM_RPC else None
+        )
+
         content = {
             "name": "Safe Transaction Service",
             "version": __version__,
