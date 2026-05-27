@@ -22,6 +22,7 @@ from ..models import (
     SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
+    normalize_block_timestamp,
 )
 from ..models import IndexingStatus as IndexingStatusDb
 
@@ -171,9 +172,13 @@ class IndexService:
                     master_copies_indexing_status.block_number,
                 ]
             )
-        current_block_timestamp = current_block["timestamp"]
-        erc20_block_timestamp = erc20_block["timestamp"]
-        master_copies_block_timestamp = master_copies_block["timestamp"]
+        current_block_timestamp = normalize_block_timestamp(
+            current_block["timestamp"]
+        )
+        erc20_block_timestamp = normalize_block_timestamp(erc20_block["timestamp"])
+        master_copies_block_timestamp = normalize_block_timestamp(
+            master_copies_block["timestamp"]
+        )
 
         return AllIndexingStatus(
             current_block_number=current_block_number,

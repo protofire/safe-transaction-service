@@ -35,6 +35,7 @@ from ..models import (
     SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
+    normalize_block_timestamp,
 )
 from ..utils import clean_receipt_log
 from .factories import (
@@ -1448,6 +1449,23 @@ class TestEthereumBlock(TestCase):
             self.assertEqual(EthereumBlock.objects.count(), 1)
             db_block.refresh_from_db()
             self.assertEqual(db_block.confirmed, False)
+
+    def test_normalize_block_timestamp(self):
+        # Seconds (standard Ethereum) are left untouched
+        self.assertEqual(normalize_block_timestamp(1779900655), 1779900655)
+        # Milliseconds (e.g. Seismic chain) are converted to seconds
+        self.assertEqual(normalize_block_timestamp(1779900655719), 1779900655)
+
+    def test_from_block_dict_milliseconds_timestamp(self):
+        # Chains like Seismic return block timestamps in milliseconds, which
+        # would overflow datetime if interpreted as seconds (year 58334)
+        mock_block = dict(block_result[0])
+        mock_block["timestamp"] = mock_block["timestamp"] * 1000
+        db_block = EthereumBlock.objects.create_from_block_dict(mock_block)
+        self.assertEqual(
+            db_block.timestamp,
+            datetime.datetime.fromtimestamp(block_result[0]["timestamp"], datetime.UTC),
+        )
 
     def test_set_confirmed_not_confirmed(self):
         ethereum_block = EthereumBlockFactory(confirmed=False)

@@ -77,6 +77,22 @@ from .utils import clean_receipt_log
 logger = getLogger(__name__)
 
 
+# Block timestamps are normally Unix seconds. Some chains (e.g. Seismic) return
+# them in milliseconds. Unix seconds stay below ~2.5e11 even at year 9999, while
+# current millisecond time is ~1.78e12, so any value at/above this threshold is ms.
+_MILLISECONDS_TIMESTAMP_THRESHOLD = 10**12
+
+
+def normalize_block_timestamp(timestamp: int) -> int:
+    """
+    Normalize a raw block timestamp to Unix seconds, converting from
+    milliseconds when the value is too large to be seconds.
+    """
+    if timestamp >= _MILLISECONDS_TIMESTAMP_THRESHOLD:
+        return timestamp // 1000
+    return timestamp
+
+
 class ConfirmationType(Enum):
     CONFIRMATION = 0
     EXECUTION = 1
@@ -250,7 +266,9 @@ class EthereumBlockManager(BulkCreateSignalMixin, models.Manager):
             # Some networks like CELO don't provide gasLimit
             gas_limit=block.get("gasLimit", 0),
             gas_used=block["gasUsed"],
-            timestamp=datetime.datetime.fromtimestamp(block["timestamp"], datetime.UTC),
+            timestamp=datetime.datetime.fromtimestamp(
+                normalize_block_timestamp(block["timestamp"]), datetime.UTC
+            ),
             block_hash=to_0x_hex_str(block["hash"]),
             parent_hash=to_0x_hex_str(block["parentHash"]),
             confirmed=confirmed,
