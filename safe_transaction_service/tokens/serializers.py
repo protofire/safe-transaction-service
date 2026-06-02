@@ -10,6 +10,7 @@ class TokenTransferInfoType(Enum):
     UNKNOWN = -1
     ERC20 = 0
     ERC721 = 1
+    SRC20 = 2
 
 
 class TokenInfoResponseSerializer(serializers.Serializer):
@@ -22,7 +23,9 @@ class TokenInfoResponseSerializer(serializers.Serializer):
     trusted = serializers.BooleanField()
 
     def get_type(self, obj: Token) -> str:
-        if obj.is_erc20():
+        if obj.is_src20():
+            return TokenTransferInfoType.SRC20.name
+        elif obj.is_erc20():
             return TokenTransferInfoType.ERC20.name
         elif obj.is_erc721():
             return TokenTransferInfoType.ERC721.name
