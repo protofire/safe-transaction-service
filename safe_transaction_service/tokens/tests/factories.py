@@ -17,6 +17,7 @@ class TokenFactory(DjangoModelFactory):
     trusted = False
     spam = False
     copy_price = None
+    src20 = False
 
 
 class TokenListFactory(DjangoModelFactory):

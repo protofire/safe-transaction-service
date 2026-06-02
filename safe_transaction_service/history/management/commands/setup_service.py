@@ -117,6 +117,12 @@ TASKS = [
         period=IntervalSchedule.SECONDS,
     ),
     CeleryTaskConfiguration(
+        name="safe_transaction_service.history.tasks.index_src20_events_task",
+        description="Index SRC20 Transfer Events (every 14 seconds)",
+        interval=14,
+        period=IntervalSchedule.SECONDS,
+    ),
+    CeleryTaskConfiguration(
         name="safe_transaction_service.history.tasks.reindex_mastercopies_last_hours_task",
         description="Reindex master copies for the last hours (every 2 hours at minute 0)",
         cron=CronDefinition(
@@ -163,7 +169,9 @@ TASKS = [
     CeleryTaskConfiguration(
         name="safe_transaction_service.analytics.tasks.get_safe_statistics_task",
         description="Calculate Safe statistics (every month at 00:00)",
-        cron=CronDefinition(minute=0, hour=0, day_of_month="1"),  # Every month at 00:00 - 0 0 1 * *
+        cron=CronDefinition(
+            minute=0, hour=0, day_of_month="1"
+        ),  # Every month at 00:00 - 0 0 1 * *
     ),
 ]
 

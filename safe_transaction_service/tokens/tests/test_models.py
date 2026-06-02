@@ -227,6 +227,61 @@ class TestModels(TestCase):
         # Token should not be marked as not valid if there's a blockchain error
         self.assertEqual(TokenNotValid.objects.count(), 0)
 
+    @mock.patch.object(
+        Erc20Manager,
+        "get_info",
+        autospec=True,
+        # A malicious/non-standard token can return an over-long name/symbol. `get_or_create`
+        # bypasses `TokenManager.create`'s truncation, so without truncation this would raise
+        # `DataError` and (on the indexer's critical path) halt SRC20 indexing forever.
+        return_value=Erc20Info(
+            name="N" * 100,
+            symbol="S" * 100,
+            decimals=18,
+        ),
+    )
+    def test_create_src20_from_blockchain_truncates_long_metadata(
+        self, get_info: MagicMock
+    ):
+        address = "0xBB9bc244D798123fDe783fCc1C72d3Bb8C189413"
+        token = Token.objects.create_src20_from_blockchain(address)
+
+        self.assertIsNotNone(token)
+        self.assertEqual(len(token.name), 60)
+        self.assertEqual(len(token.symbol), 60)
+        self.assertTrue(token.src20)
+        self.assertEqual(token.decimals, 0)
+        # Stored row matches (i.e. the INSERT did not raise)
+        self.assertEqual(Token.objects.get(address=address).name, "N" * 60)
+
+    @mock.patch.object(
+        Erc20Manager,
+        "get_info",
+        autospec=True,
+        side_effect=Exception("Token does not implement metadata"),
+    )
+    def test_create_src20_from_blockchain_metadata_failure_uses_defaults(
+        self, get_info: MagicMock
+    ):
+        address = "0xBB9bc244D798123fDe783fCc1C72d3Bb8C189413"
+        token = Token.objects.create_src20_from_blockchain(address)
+
+        self.assertIsNotNone(token)
+        self.assertEqual(token.name, "SRC20")
+        self.assertEqual(token.symbol, "SRC20")
+        self.assertTrue(token.src20)
+
+    @mock.patch.object(Erc20Manager, "get_info", autospec=True)
+    def test_create_src20_from_blockchain_is_db_first(self, get_info: MagicMock):
+        address = "0xBB9bc244D798123fDe783fCc1C72d3Bb8C189413"
+        existing = TokenFactory(address=address, src20=True)
+
+        token = Token.objects.create_src20_from_blockchain(address)
+
+        # Known token returned without hitting the node
+        self.assertEqual(token.address, existing.address)
+        get_info.assert_not_called()
+
 
 class TestTokenListModel(TestCase):
     @mock.patch("requests.get")

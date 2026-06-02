@@ -4,3 +4,4 @@ from .ethereum_indexer import EthereumIndexer, FindRelevantElementsException
 from .internal_tx_indexer import InternalTxIndexer, InternalTxIndexerProvider
 from .proxy_factory_indexer import ProxyFactoryIndexer, ProxyFactoryIndexerProvider
 from .safe_events_indexer import SafeEventsIndexer, SafeEventsIndexerProvider
+from .src20_events_indexer import Src20EventsIndexer, Src20EventsIndexerProvider

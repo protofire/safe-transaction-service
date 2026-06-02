@@ -29,6 +29,7 @@ from ..models import (
     ModuleTransaction,
     MultisigTransaction,
     SafeRelevantTransaction,
+    SRC20Transfer,
     TransferDict,
 )
 from ..serializers import (
@@ -245,11 +246,16 @@ class TransactionService:
         ether_queryset = InternalTx.objects.ether_txs_for_address(safe_address).filter(
             ethereum_tx__in=all_ids
         )
+        src20_queryset = (
+            SRC20Transfer.objects.to_or_from(safe_address)
+            .token_txs()
+            .filter(ethereum_tx__in=all_ids)
+        )
 
         # Build dict of transfers for optimizing access
         transfer_dict = defaultdict(list)
         transfers: list[TransferDict] = InternalTx.objects.union_ether_and_token_txs(
-            erc20_queryset, erc721_queryset, ether_queryset
+            erc20_queryset, erc721_queryset, ether_queryset, src20_queryset
         )
         for transfer in transfers:
             transfer_dict[transfer["transaction_hash"]].append(transfer)

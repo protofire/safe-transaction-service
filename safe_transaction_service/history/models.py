@@ -6,13 +6,7 @@ from enum import Enum
 from functools import cache, lru_cache
 from itertools import islice
 from logging import getLogger
-from typing import (
-    Any,
-    Optional,
-    Self,
-    TypedDict,
-    Union,
-)
+from typing import Any, Optional, Self, TypedDict, Union
 
 from django.conf import settings
 from django.contrib.postgres.fields import ArrayField
@@ -146,6 +140,15 @@ class InternalTxType(Enum):
 
 class IndexingStatusType(Enum):
     ERC20_721_EVENTS = 0
+    SRC20_EVENTS = 1
+
+
+# SRC20 confidential token `Transfer` event:
+# Transfer(address indexed from, address indexed to, bytes32 indexed encryptKeyHash, bytes encryptedAmount)
+# Topic differs from the canonical ERC20/721 Transfer topic, so it's indexed separately.
+SRC20_TRANSFER_TOPIC = HexBytes(
+    "0x80ffa007a69623ef13594f5e8178eee6c4ef2d0cba74c08329e879f695b7d3f6"
+)
 
 
 class TransferDict(TypedDict):
@@ -217,6 +220,23 @@ class IndexingStatusManager(models.Manager):
         :return:
         """
         queryset = self.filter(indexing_type=IndexingStatusType.ERC20_721_EVENTS.value)
+        if from_block_number is not None:
+            queryset = queryset.filter(block_number__gte=from_block_number)
+        return bool(queryset.update(block_number=block_number))
+
+    def get_src20_indexing_status(self) -> "IndexingStatus":
+        return self.get(indexing_type=IndexingStatusType.SRC20_EVENTS.value)
+
+    def set_src20_indexing_status(
+        self, block_number: int, from_block_number: int | None = None
+    ) -> bool:
+        """
+        :param block_number:
+        :param from_block_number: If provided, only update the field if bigger than `from_block_number`, to protect
+                                  from reorgs
+        :return:
+        """
+        queryset = self.filter(indexing_type=IndexingStatusType.SRC20_EVENTS.value)
         if from_block_number is not None:
             queryset = queryset.filter(block_number__gte=from_block_number)
         return bool(queryset.update(block_number=block_number))
@@ -546,6 +566,7 @@ class TokenTransferQuerySet(models.QuerySet):
         self,
         erc20_queryset: QuerySet,
         erc721_queryset: QuerySet,
+        src20_queryset: QuerySet | None = None,
     ) -> TransferDict:
         values = [
             "block",
@@ -558,9 +579,12 @@ class TokenTransferQuerySet(models.QuerySet):
             "token_address",
             "_log_index",
         ]
-        return erc20_queryset.values(*values).union(
+        result = erc20_queryset.values(*values).union(
             erc721_queryset.values(*values), all=True
         )
+        if src20_queryset is not None:
+            result = result.union(src20_queryset.values(*values), all=True)
+        return result
 
 
 class TokenTransferManager(BulkCreateSignalMixin, models.Manager):
@@ -861,6 +885,97 @@ class ERC721Transfer(TokenTransfer):
         )
 
 
+class SRC20TransferQuerySet(TokenTransferQuerySet):
+    def token_txs(self):
+        return self.annotate(
+            # Amount is encrypted on-chain, so value is always reported as 0
+            _value=RawSQL("0::numeric", ()),
+            transaction_hash=F("ethereum_tx_id"),
+            block=F("block_number"),
+            execution_date=F("timestamp"),
+            _token_id=RawSQL("NULL::numeric", ()),
+            token_address=F("address"),
+            _log_index=F("log_index"),
+            _trace_address=RawSQL("NULL", ()),
+        )
+
+
+class SRC20Transfer(TokenTransfer):
+    """
+    SRC20 confidential `Transfer` event.
+
+    The transferred amount is encrypted on-chain (`encryptedAmount`), so it cannot be
+    represented as a number. Transfers are exposed like ERC20 transfers with `value=0`,
+    and the token never enters the balances pipeline (separate table from `ERC20Transfer`).
+    """
+
+    objects = TokenTransferManager.from_queryset(SRC20TransferQuerySet)()
+    encrypt_key_hash = models.BinaryField(null=True)  # bytes32, indexed topic
+    encrypted_amount = models.BinaryField(null=True)  # raw `encryptedAmount` bytes
+
+    class Meta(TokenTransfer.Meta):
+        abstract = False
+        verbose_name = "SRC20 Transfer"
+        verbose_name_plural = "SRC20 Transfers"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ethereum_tx", "log_index"], name="unique_src20_transfer_index"
+            )
+        ]
+
+    def __str__(self):
+        return f"SRC20 Transfer from={self._from} to={self.to}"
+
+    @property
+    def value(self) -> int:
+        """
+        Behave as an ERC20Transfer so it's easier to handle. Amount is encrypted, always 0.
+        """
+        return 0
+
+    @classmethod
+    def from_decoded_event(cls, event_data: EventData) -> "SRC20Transfer":
+        """
+        Does not create the model, as it requires that `ethereum_tx` exists
+
+        Receives a decoded `EventData` (already matched against the SRC20 topic during
+        decoding), so the raw `topics` are no longer present.
+
+        :param event_data:
+        :return: `SRC20Transfer`
+        :raises: ValueError
+        """
+        if "from" not in event_data["args"] or "to" not in event_data["args"]:
+            raise ValueError(
+                f"Not supported EventData, `from`/`to` not present {event_data}"
+            )
+
+        try:
+            timestamp = EthereumBlock.objects.get_timestamp_by_hash(
+                event_data["blockHash"]
+            )
+        except EthereumBlock.DoesNotExist:
+            # Block is not found and should be present on DB. Reorg
+            EthereumTx.objects.get(
+                event_data["transactionHash"]
+            ).block.set_not_confirmed()
+            raise
+
+        encrypted_amount = event_data["args"].get("encryptedAmount") or b""
+        encrypt_key_hash = event_data["args"].get("encryptKeyHash") or b""
+        return cls(
+            timestamp=timestamp,
+            block_number=event_data["blockNumber"],
+            ethereum_tx_id=event_data["transactionHash"],
+            log_index=event_data["logIndex"],
+            address=event_data["address"],  # SRC20 token contract
+            _from=event_data["args"]["from"],
+            to=event_data["args"]["to"],
+            encrypt_key_hash=bytes(HexBytes(encrypt_key_hash)),
+            encrypted_amount=bytes(HexBytes(encrypted_amount)),
+        )
+
+
 class InternalTxManager(BulkCreateSignalMixin, models.Manager):
     def _trace_address_to_str(self, trace_address: Sequence[int]) -> str:
         return ",".join([str(address) for address in trace_address])
@@ -1090,6 +1205,7 @@ class InternalTxQuerySet(models.QuerySet):
         erc20_queryset: QuerySet,
         erc721_queryset: QuerySet,
         ether_queryset: QuerySet,
+        src20_queryset: QuerySet | None = None,
     ) -> TransferDict:
         values = [
             "block",
@@ -1103,12 +1219,14 @@ class InternalTxQuerySet(models.QuerySet):
             "_log_index",
             "_trace_address",
         ]
-        return (
+        queryset = (
             ether_queryset.values(*values)
             .union(erc20_queryset.values(*values), all=True)
             .union(erc721_queryset.values(*values), all=True)
-            .order_by("-block")
         )
+        if src20_queryset is not None:
+            queryset = queryset.union(src20_queryset.values(*values), all=True)
+        return queryset.order_by("-block")
 
     def union_optimized_ether_and_token_txs(
         self,
@@ -1117,6 +1235,8 @@ class InternalTxQuerySet(models.QuerySet):
         erc721_in_queryset: QuerySet,
         erc721_out_queryset: QuerySet,
         ether_queryset: QuerySet,
+        src20_in_queryset: QuerySet | None = None,
+        src20_out_queryset: QuerySet | None = None,
     ) -> TransferDict:
         values = [
             "block",
@@ -1130,13 +1250,18 @@ class InternalTxQuerySet(models.QuerySet):
             "_log_index",
             "_trace_address",
         ]
-        return (
+        queryset = (
             ether_queryset.values(*values)
             .union(erc20_in_queryset.values(*values), all=True)
             .union(erc20_out_queryset.values(*values), all=True)
             .union(erc721_in_queryset.values(*values), all=True)
             .union(erc721_out_queryset.values(*values), all=True)
         )
+        if src20_in_queryset is not None:
+            queryset = queryset.union(src20_in_queryset.values(*values), all=True)
+        if src20_out_queryset is not None:
+            queryset = queryset.union(src20_out_queryset.values(*values), all=True)
+        return queryset
 
     def ether_txs_values(
         self,

@@ -36,6 +36,7 @@ from ..models import (
     SafeMasterCopy,
     SafeRelevantTransaction,
     SafeStatus,
+    SRC20Transfer,
     TokenTransfer,
 )
 
@@ -128,6 +129,14 @@ class ERC721TransferFactory(TokenTransfer):
 
     class Meta:
         model = ERC721Transfer
+
+
+class SRC20TransferFactory(TokenTransfer):
+    encrypt_key_hash = factory.Sequence(lambda n: HexBytes("%064x" % n))
+    encrypted_amount = factory.Sequence(lambda n: HexBytes("%x" % (n + 1000)))
+
+    class Meta:
+        model = SRC20Transfer
 
 
 class InternalTxFactory(DjangoModelFactory):

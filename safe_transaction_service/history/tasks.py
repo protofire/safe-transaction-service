@@ -23,6 +23,7 @@ from .indexers import (
     InternalTxIndexerProvider,
     ProxyFactoryIndexerProvider,
     SafeEventsIndexerProvider,
+    Src20EventsIndexerProvider,
 )
 from .models import (
     EthereumBlock,
@@ -108,6 +109,32 @@ def index_erc20_events_task(self) -> tuple[int, int] | None:
             ) = Erc20EventsIndexerProvider().start()
             logger.debug(
                 "Indexing of erc20/721 events task processed %d events", number_events
+            )
+            return number_events, number_of_blocks_processed
+
+
+@app.shared_task(
+    bind=True,
+    autoretry_for=(IndexingException, IOError),
+    default_retry_delay=15,
+    retry_kwargs={"max_retries": 3},
+)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def index_src20_events_task(self) -> tuple[int, int] | None:
+    """
+    Find and process SRC20 `Transfer` events for monitored addresses
+
+    :return: Tuple Number of events processed, number of blocks processed
+    """
+    with contextlib.suppress(LockError):
+        with only_one_running_task(self):
+            logger.info("Start indexing of src20 events")
+            (
+                number_events,
+                number_of_blocks_processed,
+            ) = Src20EventsIndexerProvider().start()
+            logger.debug(
+                "Indexing of src20 events task processed %d events", number_events
             )
             return number_events, number_of_blocks_processed
 
@@ -410,7 +437,10 @@ def reindex_master_copies_task(
                 addresses,
             )
             index_service.reindex_master_copies(
-                from_block_number, to_block_number=to_block_number, block_process_limit=20, addresses=addresses
+                from_block_number,
+                to_block_number=to_block_number,
+                block_process_limit=20,
+                addresses=addresses,
             )
 
 

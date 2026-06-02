@@ -54,6 +54,7 @@ from .models import (
     SafeContractDelegate,
     SafeLastStatus,
     SafeMasterCopy,
+    SRC20Transfer,
     TransferDict,
 )
 from .pagination import DummyPagination
@@ -77,7 +78,9 @@ class AboutView(APIView):
 
     @method_decorator(cache_page(5 * 60))  # 5 minutes
     def get(self, request, format=None):
-        ethereum_node_url = settings.ETHEREUM_NODE_URL if not settings.HIDE_ETHEREUM_RPC else None
+        ethereum_node_url = (
+            settings.ETHEREUM_NODE_URL if not settings.HIDE_ETHEREUM_RPC else None
+        )
 
         content = {
             "name": "Safe Transaction Service",
@@ -861,7 +864,7 @@ class TransferView(RetrieveAPIView):
         self, transaction_hash: HexStr, log_index: int
     ) -> TransferDict:
         """
-        Search ERCTransfer by transaction_hash and log_index event.
+        Search ERC20/ERC721/SRC20 transfer by transaction_hash and log_index event.
 
         :param transaction_hash: ethereum transaction hash
         :param log_index: event log index
@@ -877,8 +880,13 @@ class TransferView(RetrieveAPIView):
                 ethereum_tx=transaction_hash, log_index=log_index
             ).token_txs()
         )
+        src20_queryset = self.filter_queryset(
+            SRC20Transfer.objects.filter(
+                ethereum_tx=transaction_hash, log_index=log_index
+            ).token_txs()
+        )
         return ERC20Transfer.objects.token_transfer_values(
-            erc20_queryset, erc721_queryset
+            erc20_queryset, erc721_queryset, src20_queryset
         )
 
     def get_ethereum_transfer(
@@ -972,12 +980,23 @@ class SafeTransferListView(ListAPIView):
         ether_queryset = self.filter_queryset(
             InternalTx.objects.ether_txs_for_address(address).order_by(order_by)
         )[: settings.TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS]
+        src20_in_queryset = self.filter_queryset(
+            SRC20Transfer.objects.incoming(address).token_txs().order_by(order_by)
+        )[: settings.TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS]
+        src20_out_queryset = self.filter_queryset(
+            SRC20Transfer.objects.outgoing(address)
+            .not_self_transfers()
+            .token_txs()
+            .order_by(order_by)
+        )[: settings.TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS]
         return InternalTx.objects.union_optimized_ether_and_token_txs(
             erc20_in_queryset,
             erc20_out_queryset,
             erc721_in_queryset,
             erc721_out_queryset,
             ether_queryset,
+            src20_in_queryset,
+            src20_out_queryset,
         ).order_by("-execution_date")
 
     def get_queryset(self):
@@ -1060,9 +1079,12 @@ class SafeIncomingTransferListView(SafeTransferListView):
                 order_by
             )
         )[: settings.TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS]
+        src20_queryset = self.filter_queryset(
+            SRC20Transfer.objects.incoming(address).token_txs().order_by(order_by)
+        )[: settings.TX_SERVICE_ALL_TXS_ENDPOINT_LIMIT_TRANSFERS]
 
         return InternalTx.objects.union_ether_and_token_txs(
-            erc20_queryset, erc721_queryset, ether_queryset
+            erc20_queryset, erc721_queryset, ether_queryset, src20_queryset
         ).order_by("-execution_date")
 
 
