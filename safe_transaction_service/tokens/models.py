@@ -25,7 +25,10 @@ from .clients.zerion_client import (
     ZerionTokenAdapterClient,
     ZerionUniswapV2TokenAdapterClient,
 )
-from .constants import ENS_CONTRACTS_WITH_TLD
+from .constants import (
+    ENS_CONTRACTS_WITH_TLD,
+    get_src20_keyless_placeholder_logs,
+)
 from .exceptions import TokenListRetrievalException
 
 logger = logging.getLogger(__name__)
@@ -198,6 +201,9 @@ class TokenManager(models.Manager):
                 "symbol": _clean(symbol, "SRC20"),
                 "decimals": 0,
                 "src20": True,
+                "src20_keyless_placeholder_logs_per_transfer": (
+                    get_src20_keyless_placeholder_logs(token_address)
+                ),
             },
         )
         return token
@@ -292,6 +298,17 @@ class Token(models.Model):
     src20 = models.BooleanField(
         default=False,
         help_text="Set `True` for SRC20 confidential tokens (amounts are encrypted)",
+    )
+    src20_keyless_placeholder_logs_per_transfer = models.PositiveSmallIntegerField(
+        default=1,
+        help_text=(
+            "Number of `encryptKeyHash == 0` `Transfer` logs a single SRC20 transfer "
+            "emits when both parties are keyless (sender + recipient = 2 for the standard "
+            "base). STRUCTURAL and PROVIDER-INDEPENDENT: provider logs carry non-zero "
+            "hashes and are counted separately, so this value stays 2 even when providers "
+            "are registered. Used as the divisor to collapse duplicate keyless logs back "
+            "to one logical transfer. `1` means keep every log (never under-count)."
+        ),
     )
 
     class Meta:

@@ -7,17 +7,35 @@ from django.test import TestCase
 
 from eth_account import Account
 from safe_eth.eth.ethereum_client import Erc20Info, Erc20Manager
+from web3 import Web3
 
 from ..clients.zerion_client import (
     BalancerTokenAdapterClient,
     ZerionPoolMetadata,
     ZerionUniswapV2TokenAdapterClient,
 )
+from ..constants import SRC20_KEYLESS_PLACEHOLDER_LOGS
 from ..exceptions import TokenListRetrievalException
 from ..models import Token, TokenManager, TokenNotValid
 from ..models import logger as token_model_logger
 from .factories import TokenFactory, TokenListFactory
 from .mocks import token_list_mock
+
+
+class TestSrc20PlaceholderConstants(TestCase):
+    def test_keys_are_checksummed_addresses(self):
+        # Token.address is a binary field queried via checksummed strings; a non-checksummed
+        # key would make the 0018 backfill (and the indexer fallback) a silent no-op.
+        for address in SRC20_KEYLESS_PLACEHOLDER_LOGS:
+            self.assertEqual(
+                address,
+                Web3.to_checksum_address(address),
+                f"{address} is not EIP-55 checksummed",
+            )
+
+    def test_values_are_positive(self):
+        for address, count in SRC20_KEYLESS_PLACEHOLDER_LOGS.items():
+            self.assertGreaterEqual(count, 1, address)
 
 
 class TestModels(TestCase):

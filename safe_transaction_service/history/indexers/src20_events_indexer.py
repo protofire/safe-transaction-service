@@ -16,6 +16,7 @@ from web3 import Web3
 from web3.contract.contract import ContractEvent
 from web3.types import EventData, FilterParams, LogReceipt
 
+from ...tokens.constants import get_src20_keyless_placeholder_logs
 from ...tokens.models import Token
 from ...utils.utils import FixedSizeDict
 from ..models import (
@@ -29,6 +30,41 @@ from ..models import (
 from .events_indexer import EventsIndexer
 
 logger = getLogger(__name__)
+
+
+class Src20DirectoryLookupError(Exception):
+    """
+    Raised when the directory precompile lookup itself FAILS (RPC error, pruned/archive
+    state unavailable, etc.). This is deliberately distinct from a successful lookup that
+    returns "no key": a failure must never be read as "keyless", because that would let the
+    keyless `÷m` path under-count a genuinely keyed transfer. Callers treat this as
+    "uncertain" and keep every log.
+    """
+
+
+# Seismic "directory" precompile exposing per-address encryption-key state. Used to resolve
+# a party's `keyHash` at a historical block when a SRC20 group contains keyed (`encryptKeyHash
+# != 0`) logs, so the recipient/sender log can be anchored exactly. `keyHash(address)` is the
+# same value the token writes into the `Transfer` event's `encryptKeyHash` topic.
+SRC20_DIRECTORY_PRECOMPILE_ADDRESS = Web3.to_checksum_address(
+    "0x1000000000000000000000000000000000000004"
+)
+SRC20_DIRECTORY_ABI = [
+    {
+        "name": "checkHasKey",  # selector 0x8b2f9fd1
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "addr", "type": "address"}],
+        "outputs": [{"name": "", "type": "bool"}],
+    },
+    {
+        "name": "keyHash",  # selector 0xeefbaf18
+        "type": "function",
+        "stateMutability": "view",
+        "inputs": [{"name": "addr", "type": "address"}],
+        "outputs": [{"name": "", "type": "bytes32"}],
+    },
+]
 
 
 # Transfer(address indexed from, address indexed to, bytes32 indexed encryptKeyHash, bytes encryptedAmount)
@@ -156,14 +192,273 @@ class Src20EventsIndexer(EventsIndexer):
         """
         pass
 
+    @staticmethod
+    def _log_key_hash(decoded_element: EventData) -> bytes:
+        """
+        :return: The `encryptKeyHash` of a decoded `Transfer` event as 32 raw bytes
+            (empty/zero hashes are normalized to all-zero bytes via `int.from_bytes`).
+        """
+        return bytes(HexBytes(decoded_element["args"].get("encryptKeyHash") or b""))
+
+    @classmethod
+    def _is_keyed(cls, decoded_element: EventData) -> bool:
+        return int.from_bytes(cls._log_key_hash(decoded_element), "big") != 0
+
+    def _keyless_placeholder_logs_map(
+        self, token_addresses: set[ChecksumAddress]
+    ) -> dict[ChecksumAddress, int]:
+        """
+        :return: For each token, the number of `encryptKeyHash == 0` logs a single transfer
+            emits when both parties are keyless (the keyless/self divisor). The value stored
+            on the `Token` row is authoritative once the token is registered; tokens not yet
+            registered fall back to the config map (both yield identical values).
+        """
+        stored = dict(
+            Token.objects.filter(address__in=token_addresses).values_list(
+                "address", "src20_keyless_placeholder_logs_per_transfer"
+            )
+        )
+        return {
+            address: stored.get(address) or get_src20_keyless_placeholder_logs(address)
+            for address in token_addresses
+        }
+
+    def _key_hash_at_block(
+        self,
+        address: ChecksumAddress,
+        block_number: int,
+        cache: dict[tuple[ChecksumAddress, int], bytes | None],
+    ) -> bytes | None:
+        """
+        Resolve `keyHash(address)` from the directory precompile at a historical block.
+
+        :return: 32 raw bytes if the address has a key at that block, or `None` if the
+            directory CONFIRMS the address is keyless.
+        :raises Src20DirectoryLookupError: if the lookup itself fails (RPC error, pruned
+            state). A failure must not be conflated with a confirmed "no key" — see the
+            exception docstring. Callers keep every log when this is raised.
+        """
+        key = (address, block_number)
+        if key in cache:
+            return cache[key]
+
+        try:
+            directory = self.ethereum_client.w3.eth.contract(
+                address=SRC20_DIRECTORY_PRECOMPILE_ADDRESS, abi=SRC20_DIRECTORY_ABI
+            )
+            result: bytes | None = None
+            if directory.functions.checkHasKey(address).call(
+                block_identifier=block_number
+            ):
+                key_hash = bytes(
+                    HexBytes(
+                        directory.functions.keyHash(address).call(
+                            block_identifier=block_number
+                        )
+                    )
+                )
+                if int.from_bytes(key_hash, "big"):
+                    result = key_hash
+        except Exception as exc:
+            # Do NOT cache and do NOT return None: a failed lookup is "uncertain", not
+            # "keyless". Returning None here would let the keyless `÷m` path under-count a
+            # genuinely keyed transfer (and make the dedupe command delete rows the indexer
+            # kept when it later runs against a pruned node).
+            logger.warning(
+                "SRC20 directory lookup failed for address=%s block=%d; keeping all logs",
+                address,
+                block_number,
+                exc_info=True,
+            )
+            raise Src20DirectoryLookupError(address, block_number) from exc
+
+        cache[key] = result
+        return result
+
+    def _keyless_representatives(
+        self,
+        zero_logs: list[EventData],
+        keyless_logs_per_transfer: int,
+        group_logs: list[EventData],
+    ) -> list[EventData]:
+        """
+        Collapse the `encryptKeyHash == 0` placeholders of a group to one log per logical
+        transfer by keeping every `m`-th (the recipient — last placeholder of each transfer).
+        Keeps every keyless placeholder (never under-counts) if the count is not divisible
+        by `m`. Provider (non-zero `kh`) logs are never returned — only `zero_logs`.
+        """
+        if keyless_logs_per_transfer <= 1:
+            return zero_logs
+        if zero_logs and len(zero_logs) % keyless_logs_per_transfer != 0:
+            logger.warning(
+                "SRC20: %d keyless logs not divisible by placeholder count %d "
+                "(tx=%s token=%s); keeping all keyless logs to avoid mis-dividing",
+                len(zero_logs),
+                keyless_logs_per_transfer,
+                to_0x_hex_str(group_logs[0]["transactionHash"]),
+                group_logs[0]["address"],
+            )
+            # Keep only the keyless placeholders, never the provider logs (which would be
+            # stored as bogus extra transfers). `group_logs` is unused here on purpose.
+            return zero_logs
+        return zero_logs[keyless_logs_per_transfer - 1 :: keyless_logs_per_transfer]
+
+    def _select_representatives(
+        self,
+        group_logs: list[EventData],
+        keyless_logs_per_transfer: int,
+        from_: ChecksumAddress,
+        to: ChecksumAddress,
+        key_hash_cache: dict[tuple[ChecksumAddress, int], bytes | None],
+    ) -> list[EventData]:
+        """
+        Pick the representative logs for one `(tx, token, from, to)` group so that the number
+        of stored rows equals the number of logical transfers. See module docstring / plan
+        for the full rule. Guarantees a non-empty group never yields zero representatives.
+        """
+        group_logs = sorted(group_logs, key=lambda element: element["logIndex"])
+        zero_logs = [e for e in group_logs if not self._is_keyed(e)]
+        nonzero_logs = [e for e in group_logs if self._is_keyed(e)]
+
+        try:
+            reps = self._compute_representatives(
+                group_logs,
+                zero_logs,
+                nonzero_logs,
+                keyless_logs_per_transfer,
+                from_,
+                to,
+                key_hash_cache,
+            )
+        except Src20DirectoryLookupError:
+            # Could not determine whether a party is keyed, so we cannot safely divide.
+            # Keep every log (over-count is acceptable; under-count is not).
+            logger.warning(
+                "SRC20: directory lookup failed for group tx=%s token=%s from=%s to=%s "
+                "size=%d; keeping all logs",
+                to_0x_hex_str(group_logs[0]["transactionHash"]),
+                group_logs[0]["address"],
+                from_,
+                to,
+                len(group_logs),
+            )
+            return group_logs
+
+        if group_logs and not reps:
+            # Never-empty guard: a real transfer must never be dropped (key rotation,
+            # archive-state mismatch, or an unexpected emission shape) — keep every log.
+            logger.warning(
+                "SRC20: empty selection for group tx=%s token=%s from=%s to=%s size=%d; "
+                "keeping all logs",
+                to_0x_hex_str(group_logs[0]["transactionHash"]),
+                group_logs[0]["address"],
+                from_,
+                to,
+                len(group_logs),
+            )
+            return group_logs
+        return reps
+
+    def _compute_representatives(
+        self,
+        group_logs: list[EventData],
+        zero_logs: list[EventData],
+        nonzero_logs: list[EventData],
+        keyless_logs_per_transfer: int,
+        from_: ChecksumAddress,
+        to: ChecksumAddress,
+        key_hash_cache: dict[tuple[ChecksumAddress, int], bytes | None],
+    ) -> list[EventData]:
+        if not nonzero_logs:
+            # Fully keyless (the only case on this testnet today): divide the placeholders.
+            return self._keyless_representatives(
+                zero_logs, keyless_logs_per_transfer, group_logs
+            )
+
+        distinct_hashes = {self._log_key_hash(e) for e in nonzero_logs}
+        if not zero_logs and len(distinct_hashes) == 1 and from_ != to:
+            # Recipient-only keyed token (e.g. 0xDDe870…): for from != to a single transfer's
+            # viewer hashes are all distinct, so identical-hash logs are separate transfers.
+            # Exact count with no directory call.
+            return nonzero_logs
+
+        # A party may be keyed (possibly mixed with keyless placeholders or providers):
+        # anchor on the directory's keyHash at the tx's block.
+        block_number = group_logs[0]["blockNumber"]
+        kh_to = self._key_hash_at_block(to, block_number, key_hash_cache)
+        kh_from = self._key_hash_at_block(from_, block_number, key_hash_cache)
+
+        if from_ == to:
+            anchor = kh_to or kh_from
+            if anchor is None:
+                # Self-transfer but both parties keyless: the non-zero logs are providers;
+                # count the keyless placeholders instead.
+                return self._keyless_representatives(
+                    zero_logs, keyless_logs_per_transfer, group_logs
+                )
+            matched = [e for e in nonzero_logs if self._log_key_hash(e) == anchor]
+            if not matched or len(matched) % keyless_logs_per_transfer != 0:
+                logger.warning(
+                    "SRC20: self-transfer keyed mismatch (tx=%s token=%s matched=%d m=%d); "
+                    "keeping all logs",
+                    to_0x_hex_str(group_logs[0]["transactionHash"]),
+                    group_logs[0]["address"],
+                    len(matched),
+                    keyless_logs_per_transfer,
+                )
+                return group_logs
+            return matched[keyless_logs_per_transfer - 1 :: keyless_logs_per_transfer]
+
+        if kh_to is not None:
+            return [e for e in nonzero_logs if self._log_key_hash(e) == kh_to]
+        if kh_from is not None:
+            return [e for e in nonzero_logs if self._log_key_hash(e) == kh_from]
+
+        # Both parties keyless: the non-zero logs are providers — ignore them and count the
+        # keyless placeholders only.
+        return self._keyless_representatives(
+            zero_logs, keyless_logs_per_transfer, group_logs
+        )
+
     def events_to_src20_transfer(
         self, decoded_elements: Sequence[EventData]
     ) -> Iterator[SRC20Transfer]:
+        """
+        A single SRC20 transfer emits one `Transfer` log per "viewer" of the encrypted
+        amount (sender + recipient placeholders, plus one per registered provider), so a
+        raw 1:1 log→row mapping over-counts. Group the decoded events by
+        `(tx, token, from, to)`, count the logical transfers per group, and yield only that
+        many representative logs (keeping their real, distinct `log_index`).
+        """
+        groups: OrderedDict[tuple, list[EventData]] = OrderedDict()
         for decoded_element in decoded_elements:
-            try:
-                yield SRC20Transfer.from_decoded_event(decoded_element)
-            except ValueError:
-                pass
+            args = decoded_element["args"]
+            if "from" not in args or "to" not in args:
+                continue
+            group_key = (
+                decoded_element["transactionHash"],
+                decoded_element["address"],
+                args["from"],
+                args["to"],
+            )
+            groups.setdefault(group_key, []).append(decoded_element)
+
+        token_addresses = {address for (_tx, address, _from, _to) in groups}
+        keyless_logs_per_transfer = self._keyless_placeholder_logs_map(token_addresses)
+        key_hash_cache: dict[tuple[ChecksumAddress, int], bytes | None] = {}
+
+        for (_tx, token, from_, to), group_logs in groups.items():
+            for representative in self._select_representatives(
+                group_logs,
+                keyless_logs_per_transfer[token],
+                from_,
+                to,
+                key_hash_cache,
+            ):
+                try:
+                    yield SRC20Transfer.from_decoded_event(representative)
+                except ValueError:
+                    pass
 
     def events_to_safe_relevant_transaction(
         self, decoded_elements: Sequence[EventData]

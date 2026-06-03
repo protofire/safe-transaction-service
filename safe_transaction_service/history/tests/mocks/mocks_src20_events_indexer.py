@@ -1,9 +1,73 @@
+from eth_abi import encode
 from hexbytes import HexBytes
+from web3 import Web3
 
-# Raw SRC20 `Transfer` log:
-# Transfer(address indexed from, address indexed to, bytes32 indexed encryptKeyHash, bytes encryptedAmount)
-# topics[0] is the SRC20 transfer topic (distinct from the ERC20/721 one).
-# `data` is the ABI-encoded dynamic `bytes encryptedAmount` (here 0xdeadbeefcafe).
+# SRC20 `Transfer(address indexed from, address indexed to, bytes32 indexed encryptKeyHash,
+# bytes encryptedAmount)` topic (distinct from the ERC20/721 one).
+SRC20_TRANSFER_TOPIC_HEX = (
+    "0x80ffa007a69623ef13594f5e8178eee6c4ef2d0cba74c08329e879f695b7d3f6"
+)
+
+# Deterministic checksummed addresses for tests.
+TOKEN_STANDARD = Web3.to_checksum_address("0x" + "ab" * 20)  # 2 placeholders/transfer
+TOKEN_RECIPIENT_ONLY = Web3.to_checksum_address(
+    "0x" + "cd" * 20
+)  # 1 keyed log/transfer
+ADDR_A = Web3.to_checksum_address("0x" + "1a" * 20)
+ADDR_B = Web3.to_checksum_address("0x" + "2b" * 20)
+ADDR_C = Web3.to_checksum_address("0x" + "3c" * 20)
+ZERO_ADDRESS = "0x" + "00" * 20
+
+
+def _address_topic(address: str) -> HexBytes:
+    # Indexed address topic: 12 zero bytes + the 20-byte address.
+    return HexBytes("0x" + "00" * 12 + address[2:])
+
+
+def _key_hash_topic(key_hash) -> HexBytes:
+    if isinstance(key_hash, int):
+        return HexBytes(f"0x{key_hash:064x}")
+    return HexBytes(key_hash)
+
+
+def build_src20_log(
+    *,
+    tx_hash: str,
+    block_hash: str,
+    block_number: int,
+    log_index: int,
+    token: str,
+    from_: str,
+    to: str,
+    key_hash=0,
+    encrypted_amount: bytes = b"\xde\xad\xbe\xef",
+) -> dict:
+    """
+    Build a raw SRC20 `Transfer` LogReceipt the indexer can decode and group.
+
+    :param key_hash: `encryptKeyHash` topic; ``0`` is the keyless placeholder.
+    :param encrypted_amount: opaque encrypted bytes (vary it to mimic distinct transfers).
+    """
+    return {
+        "address": Web3.to_checksum_address(token),
+        "blockHash": HexBytes(block_hash),
+        "blockNumber": block_number,
+        "data": HexBytes(encode(["bytes"], [encrypted_amount])),
+        "logIndex": log_index,
+        "removed": False,
+        "topics": [
+            HexBytes(SRC20_TRANSFER_TOPIC_HEX),
+            _address_topic(from_),
+            _address_topic(to),
+            _key_hash_topic(key_hash),
+        ],
+        "transactionHash": HexBytes(tx_hash),
+        "transactionIndex": 0,
+    }
+
+
+# Single keyless placeholder log (matches today's on-chain reality: keyless parties emit
+# `encryptKeyHash == 0`). Used by the resilience tests below.
 log_receipt_mock = [
     {
         "address": "0xD84dbd5138D2297959Ae56602Bd5B2A035bb3F59",
@@ -29,7 +93,7 @@ log_receipt_mock = [
                 "0x0000000000000000000000006e5b7093ac36ea61da02fd1cceecf56fd6626d48"
             ),
             HexBytes(
-                "0x1111111111111111111111111111111111111111111111111111111111111111"
+                "0x0000000000000000000000000000000000000000000000000000000000000000"
             ),
         ],
         "transactionHash": HexBytes(
