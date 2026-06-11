@@ -1,0 +1,79 @@
+# AGENTS.md
+
+## How Codex Uses This File
+Codex will read `AGENTS.md` for project-specific guidance, workflows, and conventions.
+It is the preferred place to capture shared context and expectations.
+
+## Indexer Architecture (Summary)
+This repository includes multiple indexers under `safe_transaction_service/history/indexers/`.
+
+## Linear
+- All tickets go into `PLATFORM` team and with labels `Backend` and `Transaction Service`
+
+### Base Classes
+- `ethereum_indexer.py`
+  - Orchestrates block range selection and indexing flow.
+  - Shared helpers:
+    - `_is_processed(...)` / `_mark_processed(...)`
+    - `_prefetch_ethereum_txs(...)`
+  - `element_already_processed_checker` is centralized here.
+- `events_indexer.py`
+  - Base for event-driven indexers using `eth_getLogs`.
+  - Shared helpers:
+    - `_filter_not_processed_log_receipts(...)`
+    - `_mark_log_receipts_processed(...)`
+
+### Concrete Indexers
+- `safe_events_indexer.py`
+  - Used on L2 networks. Builds InternalTx-like records from events.
+  - Supports conditional indexing with allow/block lists.
+- `internal_tx_indexer.py`
+  - Used on L1 networks. Uses `trace_filter`/`trace_block`.
+  - Filters traces to relevant ones and skips errored txs.
+  - Only inserts `EthereumTx` when relevant traces exist.
+- `erc20_events_indexer.py`
+  - Indexes ERC20/ERC721 transfers.
+  - Only inserts `EthereumTx` when there are new (not-yet-processed) logs.
+- `proxy_factory_indexer.py`
+  - Indexes Safe `ProxyCreation` events, inserts `SafeContract`.
+
+### Key Behavioral Constraints (Must Preserve)
+- L1 uses `InternalTxIndexer` and L2 uses `SafeEventsIndexer`. They never run in parallel.
+- Internal traces are matched only by `SafeMasterCopy` addresses (no other address list).
+- `EthereumTx` should not exist without at least one related table row.
+- Do not index errored transactions.
+
+## Recent Refactors & Conventions
+- Reused helpers in `EthereumIndexer` for processed-element checks and EthereumTx prefetching.
+- Event indexers use shared helpers to filter/mark processed log receipts.
+- `InternalTxIndexer` filters to relevant traces at trace-level and re-checks `InternalTx.is_relevant` before insert.
+- `is_relevant_trace(...)` must remain consistent with `InternalTx.is_relevant`.
+
+## Dependency Management
+- Dependencies are declared in `pyproject.toml` (`[project] dependencies` for production, `[dependency-groups] dev` for everything else — test and dev tools are a single group).
+- `uv.lock` is the source of pinned truth and must be committed. Always run `uv lock` after editing `pyproject.toml`, then commit both files together.
+- All `uv sync` calls use `--frozen`. CI is the canonical way to update dependencies; never bypass the lockfile locally.
+- `[tool.uv] exclude-newer = "7 days"` rejects packages published less than 7 days ago. If `uv lock` fails due to a recently released pin, revert it to the previous version and re-pin after 7 days.
+
+## Testing
+- Virtualenv is managed by uv at `.venv`. Activate with `source .venv/bin/activate` or prefix commands with `uv run`.
+- Dependencies must be up before running tests: `docker compose --profile develop up db redis ganache rabbitmq -d`
+- Use `pytest` (no parameters). It should auto-detect configuration. `DJANGO_SETTINGS_MODULE=config.settings.test uv run python -m pytest`
+- Use factories (e.g. `SafeContractFactory`) instead of inline helpers or `get_or_create` calls in tests.
+
+## Performance Conventions
+- Prefer `safe_eth.eth.utils.fast_to_checksum_address` and `fast_is_checksum_address` over `Web3.to_checksum_address` / `Web3.is_address` — the `fast_*` variants use `pysha3` for keccak256, making them significantly faster.
+
+## Event Log Parsing Conventions
+- `ExecutionSuccess` and `ExecutionFailure` events exist in two formats depending on Safe version:
+  - v1.3.0: `event ExecutionSuccess(bytes32 txHash, uint256 payment)` — txHash is the first 32 bytes of `data`, payment is the next 32 bytes.
+  - v1.4.1+: `event ExecutionSuccess(bytes32 indexed txHash, uint256 payment)` — txHash is `topics[1]`, payment is the first 32 bytes of `data`.
+- `SafeTxProcessor.get_execution_result(ethereum_tx, safe_tx_hash)` handles both formats in a single log scan and returns `(failed: bool, payment: int | None)`. Use this instead of separate failed/payment lookups.
+- `safe_tx_execution_events_topics` on `SafeTxProcessor` is the combined set of ExecutionSuccess + ExecutionFailure topics, precomputed in `__init__` for efficient log filtering.
+
+## Backfill Management Commands
+- Place one-off backfill commands in `safe_transaction_service/history/management/commands/`.
+- Name them `backfill_<thing>.py`.
+- Filter only rows that need updating (e.g. `payment__isnull=True`) so the command is idempotent.
+- Use `.iterator()` on the queryset to avoid loading all rows into memory; call `.count()` separately beforehand for progress reporting.
+- Log progress every 100 items and emit a final `self.style.SUCCESS(...)` summary.

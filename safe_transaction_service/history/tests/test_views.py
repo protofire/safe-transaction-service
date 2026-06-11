@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
 import datetime
 import json
 import logging
@@ -2278,6 +2279,93 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
         )
 
         data["signature"] = data["signature"] + data["signature"][2:]
+        response = self.client.post(
+            reverse("v1:history:multisig-transactions", args=(safe_address,)),
+            format="json",
+            data=data,
+        )
+        self.assertEqual(response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY)
+        self.assertIn(
+            "Just one signature is expected if using delegates",
+            response.data["non_field_errors"][0],
+        )
+
+    def test_post_multisig_transactions_with_owner_and_delegate(self):
+        """Owner that is also a delegate should be able to sign alongside other owners."""
+        safe_owners = [Account.create() for _ in range(4)]
+        safe_owner_addresses = [s.address for s in safe_owners]
+        # safe_owners[0] will be both an owner and a delegate
+        owner_and_delegate = safe_owners[0]
+        safe = self.deploy_test_safe(owners=safe_owner_addresses, threshold=3)
+        safe_address = safe.address
+
+        to = Account.create().address
+        data = {
+            "to": to,
+            "value": 100000000000000000,
+            "data": None,
+            "operation": 0,
+            "nonce": 0,
+            "safeTxGas": 0,
+            "baseGas": 0,
+            "gasPrice": 0,
+            "gasToken": "0x0000000000000000000000000000000000000000",
+            "refundReceiver": "0x0000000000000000000000000000000000000000",
+            "sender": owner_and_delegate.address,
+            "origin": "Testing origin field",
+        }
+
+        safe_tx = safe.build_multisig_tx(
+            data["to"],
+            data["value"],
+            data["data"],
+            data["operation"],
+            data["safeTxGas"],
+            data["baseGas"],
+            data["gasPrice"],
+            data["gasToken"],
+            data["refundReceiver"],
+            safe_nonce=data["nonce"],
+        )
+        safe_tx_hash = safe_tx.safe_tx_hash
+
+        # Register owner_and_delegate as a delegate for another owner
+        owner_delegate_record = SafeContractDelegateFactory(
+            safe_contract__address=safe_address,
+            delegate=owner_and_delegate.address,
+            delegator=safe_owners[1].address,
+        )
+
+        # Multiple owner signatures including the owner+delegate
+        sig_a = owner_and_delegate.unsafe_sign_hash(safe_tx_hash)["signature"]
+        sig_b = safe_owners[1].unsafe_sign_hash(safe_tx_hash)["signature"]
+        sig_c = safe_owners[2].unsafe_sign_hash(safe_tx_hash)["signature"]
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx_hash)
+        data["signature"] = to_0x_hex_str(sig_a + sig_b + sig_c)
+
+        response = self.client.post(
+            reverse("v1:history:multisig-transactions", args=(safe_address,)),
+            format="json",
+            data=data,
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        multisig_transaction = MultisigTransaction.objects.get()
+        self.assertTrue(multisig_transaction.trusted)
+        # Sender is an owner, so proposer is the sender directly
+        self.assertEqual(multisig_transaction.proposer, owner_and_delegate.address)
+        self.assertIsNone(multisig_transaction.proposed_by_delegate)
+
+        # A pure delegate (non-owner) with multiple signatures still fails
+        MultisigTransaction.objects.all().delete()
+        pure_delegate = Account.create()
+        SafeContractDelegateFactory(
+            safe_contract=owner_delegate_record.safe_contract,
+            delegate=pure_delegate.address,
+            delegator=safe_owners[2].address,
+        )
+        data["sender"] = pure_delegate.address
+        sig_delegate = pure_delegate.unsafe_sign_hash(safe_tx_hash)["signature"]
+        data["signature"] = to_0x_hex_str(sig_delegate + sig_b)
         response = self.client.post(
             reverse("v1:history:multisig-transactions", args=(safe_address,)),
             format="json",
@@ -5009,6 +5097,197 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
         self.assertEqual(result["amount"], str(erc20_transfer.value))
         self.assertEqual(result["transactionHash"], ethereum_tx.tx_hash)
         # Standalone transfers should not have safe_tx_hash
+
+    def test_export_view_gas_fee_fields(self):
+        """Test that gas fee fields are populated for GTF transactions and null otherwise."""
+        self._setup_export_tests()
+
+        # Case 1: ERC20 transfer with GTF, gas_token = NULL_ADDRESS (native ETH)
+        ethereum_tx_erc20 = EthereumTxFactory(gas_used=21000)
+        MultisigTransactionFactory(
+            safe=self.safe_address,
+            ethereum_tx=ethereum_tx_erc20,
+            trusted=True,
+            gas_price=1000000000,
+            gas_token=NULL_ADDRESS,
+            payment=21000000000000,
+        )
+        ERC20TransferFactory(
+            ethereum_tx=ethereum_tx_erc20,
+            address=self.token.address,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=1000000000000000000,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        result = response.json()["results"][0]
+        self.assertEqual(result["assetType"], "erc20")
+        self.assertEqual(result["gasToken"], NULL_ADDRESS)
+        self.assertIsNone(result["gasTokenSymbol"])
+        self.assertIsNone(result["gasTokenDecimals"])
+        self.assertIsNotNone(result["payment"])
+        self.assertTrue(int(result["payment"]) > 0)
+
+        # Case 2: ERC721 transfer with GTF, gas_token = NULL_ADDRESS
+        ethereum_tx_erc721 = EthereumTxFactory(gas_used=21000)
+        MultisigTransactionFactory(
+            safe=self.safe_address,
+            ethereum_tx=ethereum_tx_erc721,
+            trusted=True,
+            gas_price=1000000000,
+            gas_token=NULL_ADDRESS,
+            payment=21000000000000,
+        )
+        ERC721TransferFactory(
+            ethereum_tx=ethereum_tx_erc721,
+            address=self.nft_token.address,
+            _from=self.safe_address,
+            to=self.external_address,
+            token_id=999,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        erc721_result = next(
+            r for r in response.json()["results"] if r["assetType"] == "erc721"
+        )
+        self.assertEqual(erc721_result["gasToken"], NULL_ADDRESS)
+        self.assertIsNone(erc721_result["gasTokenSymbol"])
+        self.assertIsNone(erc721_result["gasTokenDecimals"])
+        self.assertIsNotNone(erc721_result["payment"])
+
+        # Case 3: Native ETH transfer with GTF, gas_token = NULL_ADDRESS
+        ethereum_tx_native = EthereumTxFactory(gas_used=21000)
+        MultisigTransactionFactory(
+            safe=self.safe_address,
+            ethereum_tx=ethereum_tx_native,
+            trusted=True,
+            gas_price=1000000000,
+            gas_token=NULL_ADDRESS,
+            to=self.external_address,
+            value=1000000000000000000,
+            payment=21000000000000,
+        )
+        InternalTxFactory(
+            ethereum_tx=ethereum_tx_native,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=1000000000000000000,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        native_result = next(
+            r for r in response.json()["results"] if r["assetType"] == "native"
+        )
+        self.assertEqual(native_result["gasToken"], NULL_ADDRESS)
+        self.assertIsNone(native_result["gasTokenSymbol"])
+        self.assertIsNone(native_result["gasTokenDecimals"])
+        self.assertIsNotNone(native_result["payment"])
+
+        # Case 4: standalone incoming transfer (no multisig tx) → all four gas fee fields are null
+        ethereum_tx_standalone = EthereumTxFactory()
+        ERC20TransferFactory(
+            ethereum_tx=ethereum_tx_standalone,
+            address=self.token.address,
+            _from=self.external_address,
+            to=self.safe_address,
+            value=500000000000000000,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        standalone_results = [
+            r for r in response.json()["results"] if r["gasToken"] is None
+        ]
+        self.assertEqual(len(standalone_results), 1)
+        standalone = standalone_results[0]
+        self.assertIsNone(standalone["payment"])
+        self.assertIsNone(standalone["gasTokenSymbol"])
+        self.assertIsNone(standalone["gasTokenDecimals"])
+
+        # Case 5: GTF with ERC20 token as gas_token
+        gas_token = TokenFactory(
+            address=Account.create().address, symbol="USDC", decimals=6
+        )
+        ethereum_tx_erc20_gas = EthereumTxFactory(gas_used=21000)
+        MultisigTransactionFactory(
+            safe=self.safe_address,
+            ethereum_tx=ethereum_tx_erc20_gas,
+            trusted=True,
+            gas_price=1000000000,
+            gas_token=gas_token.address,
+            payment=21000000000000,
+        )
+        ERC20TransferFactory(
+            ethereum_tx=ethereum_tx_erc20_gas,
+            address=self.token.address,
+            _from=self.safe_address,
+            to=self.external_address,
+            value=100000000000000000,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        usdc_results = [
+            r
+            for r in response.json()["results"]
+            if r.get("gasToken") == gas_token.address
+        ]
+        self.assertEqual(len(usdc_results), 1)
+        usdc_result = usdc_results[0]
+        self.assertEqual(usdc_result["gasToken"], gas_token.address)
+        self.assertEqual(usdc_result["gasTokenSymbol"], "USDC")
+        self.assertEqual(usdc_result["gasTokenDecimals"], 6)
+        self.assertIsNotNone(usdc_result["payment"])
+
+    def test_export_view_incoming_transfer_from_safe_payment_is_null(self):
+        """
+        When Safe B receives a transfer from Safe A, the multisig transaction
+        belongs to Safe A. Safe B's export should show null for payment, gas_token,
+        gas_token_symbol and gas_token_decimals (case: Safe-to-Safe transfer).
+        """
+        self._setup_export_tests()
+
+        sender_safe_address = Account.create().address
+        ethereum_tx = EthereumTxFactory(gas_used=21000)
+        # Multisig tx belongs to the sender Safe, not the queried Safe
+        MultisigTransactionFactory(
+            safe=sender_safe_address,
+            ethereum_tx=ethereum_tx,
+            trusted=True,
+            gas_price=1000000000,
+            gas_token=NULL_ADDRESS,
+            payment=21000000000000,
+        )
+        # ERC20TransferFactory already registers SafeRelevantTransaction for both _from and to
+        ERC20TransferFactory(
+            ethereum_tx=ethereum_tx,
+            address=self.token.address,
+            _from=sender_safe_address,
+            to=self.safe_address,
+            value=500000000000000000,
+        )
+
+        response = self.client.get(
+            reverse("v1:history:safe-export", args=(self.safe_address,)), format="json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        results = response.json()["results"]
+        self.assertEqual(len(results), 1)
+        result = results[0]
+        self.assertIsNone(result["payment"])
+        self.assertIsNone(result["gasToken"])
+        self.assertIsNone(result["gasTokenSymbol"])
+        self.assertIsNone(result["gasTokenDecimals"])
 
 
 class TestViewsV141(TestViewsV150):

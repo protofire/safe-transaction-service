@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
 from logging import getLogger
 
 from django.conf import settings
@@ -5,6 +6,9 @@ from django.db.models import Model
 from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 from django.utils import timezone
+
+import gevent
+from gevent.greenlet import Greenlet
 
 from ..events.services.queue_service import get_queue_service
 from .cache import remove_cache_view_by_instance
@@ -21,6 +25,7 @@ from .models import (
     SafeMasterCopy,
     SafeStatus,
     TokenTransfer,
+    post_bulk_create,
 )
 from .services.event_service import (
     build_delete_delegate_payload,
@@ -68,29 +73,31 @@ def bind_confirmation(
         )
         if updated:
             # Update modified on MultisigTransaction if at least one confirmation is added. Tx will now be trusted
-            instance.modified = timezone.now()
+            now = timezone.now()
+            MultisigTransaction.objects.filter(pk=instance.safe_tx_hash).update(
+                modified=now, trusted=True
+            )
+            # Keep the in-memory instance in sync so subsequent signal handlers
+            # (e.g. process_event → is_relevant_event) see the updated state.
             instance.trusted = True
-            instance.save(update_fields=["modified", "trusted"])
+            instance.modified = now
     elif sender == MultisigConfirmation:
         if instance.multisig_transaction_id:
             # Update modified on MultisigTransaction if one confirmation is added. Tx will now be trusted
             MultisigTransaction.objects.filter(
+                safe_tx_hash=instance.multisig_transaction_id
+            ).update(modified=instance.created, trusted=True)
+        elif instance.multisig_transaction_hash:
+            MultisigTransaction.objects.filter(
                 safe_tx_hash=instance.multisig_transaction_hash
             ).update(modified=instance.created, trusted=True)
-        else:
-            try:
-                if instance.multisig_transaction_hash:
-                    multisig_transaction = MultisigTransaction.objects.get(
-                        safe_tx_hash=instance.multisig_transaction_hash
-                    )
-                    multisig_transaction.modified = instance.created
-                    multisig_transaction.trusted = True
-                    multisig_transaction.save(update_fields=["modified", "trusted"])
-
-                    instance.multisig_transaction = multisig_transaction
-                    instance.save(update_fields=["multisig_transaction"])
-            except MultisigTransaction.DoesNotExist:
-                pass
+            # Use a subquery so the FK update only runs if the MultisigTransaction
+            # exists, regardless of whether the previous update changed any values
+            MultisigConfirmation.objects.filter(pk=instance.pk).filter(
+                multisig_transaction_hash__in=MultisigTransaction.objects.filter(
+                    safe_tx_hash=instance.multisig_transaction_hash
+                ).values("safe_tx_hash")
+            ).update(multisig_transaction_id=instance.multisig_transaction_hash)
 
 
 @receiver(
@@ -100,7 +107,7 @@ def bind_confirmation(
 )
 def safe_master_copy_clear_cache(
     sender: type[Model],
-    instance: MultisigConfirmation | MultisigTransaction,
+    instance: SafeMasterCopy,
     created: bool,
     **kwargs,
 ) -> None:
@@ -140,9 +147,21 @@ def _process_event(
     assert not (created and deleted), (
         "An instance cannot be created and deleted at the same time"
     )
+    if settings.CACHE_VIEW_DEFAULT_TIMEOUT:
+        logger.debug("Removing cache for object=%s", instance)
+        remove_cache_view_by_instance(instance)
+        logger.debug("Removed cache for object=%s", instance)
 
-    logger.debug("Removing cache for object=%s", instance)
-    remove_cache_view_by_instance(instance)
+    # Skip heavy cache invalidation and payload generation for events
+    # that won't be emitted anyway (for example, old/reindexed txs).
+    if not is_relevant_event(sender, instance, created):
+        logger.debug(
+            "Skipping non-relevant event for created=%s object=%s",
+            created,
+            instance,
+        )
+        return None
+
     logger.debug("Start building payloads for created=%s object=%s", created, instance)
     payloads = build_event_payload(sender, instance, deleted=deleted)
     logger.debug(
@@ -150,22 +169,14 @@ def _process_event(
     )
     for payload in payloads:
         if address := payload.get("address"):
-            if is_relevant_event(sender, instance, created):
-                logger.debug(
-                    "[%s] Triggering send_event tasks for created=%s object=%s",
-                    address,
-                    created,
-                    instance,
-                )
-                queue_service = get_queue_service()
-                queue_service.send_event(payload)
-            else:
-                logger.debug(
-                    "[%s] Event will not be sent for created=%s object=%s",
-                    address,
-                    created,
-                    instance,
-                )
+            logger.debug(
+                "[%s] Triggering send_event tasks for created=%s object=%s",
+                address,
+                created,
+                instance,
+            )
+            queue_service = get_queue_service()
+            queue_service.send_event(payload)
 
 
 @receiver(
@@ -210,6 +221,59 @@ def process_event(
     **kwargs,
 ) -> None:
     return _process_event(sender, instance, created, False)
+
+
+@receiver(
+    post_bulk_create,
+    sender=ModuleTransaction,
+    dispatch_uid="module_transaction.process_event",
+)
+@receiver(
+    post_bulk_create,
+    sender=MultisigConfirmation,
+    dispatch_uid="multisig_confirmation.process_event",
+)
+@receiver(
+    post_bulk_create,
+    sender=MultisigTransaction,
+    dispatch_uid="multisig_transaction.process_event",
+)
+@receiver(
+    post_bulk_create,
+    sender=ERC20Transfer,
+    dispatch_uid="erc20_transfer.process_event",
+)
+@receiver(
+    post_bulk_create,
+    sender=ERC721Transfer,
+    dispatch_uid="erc721_transfer.process_event",
+)
+@receiver(post_bulk_create, sender=InternalTx, dispatch_uid="internal_tx.process_event")
+@receiver(
+    post_bulk_create,
+    sender=SafeContract,
+    dispatch_uid="safe_contract.process_event",
+)
+def process_event_from_bulk_create(
+    sender: type[Model],
+    instance: TokenTransfer
+    | InternalTx
+    | MultisigConfirmation
+    | MultisigTransaction
+    | SafeContract,
+    created: bool,
+    **kwargs,
+) -> Greenlet:
+    """
+    Handle post_bulk_create signals by spawning a greenlet to process events asynchronously.
+
+    :param sender: Model class that sent the signal
+    :param instance: Instance of the created model
+    :param created: `True` if model has just been created, `False` otherwise
+    :param kwargs:
+    :return: Greenlet running _process_event
+    """
+    return gevent.spawn(_process_event, sender, instance, created, False)
 
 
 @receiver(

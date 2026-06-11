@@ -1,11 +1,14 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
 import os.path
 import tempfile
+from datetime import timedelta
 from io import StringIO
 from unittest import mock
 from unittest.mock import MagicMock, PropertyMock
 
 from django.core.management import CommandError, call_command
 from django.test import TestCase
+from django.utils import timezone
 
 from django_celery_beat.models import PeriodicTask
 from eth_account import Account
@@ -17,6 +20,7 @@ from safe_eth.util.util import to_0x_hex_str
 
 from ..indexers import Erc20EventsIndexer, InternalTxIndexer, SafeEventsIndexer
 from ..models import (
+    EthereumTx,
     IndexingStatus,
     InternalTxDecoded,
     ProxyFactory,
@@ -26,6 +30,7 @@ from ..models import (
 from ..services import IndexServiceProvider
 from ..tasks import logger as task_logger
 from .factories import (
+    EthereumTxFactory,
     MultisigConfirmationFactory,
     MultisigTransactionFactory,
     SafeContractFactory,
@@ -178,7 +183,6 @@ class TestCommands(SafeTestCaseMixin, TestCase):
                 stdout=buf,
             )
             self.assertIn("Setting block-process-limit to 11", buf.getvalue())
-            self.assertIn("Setting from-block-number to 76", buf.getvalue())
             self.assertIn("No addresses to process", cm.output[0])
 
         safe_master_copy = SafeMasterCopyFactory(l2=False)
@@ -312,6 +316,44 @@ class TestCommands(SafeTestCaseMixin, TestCase):
     @mock.patch.object(
         EthereumClient, "current_block_number", new_callable=PropertyMock
     )
+    def test_reindex_master_copies_without_block_process_limit(
+        self, current_block_number_mock: PropertyMock
+    ):
+        """
+        When ``--block-process-limit`` is not provided the indexer's
+        settings-derived limit must drive the first chunk (so auto-adjust
+        engages from that anchor), and no "Setting block-process-limit"
+        line is printed.
+        """
+        from django.conf import settings
+
+        # Set high enough so the first chunk is not clamped by stop_block_number
+        current_block_number_mock.return_value = 1_000_000
+        safe_master_copy = SafeMasterCopyFactory(l2=False)
+
+        buf = StringIO()
+        with mock.patch.object(
+            InternalTxIndexer, "find_relevant_elements", return_value=[]
+        ) as find_relevant_elements_mock:
+            IndexServiceProvider.del_singleton()
+            from_block_number = 100
+            call_command(
+                "reindex_master_copies",
+                f"--from-block-number={from_block_number}",
+                stdout=buf,
+            )
+            self.assertNotIn("Setting block-process-limit", buf.getvalue())
+            expected_limit = settings.ETH_INTERNAL_TXS_BLOCK_PROCESS_LIMIT
+            find_relevant_elements_mock.assert_any_call(
+                {safe_master_copy.address},
+                from_block_number,
+                from_block_number + expected_limit - 1,
+            )
+        IndexServiceProvider.del_singleton()
+
+    @mock.patch.object(
+        EthereumClient, "current_block_number", new_callable=PropertyMock
+    )
     def test_reindex_erc20_events(self, current_block_number_mock: PropertyMock):
         logger_name = "safe_transaction_service.history.services.index_service"
         current_block_number_mock.return_value = 1000
@@ -332,7 +374,6 @@ class TestCommands(SafeTestCaseMixin, TestCase):
                 stdout=buf,
             )
             self.assertIn("Setting block-process-limit to 11", buf.getvalue())
-            self.assertIn("Setting from-block-number to 76", buf.getvalue())
             self.assertIn("No addresses to process", cm.output[0])
 
         safe_contract = SafeContractFactory()
@@ -410,10 +451,10 @@ class TestCommands(SafeTestCaseMixin, TestCase):
             last_proxy_factory.tx_block_number, last_proxy_factory_initial_block
         )
 
-        # At Nov 2023 we support 12 Master Copies, 3 L2 Master Copies and 6 Proxy Factories
-        self.assertEqual(SafeMasterCopy.objects.count(), 12)
-        self.assertEqual(SafeMasterCopy.objects.l2().count(), 3)
-        self.assertEqual(ProxyFactory.objects.count(), 6)
+        # At Mar 2025 we support 14 Master Copies, 4 L2 Master Copies and 7 Proxy Factories
+        self.assertEqual(SafeMasterCopy.objects.count(), 14)
+        self.assertEqual(SafeMasterCopy.objects.l2().count(), 4)
+        self.assertEqual(ProxyFactory.objects.count(), 7)
 
     def test_setup_service_mainnet_erc20_indexing_setup(self):
         # Test IndexingStatus ERC20 is not modified if higher than the oldest master copy
@@ -741,3 +782,214 @@ class TestCommands(SafeTestCaseMixin, TestCase):
         )
         self.assertNotIn("is not matching", text)
         self.assertNotIn("is not valid for multisig transaction", text)
+
+    def test_backfill_multisig_tx_payment(self):
+        command = "backfill_multisig_tx_payment"
+
+        # No transactions to process
+        buf = StringIO()
+        call_command(command, stdout=buf)
+        self.assertIn("Processing 0", buf.getvalue())
+
+        # Transaction without ethereum_tx is skipped
+        MultisigTransactionFactory(ethereum_tx=None)
+        buf = StringIO()
+        call_command(command, stdout=buf)
+        self.assertIn("Processing 0", buf.getvalue())
+
+        # ExecutionSuccess v1.4.1 — indexed txHash in topics[1], payment in data
+        safe_tx_hash = (
+            "0xa3324f8210e3d1772329133a15ad3bb31b848c8ca2498e36a787982a685d2484"
+        )
+        ethereum_tx = EthereumTxFactory(
+            logs=[
+                {
+                    "topics": [
+                        "0x442e715f626346e8c54381002da614f62bee8d27386535b2521ec8540898556e",
+                        safe_tx_hash,
+                    ],
+                    "data": "0x0000000000000000000000000000000000000000000000000000038fc9cbcc74",
+                }
+            ]
+        )
+        multisig_tx = MultisigTransactionFactory(
+            safe_tx_hash=safe_tx_hash, ethereum_tx=ethereum_tx
+        )
+        buf = StringIO()
+        call_command(command, stdout=buf)
+        self.assertIn("Processing 1", buf.getvalue())
+        self.assertIn("Updated payment for 1/1", buf.getvalue())
+        multisig_tx.refresh_from_db()
+        self.assertEqual(multisig_tx.payment, 3916100783220)
+
+        # Idempotent: already-set payment is not reprocessed
+        buf = StringIO()
+        call_command(command, stdout=buf)
+        self.assertIn("Processing 0", buf.getvalue())
+
+        # ExecutionFailure v1.3.0 — unindexed txHash, payment in data
+        safe_tx_hash_2 = (
+            "0xb3418ba0a5d1af8a5e17b410e54f709e89ed6f45362ef772c12f70529c538ae7"
+        )
+        ethereum_tx_2 = EthereumTxFactory(
+            logs=[
+                {
+                    "topics": [
+                        "0x23428b18acfb3ea64b08dc0c1d296ea9c09702c09083ca5272e64d115b687d23",
+                    ],
+                    "data": (
+                        "0xb3418ba0a5d1af8a5e17b410e54f709e89ed6f45362ef772c12f70529c538ae7"
+                        "0000000000000000000000000000000000000000000000000000023f62a7b29c"
+                    ),
+                }
+            ]
+        )
+        multisig_tx_2 = MultisigTransactionFactory(
+            safe_tx_hash=safe_tx_hash_2, ethereum_tx=ethereum_tx_2
+        )
+
+        # Wrong safe address → skipped
+        buf = StringIO()
+        call_command(command, f"--safe-address={Account.create().address}", stdout=buf)
+        self.assertIn("Processing 0", buf.getvalue())
+        multisig_tx_2.refresh_from_db()
+        self.assertIsNone(multisig_tx_2.payment)
+
+        # Correct safe address → processed
+        buf = StringIO()
+        call_command(command, f"--safe-address={multisig_tx_2.safe}", stdout=buf)
+        self.assertIn("Processing 1", buf.getvalue())
+        self.assertIn("Updated payment for 1/1", buf.getvalue())
+        multisig_tx_2.refresh_from_db()
+        self.assertEqual(multisig_tx_2.payment, 2471261352604)
+
+
+_COMMAND = "backfill_delete_failed_ethereum_txs"
+_CLIENT_PATH = "safe_transaction_service.history.management.commands.backfill_delete_failed_ethereum_txs.get_auto_ethereum_client"
+
+
+class TestBackfillDeleteFailedEthereumTxsCommand(TestCase):
+    def _make_client_mock(self, receipt):
+        client = MagicMock()
+        client.get_transaction_receipt.return_value = receipt
+        mock_provider = MagicMock(return_value=client)
+        return mock_provider, client
+
+    @mock.patch(_CLIENT_PATH)
+    def test_deletes_tx_with_failed_receipt(self, mock_provider):
+        client = MagicMock()
+        client.get_transaction_receipt.return_value = {"status": 0}
+        mock_provider.return_value = client
+
+        tx = EthereumTxFactory(status=1)
+        buf = StringIO()
+        call_command(_COMMAND, stdout=buf)
+
+        self.assertFalse(EthereumTx.objects.filter(tx_hash=tx.tx_hash).exists())
+        self.assertIn("Deleted 1/1", buf.getvalue())
+
+    @mock.patch(_CLIENT_PATH)
+    def test_keeps_tx_with_successful_receipt(self, mock_provider):
+        client = MagicMock()
+        client.get_transaction_receipt.return_value = {"status": 1}
+        mock_provider.return_value = client
+
+        tx = EthereumTxFactory(status=1)
+        buf = StringIO()
+        call_command(_COMMAND, stdout=buf)
+
+        self.assertTrue(EthereumTx.objects.filter(tx_hash=tx.tx_hash).exists())
+        self.assertIn("Deleted 0/1", buf.getvalue())
+
+    @mock.patch(_CLIENT_PATH)
+    def test_skips_tx_with_missing_receipt(self, mock_provider):
+        client = MagicMock()
+        client.get_transaction_receipt.return_value = None
+        mock_provider.return_value = client
+
+        tx = EthereumTxFactory(status=1)
+        buf = StringIO()
+        call_command(_COMMAND, stdout=buf)
+
+        self.assertTrue(EthereumTx.objects.filter(tx_hash=tx.tx_hash).exists())
+        self.assertIn("missing_receipts=1", buf.getvalue())
+
+    @mock.patch(_CLIENT_PATH)
+    def test_dry_run_does_not_delete(self, mock_provider):
+        client = MagicMock()
+        client.get_transaction_receipt.return_value = {"status": 0}
+        mock_provider.return_value = client
+
+        tx = EthereumTxFactory(status=1)
+        buf = StringIO()
+        call_command(_COMMAND, "--dry-run", stdout=buf)
+
+        self.assertTrue(EthereumTx.objects.filter(tx_hash=tx.tx_hash).exists())
+        self.assertIn("Would delete 1/1", buf.getvalue())
+
+    @mock.patch("time.sleep")
+    @mock.patch(_CLIENT_PATH)
+    def test_retries_on_rpc_error_then_succeeds(self, mock_provider, mock_sleep):
+        client = MagicMock()
+        client.get_transaction_receipt.side_effect = [
+            Exception("timeout"),
+            {"status": 0},
+        ]
+        mock_provider.return_value = client
+
+        tx = EthereumTxFactory(status=1)
+        buf = StringIO()
+        call_command(_COMMAND, "--retries=2", "--backoff=0", stdout=buf)
+
+        self.assertFalse(EthereumTx.objects.filter(tx_hash=tx.tx_hash).exists())
+        self.assertIn("Deleted 1/1", buf.getvalue())
+        mock_sleep.assert_called_once_with(0.0)
+
+    @mock.patch("time.sleep")
+    @mock.patch(_CLIENT_PATH)
+    def test_skips_tx_after_exhausted_retries(self, mock_provider, mock_sleep):
+        client = MagicMock()
+        client.get_transaction_receipt.side_effect = Exception("timeout")
+        mock_provider.return_value = client
+
+        tx = EthereumTxFactory(status=1)
+        buf = StringIO()
+        call_command(_COMMAND, "--retries=3", "--backoff=0", stdout=buf)
+
+        self.assertTrue(EthereumTx.objects.filter(tx_hash=tx.tx_hash).exists())
+        self.assertIn("rpc_errors=1", buf.getvalue())
+        self.assertEqual(client.get_transaction_receipt.call_count, 3)
+
+    @mock.patch(_CLIENT_PATH)
+    def test_days_filter_excludes_old_txs(self, mock_provider):
+        client = MagicMock()
+        client.get_transaction_receipt.return_value = {"status": 0}
+        mock_provider.return_value = client
+
+        tx = EthereumTxFactory(status=1)
+        EthereumTx.objects.filter(tx_hash=tx.tx_hash).update(
+            created=timezone.now() - timedelta(days=40)
+        )
+
+        buf = StringIO()
+        call_command(_COMMAND, "--days=30", stdout=buf)
+
+        self.assertTrue(EthereumTx.objects.filter(tx_hash=tx.tx_hash).exists())
+        self.assertIn("Checking 0 EthereumTx rows", buf.getvalue())
+
+    @mock.patch(_CLIENT_PATH)
+    def test_no_days_includes_all_txs(self, mock_provider):
+        client = MagicMock()
+        client.get_transaction_receipt.return_value = {"status": 0}
+        mock_provider.return_value = client
+
+        tx = EthereumTxFactory(status=1)
+        EthereumTx.objects.filter(tx_hash=tx.tx_hash).update(
+            created=timezone.now() - timedelta(days=365)
+        )
+
+        buf = StringIO()
+        call_command(_COMMAND, stdout=buf)
+
+        self.assertFalse(EthereumTx.objects.filter(tx_hash=tx.tx_hash).exists())
+        self.assertIn("all time", buf.getvalue())
