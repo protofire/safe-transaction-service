@@ -24,17 +24,12 @@ a transaction that is pending to be sent to the blockchain.
 - [Deploying the service](https://github.com/safe-global/safe-infrastructure)
 
 ## Setup for development
-Use a [virtualenv](https://docs.python.org/es/3/library/venv.html) if possible:
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and then install the
+dependencies (uv manages the virtualenv automatically):
 
 ```bash
-python -m venv venv
-```
-
-Then enter the `virtualenv` and install the dependencies:
-
-```bash
-source venv/bin/activate
-pip install -r requirements-dev.txt
+uv sync --group dev --frozen
+source .venv/bin/activate
 pre-commit install -f
 cp .env.dev .env
 ./run_tests.sh
@@ -220,3 +215,14 @@ If you face issues installing the `grpc` dependency locally (required by this pr
 
 ## Contributors
 [See contributors](https://github.com/safe-global/safe-transaction-service/graphs/contributors)
+
+## Licensing
+
+This repository contains code developed under two different ownership and licensing regimes, split by a defined cut-over date.
+
+- Up to and including February 16, 2026: code is Copyright (c) Safe Ecosystem Foundation and licensed under the MIT License. The final SEF-owned MIT snapshot is tagged as `sef-mit-final`.
+- From February 17, 2026 onward: new development is Copyright (c) Safe Labs GmbH and licensed under the Functional Source License, Version 1.1 (MIT Future License).
+
+Users who require a purely MIT-licensed codebase should base their work on the `sef-mit-final` tag. The historical MIT-licensed code remains MIT and is not retroactively relicensed.
+
+For details, see `LICENSE` and `NOTICE.md`.

@@ -1,117 +1,142 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
 import json
 from unittest import mock
 
-from django.test import TestCase
+from django.conf import settings
+from django.test import SimpleTestCase, TestCase
 
-from pika.channel import Channel
-from pika.exceptions import ConnectionClosedByBroker
+from kombu import Connection, Exchange, Queue
 
-from ..services.queue_service import BrokerConnection, QueueService, get_queue_service
+from ..services.queue_service import QueueService
 
 
 class TestQueueService(TestCase):
     def setUp(self):
-        broker_connection = BrokerConnection()
-        # Create queue for test
-        self.queue = "test_queue"
-
-        broker_connection.channel.queue_declare(self.queue)
-        broker_connection.channel.queue_bind(
-            self.queue, broker_connection.exchange_name
+        self.conn = Connection(settings.EVENTS_QUEUE_URL)
+        exchange = Exchange(
+            settings.EVENTS_QUEUE_EXCHANGE_NAME, type="fanout", durable=True
         )
-        # Clean queue to avoid old messages
-        broker_connection.channel.queue_purge(self.queue)
+        # exclusive=True: RabbitMQ 4.x deprecated non-durable non-exclusive queues
+        # (transient_nonexcl_queues). Exclusive queues are still allowed, are
+        # auto-deleted when the connection closes, and still receive messages
+        # routed from the fanout exchange by the broker.
+        self.test_queue = Queue("test_queue", exchange=exchange, exclusive=True)
+        with self.conn.channel() as channel:
+            bound = self.test_queue(channel)
+            bound.declare()
+            bound.purge()
 
-    def test_send_unsent_messages(self):
-        queue_service = get_queue_service()
-        # Clean previous pool connections
-        queue_service._connection_pool = []
-        messages_to_send = 10
-        queue_service.clear_unsent_events()
-        self.assertEqual(len(queue_service._connection_pool), 0)
-        with mock.patch.object(
-            Channel,
-            "basic_publish",
-            side_effect=ConnectionClosedByBroker(320, "Connection closed"),
-        ):
-            for i in range(messages_to_send):
-                payload = f"not sent {i}"
-                queue_service.send_event(payload)
+    def tearDown(self):
+        self.conn.close()
 
-            self.assertEqual(len(queue_service.unsent_events), messages_to_send)
-            self.assertEqual(queue_service.send_unsent_events(), 0)
-
-        # After reconnection should send event and previous messages (10+1)
-        self.assertEqual(queue_service.send_event("not sent 11"), messages_to_send + 1)
-        # Everything should be sent by send_event
-        self.assertEqual(queue_service.send_unsent_events(), 0)
-        self.assertEqual(len(queue_service.unsent_events), 0)
-        # Just one connection should be requested
-        self.assertEqual(len(queue_service._connection_pool), 1)
-        broker_connection = queue_service.get_connection()
-        # First event published should be the last 1
-        _, _, body = broker_connection.channel.basic_get(self.queue, auto_ack=True)
-        self.assertEqual(json.loads(body), "not sent 11")
-        # Check if all unsent_events were sent
-        for i in range(messages_to_send):
-            payload = f"not sent {i}"
-            _, _, body = broker_connection.channel.basic_get(self.queue, auto_ack=True)
-            self.assertEqual(json.loads(body), payload)
-
-    def test_send_with_pool_limit(self):
-        queue_service = QueueService()
-        payload = "Pool limit test"
-        # Unused connection, just to reach the limit
-        connection_1 = queue_service.get_connection()
-        self.assertEqual(len(queue_service.unsent_events), 0)
-        self.assertEqual(queue_service.send_event(payload), 1)
-        with self.settings(EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT=1):
-            self.assertEqual(queue_service._total_connections, 1)
-            self.assertEqual(len(queue_service.unsent_events), 0)
-            self.assertEqual(queue_service.send_event(payload), 0)
-            self.assertEqual(len(queue_service.unsent_events), 1)
-            queue_service.release_connection(connection_1)
-            self.assertEqual(len(queue_service.unsent_events), 1)
-            self.assertEqual(queue_service.send_event(payload), 2)
-            self.assertEqual(len(queue_service.unsent_events), 0)
+    def _get_message(self):
+        with self.conn.channel() as channel:
+            msg = self.test_queue(channel).get(no_ack=True)
+            if msg:
+                return json.loads(msg.body)
+        return None
 
     def test_send_event_to_queue(self):
         payload = {"event": "test_event", "type": "event type"}
         queue_service = QueueService()
-        # Clean previous connection pool
-        queue_service._connection_pool = []
-        self.assertEqual(len(queue_service._connection_pool), 0)
+        self.assertIsNone(self._get_message())
         queue_service.send_event(payload)
-        self.assertEqual(len(queue_service._connection_pool), 1)
-        broker_connection = queue_service.get_connection()
-        # Check if message was written to the queue
-        _, _, body = broker_connection.channel.basic_get(self.queue, auto_ack=True)
-        self.assertEqual(json.loads(body), payload)
+        self.assertEqual(self._get_message(), payload)
 
-    def test_get_connection(self):
+    def test_send_unsent_messages(self):
         queue_service = QueueService()
-        # Clean previous connection pool
-        queue_service._connection_pool = []
-        self.assertEqual(len(queue_service._connection_pool), 0)
-        self.assertEqual(queue_service._total_connections, 0)
-        connection_1 = queue_service.get_connection()
-        self.assertEqual(len(queue_service._connection_pool), 0)
-        self.assertEqual(queue_service._total_connections, 1)
-        connection_2 = queue_service.get_connection()
-        self.assertEqual(len(queue_service._connection_pool), 0)
-        self.assertEqual(queue_service._total_connections, 2)
-        queue_service.release_connection(connection_1)
-        self.assertEqual(len(queue_service._connection_pool), 1)
-        self.assertEqual(queue_service._total_connections, 1)
-        queue_service.release_connection(connection_2)
-        self.assertEqual(len(queue_service._connection_pool), 2)
-        self.assertEqual(queue_service._total_connections, 0)
-        with self.settings(EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT=1):
-            connection_1 = queue_service.get_connection()
-            self.assertEqual(len(queue_service._connection_pool), 1)
-            self.assertEqual(queue_service._total_connections, 1)
-            # We should reach the connection limit of the pool
-            connection_1 = queue_service.get_connection()
-            self.assertEqual(len(queue_service._connection_pool), 1)
-            self.assertEqual(queue_service._total_connections, 1)
-            self.assertIsNone(connection_1)
+        messages_to_send = 10
+        queue_service.clear_unsent_events()
+
+        with mock.patch.object(QueueService, "_try_publish", return_value=False):
+            for i in range(messages_to_send):
+                queue_service.send_event({"message": f"not sent {i}"})
+            self.assertEqual(len(queue_service.unsent_events), messages_to_send)
+            self.assertEqual(queue_service.send_unsent_events(), 0)
+
+        # After reconnection: send event + flush previously buffered (10 + 1)
+        self.assertEqual(
+            queue_service.send_event({"message": "not sent 11"}), messages_to_send + 1
+        )
+        self.assertEqual(len(queue_service.unsent_events), 0)
+        self.assertEqual(queue_service.send_unsent_events(), 0)
+
+        # Main event published first, buffered events flushed in order after
+        self.assertEqual(self._get_message(), {"message": "not sent 11"})
+        for i in range(messages_to_send):
+            self.assertEqual(self._get_message(), {"message": f"not sent {i}"})
+
+    def test_pool_exhausted_buffers_event(self):
+        queue_service = QueueService()
+        payload = {"message": "pool exhausted test"}
+
+        with mock.patch.object(QueueService, "_try_publish", return_value=False):
+            result = queue_service.send_event(payload)
+            self.assertEqual(result, 0)
+            self.assertEqual(len(queue_service.unsent_events), 1)
+
+        # Next successful send flushes the buffer too
+        result = queue_service.send_event({"message": "recovered"})
+        self.assertEqual(result, 2)
+        self.assertEqual(len(queue_service.unsent_events), 0)
+
+
+class TestBuildRoutingKey(SimpleTestCase):
+    """
+    The routing key is the contract consumers bind their queues against,
+    so its shape must stay stable. These tests pin the format.
+    """
+
+    def test_full_payload_renders_chainid_type_address(self):
+        payload = {
+            "chainId": "1",
+            "type": "EXECUTED_MULTISIG_TRANSACTION",
+            "address": "0x1234567890abcdef1234567890abcdef12345678",
+        }
+        self.assertEqual(
+            QueueService._build_routing_key(payload),
+            "1.EXECUTED_MULTISIG_TRANSACTION."
+            "0x1234567890abcdef1234567890abcdef12345678",
+        )
+
+    def test_address_is_lowercased_for_case_insensitive_bindings(self):
+        # Payloads can carry EIP-55 checksum-cased addresses, but consumers
+        # bind with a fixed casing — lowercase the address segment so the
+        # routing key is stable regardless of how the payload was built.
+        key = QueueService._build_routing_key(
+            {
+                "chainId": "1",
+                "type": "MODULE_TRANSACTION",
+                "address": "0xABCDef0000000000000000000000000000000000",
+            }
+        )
+        self.assertEqual(
+            key,
+            "1.MODULE_TRANSACTION.0xabcdef0000000000000000000000000000000000",
+        )
+
+    def test_missing_address_uses_placeholder_to_preserve_three_segments(self):
+        # A topic-exchange `*` matches exactly one word. If we emitted
+        # "1.REORG_DETECTED." (trailing empty segment), bindings like
+        # "*.*.0x..." would no longer match anything. The "_" placeholder
+        # keeps the segment count at 3 so wildcard bindings work uniformly.
+        self.assertEqual(
+            QueueService._build_routing_key({"chainId": "1", "type": "REORG_DETECTED"}),
+            "1.REORG_DETECTED._",
+        )
+
+    def test_none_address_is_treated_as_missing(self):
+        # SafeContractDelegate without a safe_contract_id produces a payload
+        # with address=None; it must not blow up or end up as "none" in the
+        # routing key.
+        self.assertEqual(
+            QueueService._build_routing_key(
+                {"chainId": "1", "type": "NEW_DELEGATE", "address": None}
+            ),
+            "1.NEW_DELEGATE._",
+        )
+
+    def test_empty_payload_returns_all_placeholders(self):
+        # Defensive: an unexpected/empty payload must still produce a valid
+        # 3-segment routing key so the publish call does not crash.
+        self.assertEqual(QueueService._build_routing_key({}), "_._._")

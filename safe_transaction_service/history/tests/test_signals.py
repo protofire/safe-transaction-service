@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
 import datetime
 from datetime import timedelta
 from unittest import mock
@@ -10,6 +11,7 @@ from django.utils import timezone
 import factory
 from hexbytes import HexBytes
 from safe_eth.eth import EthereumNetwork
+from safe_eth.eth.utils import fast_keccak_text
 from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
 from safe_eth.util.util import to_0x_hex_str
 
@@ -26,7 +28,7 @@ from ..models import (
     MultisigTransaction,
     TransactionServiceEventType,
 )
-from ..signals import build_event_payload, is_relevant_event
+from ..signals import _process_event, build_event_payload, is_relevant_event
 from .factories import (
     ERC20TransferFactory,
     InternalTxFactory,
@@ -207,6 +209,41 @@ class TestSignals(SafeTestCaseMixin, TestCase):
         send_event_mock.assert_called_with(deleted_multisig_transaction_payload)
 
     @mock.patch.object(QueueService, "send_event")
+    def test_pending_event_emitted_when_tx_bound_to_existing_confirmations(
+        self, send_event_mock: MagicMock
+    ):
+        """
+        When a MultisigTransaction is created with trusted=False but unlinked
+        confirmations already exist, bind_confirmation promotes it to trusted=True
+        in the DB. The in-memory instance must also be updated so the subsequent
+        process_event signal handler emits PENDING_MULTISIG_TRANSACTION.
+        """
+        known_hash = to_0x_hex_str(fast_keccak_text("bind-test-tx-pending-event"))
+
+        # Create the confirmation before the transaction exists (unlinked).
+        # Mute signals so this creation doesn't interfere with the mock state.
+        with factory.django.mute_signals(post_save):
+            MultisigConfirmationFactory(
+                multisig_transaction=None,
+                multisig_transaction_hash=known_hash,
+            )
+        send_event_mock.assert_not_called()
+
+        # Now create the transaction with trusted=False.  bind_confirmation should
+        # find the orphaned confirmation, set trusted=True in the DB *and* on the
+        # in-memory instance so process_event can emit the notification.
+        MultisigTransactionFactory(
+            trusted=False, ethereum_tx=None, safe_tx_hash=known_hash
+        )
+
+        emitted_types = [
+            call.args[0]["type"] for call in send_event_mock.call_args_list
+        ]
+        self.assertIn(
+            TransactionServiceEventType.PENDING_MULTISIG_TRANSACTION.name, emitted_types
+        )
+
+    @mock.patch.object(QueueService, "send_event")
     def test_delegates_signals_are_correctly_fired(self, send_event_mock: MagicMock):
         # New delegate should fire an event
         delegate_for_safe = SafeContractDelegateFactory()
@@ -258,7 +295,7 @@ class TestSignals(SafeTestCaseMixin, TestCase):
         # Deleted delegate should fire an event
         delegate_to_delete = SafeContractDelegateFactory()
         delegate_to_delete.delete()
-        updated_delegate_user_payload = {
+        deleted_delegate_user_payload = {
             "type": TransactionServiceEventType.DELETED_DELEGATE.name,
             "address": delegate_to_delete.safe_contract.address,
             "delegate": delegate_to_delete.delegate,
@@ -267,4 +304,25 @@ class TestSignals(SafeTestCaseMixin, TestCase):
             "expiryDateSeconds": int(delegate_to_delete.expiry_date.timestamp()),
             "chainId": str(EthereumNetwork.GANACHE.value),
         }
-        send_event_mock.assert_called_with(updated_delegate_user_payload)
+        send_event_mock.assert_called_with(deleted_delegate_user_payload)
+
+    @factory.django.mute_signals(post_save)
+    @mock.patch(
+        "safe_transaction_service.history.signals.remove_cache_view_by_instance"
+    )
+    @mock.patch("safe_transaction_service.history.signals.build_event_payload")
+    @mock.patch.object(QueueService, "send_event")
+    def test_irrelevant_events_skip(
+        self,
+        send_event_mock: MagicMock,
+        build_event_payload_mock: MagicMock,
+        remove_cache_mock: MagicMock,
+    ):
+        # Old events are not relevant and should short-circuit before cache/payload work
+        tx = ERC20TransferFactory(timestamp=timezone.now() - timedelta(minutes=120))
+
+        _process_event(ERC20Transfer, tx, created=True, deleted=False)
+
+        remove_cache_mock.assert_called_once()
+        build_event_payload_mock.assert_not_called()
+        send_event_mock.assert_not_called()

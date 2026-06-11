@@ -1,3 +1,78 @@
+[project]
+name = "safe-transaction-service"
+dynamic = ["version"]
+requires-python = ">=3.13"
+dependencies = [
+    "boto3>=1.42",
+    "cachetools==6.2.6",
+    "celery[librabbitmq]==5.6.3",
+    "django>=5.2.13,<5.3",
+    "django-cache-memoize==0.2.1",
+    "django-celery-beat==2.9.0",
+    "django-cors-headers==4.9.0",
+    "django-debug-toolbar",
+    "django-debug-toolbar-force",
+    "django-environ==0.13.0",
+    "django-extensions==4.1",
+    "django-filter==25.2",
+    "django-imagekit==6.1.0",
+    "django-model-utils==5.0.0",
+    "django-redis==6.0.0",
+    "django-s3-storage==0.15.0",
+    "django-timezone-field==7.2.1",
+    "djangorestframework==3.17.1",
+    "djangorestframework-camel-case==1.4.2",
+    "docutils==0.22.4",
+    "drf-spectacular==0.29.0",
+    "flower==2.0.1",
+    "gunicorn[gevent]==25.3.0",
+    "orjson==3.11.9",
+    "packaging>=21.0",
+    "pillow==12.2.0",
+    "psycopg[binary,pool]==3.3.4",
+    "redis[hiredis]==7.4.0",
+    "requests==2.34.0",
+    "safe-eth-py[django]==7.20.0",
+    "web3==7.16.0",
+]
+
+[dependency-groups]
+dev = [
+    "coverage",
+    "django-stubs",
+    "django-test-migrations",
+    "factory-boy",
+    "faker",
+    "ipdb",
+    "ipython",
+    "mypy",
+    "pre-commit",
+    "pytest",
+    "pytest-celery",
+    "pytest-django",
+    "pytest-env",
+    "pytest-rerunfailures",
+    "pytest-sugar",
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "safe_transaction_service/__init__.py"
+
+[tool.uv]
+# Reject packages published less than 7 days ago to avoid supply-chain attacks
+exclude-newer = "7 days"
+compile-bytecode = true
+exclude-newer-package = { safe-eth-py = false }
+
+[tool.uv.sources]
+# Custom fork includes network configurations not present in the upstream package
+safe-eth-py = { git = "https://github.com/protofire/safe-eth-py.git", tag = "v7.20.0" }
+
 [tool.ruff]
 line-length = 88
 target-version = "py313"

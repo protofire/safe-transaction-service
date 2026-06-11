@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
 import datetime
 import json
 from collections.abc import Iterator, Sequence
@@ -41,7 +42,7 @@ from django.db.models.expressions import (
 )
 from django.db.models.functions import Coalesce
 from django.db.models.query import RawQuerySet
-from django.db.models.signals import post_save
+from django.db.models.signals import Signal
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 
@@ -74,6 +75,7 @@ from safe_transaction_service.utils.constants import (
 from .constants import SAFE_PROXY_FACTORY_CREATION_EVENT_TOPIC
 from .utils import clean_receipt_log
 
+post_bulk_create = Signal()
 logger = getLogger(__name__)
 
 
@@ -155,20 +157,22 @@ class BulkCreateSignalMixin:
             objs, batch_size=batch_size, ignore_conflicts=ignore_conflicts
         )
         for obj in objs:
-            post_save.send(obj.__class__, instance=obj, created=True)
+            post_bulk_create.send(obj.__class__, instance=obj, created=True)
         return result
 
     def bulk_create_from_generator(
         self,
         objs: Iterator[Any],
-        batch_size: int = 10_000,
+        batch_size: int = 25_000,
         ignore_conflicts: bool = False,
     ) -> int:
         """
-        Implementation in Django is not ok, as it will do `objs = list(objs)`. If objects come from a generator
-        they will be brought to RAM. This approach is more RAM friendly.
-
-        :return: Count of inserted elements
+                Implementation in Django is not ok, as it will do `objs = list(objs)`. If objects come from a generator
+                they will be brought to RAM. This approach is more RAM friendly.
+        ns.AddIndex(
+                    model_name='erc20transfer',
+                    index=models.Index(
+                :return: Count of inserted elements
         """
         assert batch_size is not None and batch_size > 0
         iterator = iter(
@@ -364,7 +368,28 @@ class EthereumTxManager(BulkCreateSignalMixin, models.Manager):
         if tx_receipt is None:
             raise ValueError("tx_receipt cannot be empty")
 
-        data = HexBytes(tx.get("data") or tx.get("input"))
+        # Handle missing data/input field
+        data_value = tx.get("data") or tx.get("input")
+        if data_value is None:
+            if settings.ETH_ALLOW_EMPTY_TRANSACTION_DATA:
+                data_value = b""
+            else:
+                raise ValueError(
+                    f"Transaction missing data/input field. TxHash: {tx.get('hash')}. "
+                    f"Set ETH_ALLOW_EMPTY_TRANSACTION_DATA=true if this is expected for your network."
+                )
+        data = HexBytes(data_value)
+
+        # Handle missing value field
+        if "value" not in tx:
+            if settings.ETH_ALLOW_EMPTY_TRANSACTION_DATA:
+                tx["value"] = 0
+            else:
+                raise ValueError(
+                    f"Transaction missing value field. TxHash: {tx.get('hash')}. "
+                    f"Set ETH_ALLOW_EMPTY_TRANSACTION_DATA=true if this is expected for your network."
+                )
+
         logs = tx_receipt and [
             clean_receipt_log(log) for log in tx_receipt.get("logs", [])
         ]
@@ -1693,6 +1718,7 @@ class MultisigTransaction(TimeStampedModel):
     signatures = models.BinaryField(null=True, blank=True)  # When tx is executed
     nonce = Uint256Field(db_index=True)
     failed = models.BooleanField(null=True, blank=True, default=None, db_index=True)
+    payment = Uint256Field(null=True, blank=True, default=None)
     origin = models.JSONField(default=dict)  # To store arbitrary data on the tx
     trusted = models.BooleanField(
         default=False, db_index=True
@@ -2040,6 +2066,22 @@ class SafeContractManager(models.Manager):
         :return: Set of addresses that exist in SafeContract table
         """
         return set(self.filter(address__in=addresses).values_list("address", flat=True))
+
+    def upsert_from_ethereum_tx_hash(
+        self, address: ChecksumAddress, ethereum_tx_id: HexBytes
+    ) -> None:
+        """
+        Insert a new SafeContract or update ``ethereum_tx_id`` on conflict. Single query.
+
+        :param address: Safe contract address
+        :param ethereum_tx_id: Creation transaction hash
+        """
+        self.bulk_create(
+            [self.model(address=address, ethereum_tx_id=ethereum_tx_id)],
+            update_conflicts=True,
+            unique_fields=["address"],
+            update_fields=["ethereum_tx"],
+        )
 
 
 class SafeContractQuerySet(models.QuerySet):
