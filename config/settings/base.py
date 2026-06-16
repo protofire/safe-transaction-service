@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
 """
 Base settings to build other settings files upon.
 """
@@ -65,6 +66,15 @@ GUNICORN_WORKERS = gunicorn_workers
 # https://docs.djangoproject.com/en/dev/ref/settings/#databases
 # DB statements should timeout before Gunicorn, so this value must be less than WEB_WORKER_TIMEOUT on gunicorn.py
 DB_STATEMENT_TIMEOUT = env.int("DB_STATEMENT_TIMEOUT", 50_000)
+# Kills a statement waiting on a lock. Without this, a slow transaction holding a row lock causes other requests to
+# queue behind it — that queue can cascade into an outage. Must be lower than DB_STATEMENT_TIMEOUT.
+DB_LOCK_TIMEOUT = env.int("DB_LOCK_TIMEOUT", 5_000)
+# Kills a connection that is inside a transaction but idle (e.g. app crash mid-request, network drop). Without this,
+# those connections hold locks indefinitely until the pool recycles them via max_lifetime. Critical for preventing
+# lock pile-ups.
+DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT = env.int(
+    "DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT", 30_000
+)
 
 DATABASES = {
     "default": env.db("DATABASE_URL"),
@@ -73,7 +83,11 @@ DATABASES["default"]["ATOMIC_REQUESTS"] = False
 DATABASES["default"]["ENGINE"] = "django.db.backends.postgresql"
 DATABASES["default"]["CONN_MAX_AGE"] = 0
 DATABASES["default"]["OPTIONS"] = {
-    "options": f"-c statement_timeout={DB_STATEMENT_TIMEOUT}",
+    "options": (
+        f"-c statement_timeout={DB_STATEMENT_TIMEOUT}"
+        f" -c lock_timeout={DB_LOCK_TIMEOUT}"
+        f" -c idle_in_transaction_session_timeout={DB_IDLE_IN_TRANSACTION_SESSION_TIMEOUT}"
+    ),
     "pool": {
         # https://www.psycopg.org/psycopg3/docs/api/pool.html#psycopg_pool.ConnectionPool
         "min_size": env.int("DB_MIN_CONNS", default=4),
@@ -517,6 +531,12 @@ LOGGING = {
         "safe_transaction_service.history.tasks.index_erc20_events_task": {
             "level": ERC20_721_INDEXER_LOG_LEVEL,
         },
+        "safe_transaction_service.history.indexers.ethereum_indexer": {
+            "level": ERC20_721_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.indexers.events_indexer": {
+            "level": ERC20_721_INDEXER_LOG_LEVEL,
+        },
         # PROXY_FACTORY_INDEXER_LOG_LEVEL
         "safe_transaction_service.history.indexers.proxy_factory_indexer": {
             "level": PROXY_FACTORY_INDEXER_LOG_LEVEL,
@@ -598,6 +618,9 @@ ETH_L2_NETWORK = env.bool(
 ETH_ZKSYNC_COMPATIBLE_NETWORK = env.bool(
     "ETH_ZKSYNC_COMPATIBLE_NETWORK", default=False
 )  # Fix some issues regarding zkSync compatible networks
+ETH_ALLOW_EMPTY_TRANSACTION_DATA = env.bool(
+    "ETH_ALLOW_EMPTY_TRANSACTION_DATA", default=False
+)  # Allow transactions with null data/input fields (required for some networks like Tempo)
 ETH_EVENTS_BLOCK_PROCESS_LIMIT = env.int(
     "ETH_EVENTS_BLOCK_PROCESS_LIMIT", default=50
 )  # Initial number of blocks to process together when searching for events. It will be auto increased. 0 == no limit.
@@ -622,6 +645,9 @@ ETH_REORG_BLOCKS_BATCH = env.int(
 ETH_REORG_BLOCKS = env.int(
     "ETH_REORG_BLOCKS", default=200 if ETH_L2_NETWORK else 10
 )  # Number of blocks from the current block number needed to consider a block valid/stable
+ETH_REINDEX_MAX_RETRIES = env.int(
+    "ETH_REINDEX_MAX_RETRIES", default=5
+)  # Number of consecutive failures of the same block range during reindex
 ETH_ERC20_LOAD_ADDRESSES_CHUNK_SIZE = env.int(
     "ETH_ERC20_LOAD_ADDRESSES_CHUNK_SIZE", default=500_000
 )  # Load Safe addresses for the ERC20 indexer with a database iterator with the defined `chunk_size`
@@ -679,9 +705,15 @@ SLACK_API_WEBHOOK = env("SLACK_API_WEBHOOK", default=None)
 # Events
 # ------------------------------------------------------------------------------
 EVENTS_QUEUE_URL = env("EVENTS_QUEUE_URL", default=None)
-EVENTS_QUEUE_EXCHANGE_NAME = env("EVENTS_QUEUE_EXCHANGE_NAME", default="amq.fanout")
+EVENTS_QUEUE_EXCHANGE_NAME = env(
+    "EVENTS_QUEUE_EXCHANGE_NAME", default="safe-transaction-service-events"
+)
+EVENTS_QUEUE_TOPIC_EXCHANGE_NAME = env(
+    "EVENTS_QUEUE_TOPIC_EXCHANGE_NAME",
+    default="safe-transaction-service-events-with-topics",
+)
 EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT = env.int(
-    "EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT", default=0
+    "EVENTS_QUEUE_POOL_CONNECTIONS_LIMIT", default=20
 )
 
 # Events

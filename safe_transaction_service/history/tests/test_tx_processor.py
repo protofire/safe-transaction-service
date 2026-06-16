@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
 import logging
 from unittest import mock
 
@@ -67,16 +68,18 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         master_copy = Account.create().address
         threshold = 1
         self.assertEqual(SafeRelevantTransaction.objects.count(), 0)
-        tx_processor.process_decoded_transaction(
-            InternalTxDecodedFactory(
-                function_name="setup",
-                owner=owner,
-                threshold=threshold,
-                fallback_handler=fallback_handler,
-                internal_tx__to=master_copy,
-                internal_tx___from=safe_address,
-                internal_tx__value=0,
-            )
+        tx_processor.process_decoded_transactions(
+            [
+                InternalTxDecodedFactory(
+                    function_name="setup",
+                    owner=owner,
+                    threshold=threshold,
+                    fallback_handler=fallback_handler,
+                    internal_tx__to=master_copy,
+                    internal_tx___from=safe_address,
+                    internal_tx__value=0,
+                )
+            ]
         )
         self.assertEqual(SafeRelevantTransaction.objects.count(), 0)
         self.assertTrue(SafeContract.objects.get(address=safe_address))
@@ -167,12 +170,12 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
             multisig_transaction__nonce=safe_status.nonce + 1,
             multisig_transaction__safe=safe_address,
         )
-        # This will be deleted
+        # This won't be deleted: message belongs to a different Safe, deletion is scoped to safe_address
         safe_message = SafeMessageFactory(safe=self.deploy_test_safe().address)
         unused_message_confirmation = SafeMessageConfirmationFactory(
             owner=another_owner, safe_message=safe_message
         )
-        # This won't be deleted
+        # This won't be deleted either
         unused_message_confirmation_2 = SafeMessageConfirmationFactory(
             safe_message=unused_message_confirmation.safe_message
         )
@@ -209,7 +212,8 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
             MultisigConfirmation.objects.count(), number_confirmations + 1 - 1
         )
         unused_multisig_confirmation.multisig_transaction.delete()  # Remove this transaction inserted manually
-        self.assertEqual(SafeMessageConfirmation.objects.count(), 1)
+        # Both confirmations remain: deletion is scoped to safe_address, but this message belongs to a different Safe
+        self.assertEqual(SafeMessageConfirmation.objects.count(), 2)
         self.assertTrue(
             SafeMessageConfirmation.objects.filter(
                 owner=unused_message_confirmation_2.owner
@@ -399,59 +403,106 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
             SafeSignatureType.APPROVED_HASH.value,
         )
 
-    def test_tx_processor_is_failed(self):
+    def test_tx_processor_get_execution_result(self):
         tx_processor = self.tx_processor
-        # Event for Safes < 1.1.1
-        logs = [
-            {
-                "data": "0x0034bff0dedc4c75f43df64a179ff26d56b99fa742fcfaeeee51e2da4e279b67",
-                "topics": [
-                    "0xabfd711ecdd15ae3a6b3ad16ff2e9d81aec026a39d16725ee164be4fbf857a7c"
-                ],
-            }
-        ]
-        ethereum_tx = EthereumTxFactory(logs=logs)
-        self.assertTrue(tx_processor.is_failed(ethereum_tx, logs[0]["data"]))
-        self.assertFalse(
-            tx_processor.is_failed(ethereum_tx, to_0x_hex_str(fast_keccak_text("hola")))
-        )
+        other_hash = to_0x_hex_str(fast_keccak_text("hola"))
 
-        # Event for Safes >= 1.1.1
-        safe_tx_hash = (
-            "0x4c15b21b9c3b57aebba3c274bf0a437950bd0eea46bc7a7b2df892f91f720311"
-        )
+        # ExecutionFailure v1.4.1 — indexed txHash in topics[1], payment=0 in data
         logs = [
             {
-                "data": "0x4c15b21b9c3b57aebba3c274bf0a437950bd0eea46bc7a7b2df892f91f720311"
-                "0000000000000000000000000000000000000000000000000000000000000000",
-                "topics": [
-                    "0x23428b18acfb3ea64b08dc0c1d296ea9c09702c09083ca5272e64d115b687d23"
-                ],
-            }
-        ]
-        ethereum_tx = EthereumTxFactory(logs=logs)
-        self.assertTrue(tx_processor.is_failed(ethereum_tx, safe_tx_hash))
-        self.assertFalse(
-            tx_processor.is_failed(ethereum_tx, to_0x_hex_str(fast_keccak_text("hola")))
-        )
-
-        # Event for Safes >= 1.4.1
-        safe_tx_hash = (
-            "0x4c15b21b9c3b57aebba3c274bf0a437950bd0eea46bc7a7b2df892f91f720311"
-        )
-        logs = [
-            {
-                "data": "0000000000000000000000000000000000000000000000000000000000000000",
                 "topics": [
                     "0x23428b18acfb3ea64b08dc0c1d296ea9c09702c09083ca5272e64d115b687d23",
-                    "0x4c15b21b9c3b57aebba3c274bf0a437950bd0eea46bc7a7b2df892f91f720311",
+                    "0xd6dfcc85421ca06ca8501b3f3e843b6db54a291d4545377a0db34f79cb02e58c",
                 ],
+                "data": "0x0000000000000000000000000000000000000000000000000000000000000000",
             }
         ]
         ethereum_tx = EthereumTxFactory(logs=logs)
-        self.assertTrue(tx_processor.is_failed(ethereum_tx, safe_tx_hash))
-        self.assertFalse(
-            tx_processor.is_failed(ethereum_tx, to_0x_hex_str(fast_keccak_text("hola")))
+        self.assertEqual(
+            tx_processor.get_execution_result(
+                ethereum_tx,
+                "0xd6dfcc85421ca06ca8501b3f3e843b6db54a291d4545377a0db34f79cb02e58c",
+            ),
+            (True, 0),
+        )
+        self.assertEqual(
+            tx_processor.get_execution_result(ethereum_tx, other_hash), (False, None)
+        )
+
+        # ExecutionFailure v1.3.0 — unindexed txHash, payment in data
+        logs = [
+            {
+                "topics": [
+                    "0x23428b18acfb3ea64b08dc0c1d296ea9c09702c09083ca5272e64d115b687d23",
+                ],
+                "data": "0xb3418ba0a5d1af8a5e17b410e54f709e89ed6f45362ef772c12f70529c538ae7"
+                "0000000000000000000000000000000000000000000000000000023f62a7b29c",
+            }
+        ]
+        ethereum_tx = EthereumTxFactory(logs=logs)
+        self.assertEqual(
+            tx_processor.get_execution_result(
+                ethereum_tx,
+                "0xb3418ba0a5d1af8a5e17b410e54f709e89ed6f45362ef772c12f70529c538ae7",
+            ),
+            (True, 2471261352604),
+        )
+        self.assertEqual(
+            tx_processor.get_execution_result(ethereum_tx, other_hash), (False, None)
+        )
+
+        # ExecutionSuccess v1.3.0 — unindexed txHash, payment=0 in data
+        logs = [
+            {
+                "topics": [
+                    "0x442e715f626346e8c54381002da614f62bee8d27386535b2521ec8540898556e",
+                ],
+                "data": "0x71a7bab18403a05d3ab369b3206ceaca9b4ab3e29d0b804ed7d05c6403a53df8"
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            }
+        ]
+        ethereum_tx = EthereumTxFactory(logs=logs)
+        self.assertEqual(
+            tx_processor.get_execution_result(
+                ethereum_tx,
+                "0x71a7bab18403a05d3ab369b3206ceaca9b4ab3e29d0b804ed7d05c6403a53df8",
+            ),
+            (False, 0),
+        )
+        self.assertEqual(
+            tx_processor.get_execution_result(ethereum_tx, other_hash), (False, None)
+        )
+
+        # ExecutionSuccess v1.4.1 — indexed txHash in topics[1], payment in data
+        logs = [
+            {
+                "topics": [
+                    "0x442e715f626346e8c54381002da614f62bee8d27386535b2521ec8540898556e",
+                    "0xa3324f8210e3d1772329133a15ad3bb31b848c8ca2498e36a787982a685d2484",
+                ],
+                "data": "0x0000000000000000000000000000000000000000000000000000038fc9cbcc74",
+            }
+        ]
+        ethereum_tx = EthereumTxFactory(logs=logs)
+        self.assertEqual(
+            tx_processor.get_execution_result(
+                ethereum_tx,
+                "0xa3324f8210e3d1772329133a15ad3bb31b848c8ca2498e36a787982a685d2484",
+            ),
+            (False, 3916100783220),
+        )
+        self.assertEqual(
+            tx_processor.get_execution_result(ethereum_tx, other_hash), (False, None)
+        )
+
+        # No matching log → default
+        ethereum_tx = EthereumTxFactory(logs=[])
+        self.assertEqual(
+            tx_processor.get_execution_result(
+                ethereum_tx,
+                "0xa3324f8210e3d1772329133a15ad3bb31b848c8ca2498e36a787982a685d2484",
+            ),
+            (False, None),
         )
 
     def test_tx_is_version_breaking_signatures(self):
@@ -488,15 +539,17 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         safe_1_1_0_master_copy = SafeMasterCopyFactory(version="1.1.0")
         safe_1_2_0_master_copy = SafeMasterCopyFactory(version="1.2.0")
         safe_1_3_0_master_copy = SafeMasterCopyFactory(version="1.3.0")
-        tx_processor.process_decoded_transaction(
-            InternalTxDecodedFactory(
-                function_name="setup",
-                owner=owner,
-                threshold=threshold,
-                fallback_handler=fallback_handler,
-                internal_tx__to=safe_1_1_0_master_copy.address,
-                internal_tx___from=safe_address,
-            )
+        tx_processor.process_decoded_transactions(
+            [
+                InternalTxDecodedFactory(
+                    function_name="setup",
+                    owner=owner,
+                    threshold=threshold,
+                    fallback_handler=fallback_handler,
+                    internal_tx__to=safe_1_1_0_master_copy.address,
+                    internal_tx___from=safe_address,
+                )
+            ]
         )
         tx_processor.process_decoded_transactions(
             [
@@ -557,7 +610,9 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
         with self.assertRaises(
             CannotFindPreviousTrace
         ):  # trace_transaction not supported
-            safe_tx_processor.process_decoded_transaction(module_internal_tx_decoded)
+            safe_tx_processor.process_decoded_transactions(
+                [module_internal_tx_decoded]
+            )[0]
             self.assertEqual(ModuleTransaction.objects.count(), 0)
 
         with mock.patch.object(
@@ -566,7 +621,9 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
             autospec=True,
             return_value=module_traces,
         ):
-            safe_tx_processor.process_decoded_transaction(module_internal_tx_decoded)
+            safe_tx_processor.process_decoded_transactions(
+                [module_internal_tx_decoded]
+            )[0]
             self.assertEqual(ModuleTransaction.objects.count(), 1)
             module_tx = ModuleTransaction.objects.get()
             self.assertEqual(
@@ -596,8 +653,17 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
             internal_tx__value=0,
         )
 
-        with self.assertRaises(ModuleCannotBeDisabled):
-            safe_tx_processor.process_decoded_transaction(disable_module_tx_decoded)
+        with self.assertLogs(
+            "safe_transaction_service.history.indexers.tx_processor", level="ERROR"
+        ) as cm:
+            self.assertFalse(
+                safe_tx_processor.process_decoded_transactions(
+                    [disable_module_tx_decoded]
+                )[0]
+            )
+            self.assertTrue(
+                any(ModuleCannotBeDisabled.__name__ in line for line in cm.output)
+            )
 
         enable_module_tx_decoded = InternalTxDecodedFactory(
             function_name="enableModule",
@@ -606,12 +672,16 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
             internal_tx__value=0,
         )
         self.assertTrue(
-            safe_tx_processor.process_decoded_transaction(enable_module_tx_decoded)
+            safe_tx_processor.process_decoded_transactions([enable_module_tx_decoded])[
+                0
+            ]
         )
         safe_last_status = SafeLastStatus.objects.get(address=safe_address)
         self.assertEqual(safe_last_status.enabled_modules, [module])
         self.assertTrue(
-            safe_tx_processor.process_decoded_transaction(disable_module_tx_decoded)
+            safe_tx_processor.process_decoded_transactions([disable_module_tx_decoded])[
+                0
+            ]
         )
         safe_last_status = SafeLastStatus.objects.get(address=safe_address)
         self.assertEqual(safe_last_status.enabled_modules, [])

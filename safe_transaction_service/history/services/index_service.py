@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: FSL-1.1-MIT
 import logging
 from collections import OrderedDict
 from collections.abc import Collection
@@ -6,6 +7,7 @@ from dataclasses import dataclass
 from django.db import transaction
 from django.db.models import Min, Q
 
+import gevent
 from eth_typing import ChecksumAddress, Hash32
 from hexbytes import HexBytes
 from safe_eth.eth import EthereumClient, get_auto_ethereum_client
@@ -75,6 +77,7 @@ class IndexServiceProvider:
                 settings.ETH_L2_NETWORK,
                 settings.ETH_INTERNAL_TX_DECODED_PROCESS_BATCH,
                 settings.PROCESSING_ENABLE_OUT_OF_ORDER_CHECK,
+                settings.ETH_REINDEX_MAX_RETRIES,
             )
         return cls.instance
 
@@ -92,6 +95,7 @@ class IndexService:
         eth_l2_network: bool,
         eth_internal_tx_decoded_process_batch: int,
         processing_enable_out_of_order_check: bool,
+        eth_reindex_max_retries: int,
     ):
         self.ethereum_client = ethereum_client
         self.eth_reorg_blocks = eth_reorg_blocks
@@ -100,6 +104,7 @@ class IndexService:
             eth_internal_tx_decoded_process_batch
         )
         self.processing_enable_out_of_order_check = processing_enable_out_of_order_check
+        self.eth_reindex_max_retries = eth_reindex_max_retries
 
         # Prevent circular import
         from ..indexers.tx_processor import SafeTxProcessor, SafeTxProcessorProvider
@@ -276,12 +281,24 @@ class IndexService:
         if not tx_hashes_not_in_db:
             return list(ethereum_txs_dict.values())
 
-        # Get receipts for hashes not in db. First get the receipts as they guarantee tx is mined and confirmed
-        logger.debug("Get tx receipts for hashes not on db")
-        tx_receipts = []
-        for tx_hash, tx_receipt in zip(
+        # Fetch receipts and transactions concurrently - both are independent RPC batch calls
+        logger.debug("Get tx receipts and transactions for hashes not on db")
+        receipts_greenlet = gevent.spawn(
+            self.ethereum_client.get_transaction_receipts, tx_hashes_not_in_db
+        )
+        txs_greenlet = gevent.spawn(
+            self.ethereum_client.get_transactions, tx_hashes_not_in_db
+        )
+        gevent.joinall([receipts_greenlet, txs_greenlet], raise_error=True)
+
+        logger.debug("Got tx receipts and transactions from RPC")
+        block_hashes = set()
+        block_hash_per_tx = []
+        ethereum_txs_to_insert = []
+        for tx_hash, tx_receipt, tx in zip(
             tx_hashes_not_in_db,
-            self.ethereum_client.get_transaction_receipts(tx_hashes_not_in_db),
+            receipts_greenlet.value,
+            txs_greenlet.value,
             strict=False,
         ):
             tx_receipt = tx_receipt or self.ethereum_client.get_transaction_receipt(
@@ -291,21 +308,12 @@ class IndexService:
                 raise TransactionNotFoundException(
                     f"Cannot find tx-receipt with tx-hash={to_0x_hex_str(HexBytes(tx_hash))}"
                 )
-
             if tx_receipt.get("blockHash") is None:
                 raise TransactionWithoutBlockException(
                     f"Cannot find blockHash for tx-receipt with "
                     f"tx-hash={to_0x_hex_str(HexBytes(tx_hash))}"
                 )
 
-            tx_receipts.append(tx_receipt)
-
-        logger.debug("Got tx receipts. Now getting transactions not on db")
-        # Get transactions for hashes not in db
-        fetched_txs = self.ethereum_client.get_transactions(tx_hashes_not_in_db)
-        block_hashes = set()
-        txs = []
-        for tx_hash, tx in zip(tx_hashes_not_in_db, fetched_txs, strict=False):
             tx = tx or self.ethereum_client.get_transaction(
                 tx_hash
             )  # Retry fetching if failed
@@ -313,15 +321,22 @@ class IndexService:
                 raise TransactionNotFoundException(
                     f"Cannot find tx with tx-hash={to_0x_hex_str(HexBytes(tx_hash))}"
                 )
-
             if tx.get("blockHash") is None:
                 raise TransactionWithoutBlockException(
                     f"Cannot find blockHash for tx with "
                     f"tx-hash={to_0x_hex_str(HexBytes(tx_hash))}"
                 )
-
+            assert tx["hash"] == tx_receipt["transactionHash"], (
+                "Mismatched tx hash for requested tx_hash="
+                f"{to_0x_hex_str(HexBytes(tx_hash))}: "
+                f"tx.hash={to_0x_hex_str(tx['hash'])}, "
+                f"receipt.transactionHash={to_0x_hex_str(tx_receipt['transactionHash'])}"
+            )
             block_hashes.add(to_0x_hex_str(tx["blockHash"]))
-            txs.append(tx)
+            block_hash_per_tx.append(tx["blockHash"])
+            ethereum_txs_to_insert.append(
+                EthereumTx.objects.from_tx_dict(tx, tx_receipt)
+            )
 
         logger.debug(
             "Got txs from RPC. Getting and inserting %d blocks", len(block_hashes)
@@ -331,24 +346,17 @@ class IndexService:
         )
         logger.debug("Inserted %d blocks", number_inserted_blocks)
 
-        logger.debug("Inserting %d transactions", len(txs))
-        # Create new transactions or ignore if they already exist
-        ethereum_txs_to_insert = [
-            EthereumTx.objects.from_tx_dict(tx, tx_receipt)
-            for tx, tx_receipt in zip(txs, tx_receipts, strict=False)
-        ]
+        # Set block on each tx and register in the result dict before bulk insert
+        for ethereum_tx, tx_block_hash in zip(
+            ethereum_txs_to_insert, block_hash_per_tx, strict=True
+        ):
+            ethereum_tx.block = blocks[tx_block_hash]
+            ethereum_txs_dict[HexBytes(ethereum_tx.tx_hash)] = ethereum_tx
+
+        logger.debug("Inserting %d transactions", len(ethereum_txs_to_insert))
         number_inserted_txs = EthereumTx.objects.bulk_create_from_generator(
             iter(ethereum_txs_to_insert), ignore_conflicts=True
         )
-        for ethereum_tx, tx in zip(ethereum_txs_to_insert, txs, strict=False):
-            # Trust they were inserted and add them to the txs dictionary
-            assert ethereum_tx.tx_hash == to_0x_hex_str(tx["hash"]), (
-                f"{ethereum_tx.tx_hash} does not match retrieved tx hash"
-            )
-            ethereum_tx.block = blocks[tx["blockHash"]]
-            ethereum_txs_dict[HexBytes(ethereum_tx.tx_hash)] = ethereum_tx
-            # Block info is required for traces
-
         logger.debug("Inserted %d transactions", number_inserted_txs)
 
         logger.debug("Blocks, transactions and receipts were inserted")
@@ -573,17 +581,21 @@ class IndexService:
         indexer: "EthereumIndexer",  # noqa F821
         from_block_number: int,
         to_block_number: int | None = None,
-        block_process_limit: int = 100,
-        addresses: ChecksumAddress | None = None,
+        block_process_limit: int | None = None,
+        addresses: Collection[ChecksumAddress] | None = None,
     ) -> int:
         """
         :param indexer: A new instance must be provider, providing the singleton one can break indexing
         :param from_block_number:
         :param to_block_number:
-        :param block_process_limit:
+        :param block_process_limit: Initial chunk size. If ``None``, the indexer's
+            configured ``block_process_limit`` is used. The indexer's auto-adjust
+            mechanism may grow or shrink the limit during the run.
         :param addresses:
         :return: Number of reindexed elements
         """
+        from ..indexers import FindRelevantElementsException
+
         assert (not to_block_number) or to_block_number > from_block_number
 
         if addresses:
@@ -593,50 +605,86 @@ class IndexService:
         else:
             addresses = set(indexer.database_queryset.values_list("address", flat=True))
 
-        element_number: int = 0
         if not addresses:
             logger.warning("No addresses to process")
-        else:
-            # Don't log all the addresses
-            addresses_len = len(addresses)
-            addresses_str = (
-                str(addresses)
-                if addresses_len < 10
-                else f"{addresses_len} addresses..."
+            return 0
+
+        if block_process_limit is not None:
+            indexer.block_process_limit = block_process_limit
+
+        # Don't log all the addresses
+        addresses_len = len(addresses)
+        addresses_str = (
+            str(addresses) if addresses_len < 10 else f"{addresses_len} addresses..."
+        )
+        logger.info("Start reindexing addresses %s", addresses_str)
+        current_block_number = self.ethereum_client.current_block_number
+        stop_block_number = (
+            min(current_block_number, to_block_number)
+            if to_block_number
+            else current_block_number
+        )
+
+        element_number: int = 0
+        block_number = from_block_number
+        consecutive_failures = 0
+        while block_number <= stop_block_number:
+            chunk_to = min(
+                block_number + indexer.block_process_limit - 1, stop_block_number
             )
-            logger.info("Start reindexing addresses %s", addresses_str)
-            current_block_number = self.ethereum_client.current_block_number
-            stop_block_number = (
-                min(current_block_number, to_block_number)
-                if to_block_number
-                else current_block_number
-            )
-            for block_number in range(
-                from_block_number, stop_block_number + 1, block_process_limit
-            ):
+            try:
                 elements = indexer.find_relevant_elements(
-                    addresses,
-                    block_number,
-                    min(block_number + block_process_limit - 1, stop_block_number),
+                    addresses, block_number, chunk_to
                 )
                 indexer.process_elements(elements)
-                logger.info(
-                    "Current block number %d, found %d traces/events",
+            except FindRelevantElementsException as exc:
+                # Mirror `EthereumIndexer.process_addresses` recovery: drop the
+                # window to the minimum and retry the same range. Auto-adjust
+                # will grow it back as requests succeed. Abort if the same
+                # single-block range keeps failing, so we surface bad blocks
+                # / node bugs instead of looping forever.
+                consecutive_failures += 1
+                if (
+                    indexer.block_process_limit == 1
+                    and consecutive_failures >= self.eth_reindex_max_retries
+                ):
+                    logger.error(
+                        "Block range [%d, %d] failed %d consecutive times at "
+                        "block_process_limit=1, aborting reindex",
+                        block_number,
+                        chunk_to,
+                        consecutive_failures,
+                    )
+                    raise
+                logger.warning(
+                    "Error reindexing block range [%d, %d]: %s. "
+                    "Retrying with block_process_limit=1",
                     block_number,
-                    len(elements),
+                    chunk_to,
+                    exc,
                 )
-                element_number += len(elements)
+                indexer.block_process_limit = 1
+                continue
 
-            logger.info("End reindexing addresses %s", addresses_str)
+            consecutive_failures = 0
+            logger.info(
+                "Reindexed block range [%d, %d], found %d traces/events",
+                block_number,
+                chunk_to,
+                len(elements),
+            )
+            element_number += len(elements)
+            block_number = chunk_to + 1
 
+        logger.info("End reindexing addresses %s", addresses_str)
         return element_number
 
     def reindex_master_copies(
         self,
         from_block_number: int,
         to_block_number: int | None = None,
-        block_process_limit: int = 100,
-        addresses: ChecksumAddress | None = None,
+        block_process_limit: int | None = None,
+        addresses: Collection[ChecksumAddress] | None = None,
     ) -> int:
         """
         Reindex master copies in parallel with the current running indexer, so service will have no missing txs
@@ -644,7 +692,8 @@ class IndexService:
 
         :param from_block_number: Block number to start indexing from
         :param to_block_number: Block number to stop indexing on
-        :param block_process_limit: Number of blocks to process each time
+        :param block_process_limit: Initial number of blocks to process each time.
+            If ``None``, the indexer's configured value is used and auto-adjust drives it from there.
         :param addresses: Master Copy or Safes(for L2 event processing) addresses. If not provided,
             all master copies will be used
         """
@@ -670,8 +719,8 @@ class IndexService:
         self,
         from_block_number: int,
         to_block_number: int | None = None,
-        block_process_limit: int = 100,
-        addresses: ChecksumAddress | None = None,
+        block_process_limit: int | None = None,
+        addresses: Collection[ChecksumAddress] | None = None,
     ) -> int:
         """
         Reindex erc20/721 events parallel with the current running indexer, so service will have no missing
@@ -679,7 +728,8 @@ class IndexService:
 
         :param from_block_number: Block number to start indexing from
         :param to_block_number: Block number to stop indexing on
-        :param block_process_limit: Number of blocks to process each time
+        :param block_process_limit: Initial number of blocks to process each time.
+            If ``None``, the indexer's configured value is used and auto-adjust drives it from there.
         :param addresses: Safe addresses. If not provided, all Safe addresses will be used
         """
         assert (not to_block_number) or to_block_number > from_block_number
