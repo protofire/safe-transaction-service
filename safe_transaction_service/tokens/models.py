@@ -25,7 +25,10 @@ from .clients.zerion_client import (
     ZerionTokenAdapterClient,
     ZerionUniswapV2TokenAdapterClient,
 )
-from .constants import ENS_CONTRACTS_WITH_TLD
+from .constants import (
+    ENS_CONTRACTS_WITH_TLD,
+    get_src20_keyless_placeholder_logs,
+)
 from .exceptions import TokenListRetrievalException
 
 logger = logging.getLogger(__name__)
@@ -160,6 +163,51 @@ class TokenManager(models.Manager):
             )
             return None
 
+    def create_src20_from_blockchain(
+        self, token_address: ChecksumAddress
+    ) -> Optional["Token"]:
+        """
+        Create (idempotently) a `Token` row for a SRC20 confidential token.
+
+        SRC20 amounts are encrypted, so `decimals` is irrelevant; it's stored as `0` (non
+        null) so the token is never treated as ERC721. Name/symbol are read best-effort.
+        """
+        # DB-first: never hit the node for an already-known token. This is called on the
+        # indexer's critical path on every cycle, so skipping the RPC avoids redundant load.
+        if existing := self.filter(address=token_address).first():
+            return existing
+
+        name = symbol = None
+        try:
+            erc_info = get_auto_ethereum_client().erc20.get_info(token_address)
+            name, symbol = erc_info.name, erc_info.symbol
+        except Exception:  # noqa - SRC20 may not implement standard metadata calls
+            logger.debug("Could not read SRC20 metadata for token=%s", token_address)
+
+        def _clean(text, default):
+            if not text:
+                return default[:60]
+            if isinstance(text, bytes):
+                text = text.decode("utf-8", errors="replace")
+            # Truncate to `Token.name`/`symbol` max_length. `get_or_create` builds the row
+            # via the QuerySet's `create`, bypassing `TokenManager.create`'s truncation, so
+            # an over-long (attacker-controlled) value would otherwise raise `DataError`.
+            return text.replace("\x00", "�")[:60]
+
+        token, _ = self.get_or_create(
+            address=token_address,
+            defaults={
+                "name": _clean(name, "SRC20"),
+                "symbol": _clean(symbol, "SRC20"),
+                "decimals": 0,
+                "src20": True,
+                "src20_keyless_placeholder_logs_per_transfer": (
+                    get_src20_keyless_placeholder_logs(token_address)
+                ),
+            },
+        )
+        return token
+
     def fix_missing_logos(self) -> int:
         """
         Syncs tokens with empty logos with files that exist on S3 and match the address
@@ -247,6 +295,21 @@ class Token(models.Model):
     copy_price = EthereumAddressBinaryField(
         null=True, blank=True, help_text="If provided, copy the price from the token"
     )
+    src20 = models.BooleanField(
+        default=False,
+        help_text="Set `True` for SRC20 confidential tokens (amounts are encrypted)",
+    )
+    src20_keyless_placeholder_logs_per_transfer = models.PositiveSmallIntegerField(
+        default=1,
+        help_text=(
+            "Number of `encryptKeyHash == 0` `Transfer` logs a single SRC20 transfer "
+            "emits when both parties are keyless (sender + recipient = 2 for the standard "
+            "base). STRUCTURAL and PROVIDER-INDEPENDENT: provider logs carry non-zero "
+            "hashes and are counted separately, so this value stays 2 even when providers "
+            "are registered. Used as the divisor to collapse duplicate keyless logs back "
+            "to one logical transfer. `1` means keep every log (never under-count)."
+        ),
+    )
 
     class Meta:
         indexes = [
@@ -274,11 +337,14 @@ class Token(models.Model):
         if self.trusted and self.spam:
             raise ValidationError("Spam and trusted cannot be both `True`")
 
+    def is_src20(self):
+        return self.src20
+
     def is_erc20(self):
-        return self.decimals is not None
+        return not self.src20 and self.decimals is not None
 
     def is_erc721(self):
-        return not self.is_erc20()
+        return not self.src20 and self.decimals is None
 
     def set_trusted(self) -> None:
         self.trusted = True

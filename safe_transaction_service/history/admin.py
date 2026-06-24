@@ -32,6 +32,7 @@ from .models import (
     SafeLastStatus,
     SafeMasterCopy,
     SafeStatus,
+    SRC20Transfer,
 )
 from .services import IndexServiceProvider
 from .utils import HexField
@@ -168,6 +169,19 @@ class ERC721TransferAdmin(TokenTransferAdmin):
         for element in queryset:
             element.to_erc20_transfer().save()
         queryset.delete()
+
+
+@admin.register(SRC20Transfer)
+class SRC20TransferAdmin(TokenTransferAdmin):
+    list_display = (
+        "timestamp",
+        "block_number",
+        "log_index",
+        "address",
+        "_from",
+        "to",
+        "ethereum_tx_id",
+    )
 
 
 @admin.register(EthereumTx)

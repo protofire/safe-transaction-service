@@ -934,6 +934,7 @@ class TransferType(Enum):
     ERC20_TRANSFER = 1
     ERC721_TRANSFER = 2
     UNKNOWN = 3
+    SRC20_TRANSFER = 4
 
 
 class TransferResponseSerializer(serializers.Serializer):
@@ -1000,6 +1001,11 @@ class TransferWithTokenInfoResponseSerializer(TransferResponseSerializer):
             TransferType.ERC721_TRANSFER.name,
         ):
             if token := obj["token"]:
+                is_src20 = (
+                    token.get("src20") if isinstance(token, dict) else token.src20
+                )
+                if is_src20:
+                    return TransferType.SRC20_TRANSFER.name
                 decimals = (
                     token["decimals"] if isinstance(token, dict) else token.decimals
                 )
