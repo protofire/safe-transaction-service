@@ -598,6 +598,10 @@ ETH_L2_NETWORK = env.bool(
 ETH_ZKSYNC_COMPATIBLE_NETWORK = env.bool(
     "ETH_ZKSYNC_COMPATIBLE_NETWORK", default=False
 )  # Fix some issues regarding zkSync compatible networks
+# Balances endpoint cache. The cache key already changes whenever new incoming
+# events are indexed, so this TTL only matters for transfers the indexer cannot
+# see (e.g. native TRX sent to a Safe via Tron TransferContract emits no event).
+BALANCES_CACHE_SECONDS = env.int("BALANCES_CACHE_SECONDS", default=60 * 10)
 ETH_EVENTS_BLOCK_PROCESS_LIMIT = env.int(
     "ETH_EVENTS_BLOCK_PROCESS_LIMIT", default=50
 )  # Initial number of blocks to process together when searching for events. It will be auto increased. 0 == no limit.

@@ -175,8 +175,8 @@ class BalanceService:
             balances, count = self._get_balances(
                 safe_address, only_trusted, exclude_spam, limit, offset
             )
-            django_cache.set(cache_key, balances, 60 * 10)  # 10 minutes cache
-            django_cache.set(cache_key_count, count, 60 * 10)  # 10 minutes cache
+            django_cache.set(cache_key, balances, settings.BALANCES_CACHE_SECONDS)
+            django_cache.set(cache_key_count, count, settings.BALANCES_CACHE_SECONDS)
             return balances, count
 
     def _get_page_erc20_balances(
