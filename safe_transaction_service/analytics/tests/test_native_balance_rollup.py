@@ -54,6 +54,7 @@ from safe_transaction_service.history.tests.factories import (
     EthereumTxFactory,
     InternalTxFactory,
     SafeContractFactory,
+    SafeMasterCopyFactory,
 )
 from safe_transaction_service.utils.redis import get_redis
 
@@ -477,16 +478,6 @@ class TestRefusalPaths(NativeBalanceRollupTestCase):
     """Every path that declines to run says why at ERROR and leaves the
     rollup untouched — a wrong number here is worse than a stale one."""
 
-    def test_uninitialised_rollup_refuses(self):
-        self.safe()
-        self.advance_head()
-        with self.assertLogs(
-            "safe_transaction_service.analytics.tasks", level="ERROR"
-        ) as logs:
-            self.assertIsNone(run_native_balance_rollup())
-        self.assertIn("backfill_native_balances", logs.output[0])
-        self.assertEqual(SafeNativeBalance.objects.count(), 0)
-
     def test_watermark_ahead_of_head_refuses(self):
         self.safe()
         self.advance_head()
@@ -502,6 +493,30 @@ class TestRefusalPaths(NativeBalanceRollupTestCase):
         self.assertEqual(
             AnalyticsWatermark.objects.get(name=NATIVE_BALANCE_WATERMARK).block_number,
             head + 10,
+        )
+
+    def test_cold_start_over_a_large_fleet_refuses(self):
+        """No watermark and a fleet too big to seed here means analytics is
+        being switched on over an existing service, not a new network
+        coming up. That is the hour-long recompute this rollup exists to
+        keep out of a nightly task."""
+        for _ in range(3):
+            self.safe()
+        self.advance_head()
+
+        with patch(
+            "safe_transaction_service.analytics.tasks.NATIVE_BALANCE_MAX_SEED_PER_RUN",
+            2,
+        ):
+            with self.assertLogs(
+                "safe_transaction_service.analytics.tasks", level="ERROR"
+            ) as logs:
+                self.assertIsNone(run_native_balance_rollup())
+
+        self.assertIn("backfill_native_balances", logs.output[0])
+        self.assertEqual(SafeNativeBalance.objects.count(), 0)
+        self.assertFalse(
+            AnalyticsWatermark.objects.filter(name=NATIVE_BALANCE_WATERMARK).exists()
         )
 
     def test_too_many_unseeded_safes_refuses(self):
@@ -525,6 +540,125 @@ class TestRefusalPaths(NativeBalanceRollupTestCase):
         self.safe(block=self.block(confirmed=False))
         self.initialise()
         self.assertIsNone(run_native_balance_rollup())
+
+
+class TestColdStart(NativeBalanceRollupTestCase):
+    """A newly spun-up transaction service must not need a human to run the
+    backfill. The nightly task initialises the rollup itself when the fleet
+    is small enough for that to be bounded work."""
+
+    def test_a_new_network_initialises_itself_on_the_first_run(self):
+        safe = self.safe()
+        self.transfer(self.block(), 4_200, to=safe.address)
+        self.advance_head()
+        head = native_balance_head_block()
+        self.assertFalse(
+            AnalyticsWatermark.objects.filter(name=NATIVE_BALANCE_WATERMARK).exists()
+        )
+
+        with self.assertLogs(
+            "safe_transaction_service.analytics.tasks", level="INFO"
+        ) as logs:
+            summary = run_native_balance_rollup()
+
+        self.assertTrue(any("cold start" in line for line in logs.output))
+        self.assertEqual(
+            AnalyticsWatermark.objects.get(name=NATIVE_BALANCE_WATERMARK).block_number,
+            head,
+        )
+        # Seeded at `head`, so the whole history is in the row already and
+        # the delta of this same run had nothing left to add.
+        self.assertEqual(summary["watermark_from"], head)
+        self.assertEqual(summary["seeded_safes"], 0)
+        self.assertEqual(self.totals(), (4_200, 1))
+        self.assertEqual(self.totals(), _calculate_native_balances_from_db())
+
+    def test_the_run_after_a_cold_start_is_a_plain_increment(self):
+        safe = self.safe()
+        self.transfer(self.block(), 100, to=safe.address)
+        self.advance_head()
+        run_native_balance_rollup()
+
+        self.transfer(self.block(), 25, to=safe.address)
+        self.advance_head()
+        summary = run_native_balance_rollup()
+
+        self.assertEqual(summary["touched_safes"], 1)
+        self.assertEqual(self.totals(), (125, 1))
+        self.assertEqual(self.totals(), _calculate_native_balances_from_db())
+
+    def test_cold_start_matches_what_the_backfill_would_have_written(self):
+        for _ in range(3):
+            safe = self.safe()
+            self.transfer(self.block(), 700, to=safe.address)
+        self.advance_head()
+
+        run_native_balance_rollup()
+        by_cold_start = self.totals()
+        stamps = set(
+            SafeNativeBalance.objects.values_list("updated_to_block", flat=True)
+        )
+
+        # Same shape the command produces: a row per Safe, one stamp.
+        self.assertEqual(SafeNativeBalance.objects.count(), 3)
+        self.assertEqual(len(stamps), 1)
+        self.assertEqual(by_cold_start, _calculate_native_balances_from_db())
+
+
+class TestIndexerProgressBound(NativeBalanceRollupTestCase):
+    """`EthereumBlock` rows are created by any indexer — the ERC20 one makes
+    a block the moment it meets a transfer — so block presence can run far
+    ahead of the master-copies indexer that actually writes `InternalTx`.
+    Consuming such a block moves the watermark past internal transactions
+    that have not been written yet, and they are never revisited.
+
+    This is the state every freshly spun-up service is in.
+    """
+
+    def test_head_waits_for_the_trace_indexer(self):
+        self.advance_head(4)
+        unbounded = native_balance_head_block()
+        behind = unbounded - 2
+        SafeMasterCopyFactory(tx_block_number=behind)
+
+        self.assertEqual(native_balance_head_block(), behind)
+
+    def test_the_furthest_behind_master_copy_wins(self):
+        self.advance_head(6)
+        head = native_balance_head_block()
+        SafeMasterCopyFactory(tx_block_number=head - 1)
+        SafeMasterCopyFactory(tx_block_number=head - 4)
+
+        self.assertEqual(native_balance_head_block(), head - 4)
+
+    def test_a_synced_indexer_does_not_constrain(self):
+        self.advance_head(4)
+        head = native_balance_head_block()
+        SafeMasterCopyFactory(tx_block_number=head + 50)
+
+        self.assertEqual(native_balance_head_block(), head)
+
+    def test_transfers_the_indexer_has_not_reached_are_not_consumed(self):
+        safe = self.safe()
+        early = self.block()
+        self.transfer(early, 300, to=safe.address)
+        late = self.block()
+        self.transfer(late, 900, to=safe.address)
+        self.advance_head()
+
+        # The trace indexer has only reached `early`. The 900 is in the
+        # database because some other indexer put it there; it is not ours
+        # to consume yet.
+        master_copy = SafeMasterCopyFactory(tx_block_number=early.number)
+        run_native_balance_rollup()
+        self.assertEqual(self.totals(), (300, 1))
+
+        # Once it catches up, the next run picks the rest up — no gap.
+        master_copy.tx_block_number = late.number + 10
+        master_copy.save(update_fields=["tx_block_number"])
+        run_native_balance_rollup()
+        self.assertEqual(self.totals(), (1_200, 1))
+        self.assertEqual(self.totals(), _calculate_native_balances_from_db())
 
 
 class TestReadHelper(NativeBalanceRollupTestCase):

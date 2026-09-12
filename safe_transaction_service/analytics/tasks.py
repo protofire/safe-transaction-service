@@ -46,6 +46,7 @@ from safe_transaction_service.history.models import (
     MultisigConfirmation,
     MultisigTransaction,
     SafeContract,
+    SafeMasterCopy,
 )
 from safe_transaction_service.utils.celery import task_timeout
 from safe_transaction_service.utils.redis import get_redis
@@ -999,18 +1000,52 @@ FROM analytics_safenativebalance
 """
 
 
-def native_balance_head_block() -> int | None:
-    """Highest block the rollup may consume: the newest one a reorg can
-    no longer touch.
+def _trace_indexer_block() -> int | None:
+    """How far the master-copies indexer has processed, or ``None`` when
+    the service has no relevant master copies configured.
 
-    ``min(MAX(number) WHERE confirmed, MAX(number) - ETH_REORG_BLOCKS)``.
-    Both terms, not either: ``confirmed`` is the indexer's own statement
-    that it has stopped re-checking a block
+    ``MIN(SafeMasterCopy.tx_block_number)`` over the master copies this
+    network actually indexes — the same expression
+    ``IndexService.get_master_copies_current_indexing_block_number`` uses
+    to answer "is this service synced".
+    """
+    return SafeMasterCopy.objects.relevant().aggregate(position=Min("tx_block_number"))[
+        "position"
+    ]
+
+
+def native_balance_head_block() -> int | None:
+    """Highest block the rollup may consume: the newest one that is both
+    beyond a reorg's reach and actually indexed.
+
+    ``min(MAX(number) WHERE confirmed, MAX(number) - ETH_REORG_BLOCKS,
+    MIN(SafeMasterCopy.tx_block_number))``.
+
+    The first two are about reorgs: ``confirmed`` is the indexer's own
+    statement that it has stopped re-checking a block
     (``reorg_service.check_reorgs`` sets it), while the depth term is an
     independent backstop for deployments whose reorg task is not running
     or is behind — there ``confirmed`` can sit at a stale height, and the
     run simply stalls (correctly) instead of consuming a block that may
     still vanish.
+
+    The third is about a different hazard entirely, and it is the one
+    that bites a freshly spun-up service. ``EthereumBlock`` rows are
+    created by *any* indexer — the ERC20 indexer makes a block and a
+    transaction the moment it meets a transfer — so block presence, and
+    ``confirmed`` with it, can run far ahead of the master-copies indexer
+    that actually writes ``InternalTx``. Consume a block whose internal
+    transactions have not been written yet and the rollup moves its
+    watermark past them forever: they are never revisited, and the
+    balance is silently short. Bounding on the trace indexer's own
+    position means the rollup waits for it instead.
+
+    On a synced service the third term does not bind — it sits at roughly
+    the same height as the other two. It only takes effect when the
+    indexer is genuinely behind: initial sync, a reindex, an outage.
+    ``None`` (no relevant master copies configured) is treated as "no
+    constraint": such a service indexes no internal transactions at all,
+    so there is nothing for this bound to protect.
 
     Why this matters more here than anywhere else in analytics:
     ``recover_from_reorg`` deletes ``EthereumBlock`` rows at or above the
@@ -1032,6 +1067,15 @@ def native_balance_head_block() -> int | None:
         return None
     depth_head = int(tip) - settings.ETH_REORG_BLOCKS
     head = min(int(confirmed_head), depth_head)
+    indexed_head = _trace_indexer_block()
+    if indexed_head is not None and int(indexed_head) < head:
+        logger.info(
+            "native_balance.head: master-copies indexer is at %d, below the "
+            "reorg-safe head %d — consuming only what it has written",
+            indexed_head,
+            head,
+        )
+        head = int(indexed_head)
     if head < 0:
         return None
     # When `confirmed` is the binding term and it lags the depth bound
@@ -1204,13 +1248,72 @@ def read_native_balance_rollup() -> dict | None:
     }
 
 
+def _cold_start_native_balance_rollup(head: int) -> AnalyticsWatermark | None:
+    """Initialise an empty rollup from inside the nightly run, when — and
+    only when — doing so is bounded work.
+
+    A newly spun-up transaction service has no Safes yet, or a handful, so
+    requiring a human to run `backfill_native_balances` on every new
+    network is friction with nothing behind it. Seeding a small fleet at
+    ``head`` and setting the watermark there is exactly what the backfill
+    command does, and at this size it is a sub-second query.
+
+    The ceiling is what keeps this honest. Above
+    ``NATIVE_BALANCE_MAX_SEED_PER_RUN`` we are no longer initialising a new
+    network, we are switching analytics on over an existing one with years
+    of history — the hour-long full recompute this whole rollup exists to
+    stop doing inside a nightly task. That case still refuses, loudly, and
+    still wants the command.
+
+    Returns the watermark row it created, or ``None`` if it declined.
+    """
+    unseeded = _unseeded_safe_addresses(NATIVE_BALANCE_MAX_SEED_PER_RUN)
+    if unseeded is None:
+        logger.error(
+            "native_balance.rollup: no '%s' watermark and more than %d Safes "
+            "to seed (~%d). That is analytics being switched on over an "
+            "existing service, not a new network coming up, and seeding it "
+            "here is the full-history recompute this rollup replaces. Run "
+            "`manage.py backfill_native_balances` once — it is inline, so no "
+            "task timeout applies to it.",
+            NATIVE_BALANCE_WATERMARK,
+            NATIVE_BALANCE_MAX_SEED_PER_RUN,
+            approx_count_or_exact(SafeContract, "history_safecontract"),
+        )
+        return None
+
+    # Seeded at `head`, not at 0: every Safe's whole history through `head`
+    # goes into its row, and the watermark then says so. Seeding at 0 would
+    # be equally correct and would make the first delta re-read the entire
+    # chain for nothing.
+    with transaction.atomic():
+        _seed_native_balances(unseeded, head)
+        watermark_row = AnalyticsWatermark.objects.create(
+            name=NATIVE_BALANCE_WATERMARK,
+            block_number=head,
+            computed_at=timezone.now(),
+        )
+    logger.info(
+        "native_balance.rollup: cold start — initialised %d Safes at block "
+        "%d. Subsequent runs are incremental.",
+        len(unseeded),
+        head,
+    )
+    return watermark_row
+
+
 def run_native_balance_rollup() -> dict | None:
     """One incremental pass — seed, apply, mark. See the sketch above.
 
+    On an uninitialised rollup this also does the cold start, when the
+    fleet is small enough for that to be bounded work — see
+    ``_cold_start_native_balance_rollup``. A new network therefore needs no
+    manual backfill at all: the first nightly run brings the rollup up.
+
     Returns a summary dict, or ``None`` when the run declined to do
-    anything: nothing confirmed yet, rollup not initialised, watermark
-    ahead of the safe head, or too many Safes to seed. Every declining
-    path logs; the three that mean something is wrong log at ERROR.
+    anything: nothing safe to consume yet, too many Safes to seed from
+    cold, or a watermark ahead of the safe head. Every declining path
+    logs; the two that mean something is wrong log at ERROR.
 
     Separate from the Celery task so the backfill command, the drift
     check and the tests can drive it without a broker.
@@ -1228,16 +1331,10 @@ def run_native_balance_rollup() -> dict | None:
         name=NATIVE_BALANCE_WATERMARK
     ).first()
     if watermark_row is None:
-        logger.error(
-            "native_balance.rollup: no '%s' watermark row — the rollup has "
-            "never been initialised. Run `manage.py backfill_native_balances` "
-            "once (it runs inline, so no task timeout applies to it); seeding "
-            "~%d Safes from a nightly task is exactly the full-history "
-            "recompute this rollup replaces.",
-            NATIVE_BALANCE_WATERMARK,
-            approx_count_or_exact(SafeContract, "history_safecontract"),
-        )
-        return None
+        cold_start = _cold_start_native_balance_rollup(head)
+        if cold_start is None:
+            return None
+        watermark_row = cold_start
 
     watermark = watermark_row.block_number
     if watermark > head:
