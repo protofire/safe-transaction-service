@@ -40,7 +40,14 @@ from safe_transaction_service.analytics.tasks import (
     read_native_balance_rollup,
     run_native_balance_rollup,
 )
-from safe_transaction_service.analytics.tasks_shards import HEX_PREFIXES
+from safe_transaction_service.analytics.tasks_shards import (
+    HEX_PREFIXES,
+    NATIVE_BALANCE_CURSOR_KEY,
+    NATIVE_BALANCE_RUN_KEY_PREFIX,
+    backfill_native_balance_chunk,
+    latest_native_balance_run_id,
+    load_native_balance_run,
+)
 from safe_transaction_service.history.models import EthereumTxCallType, SafeContract
 from safe_transaction_service.history.tests.factories import (
     EthereumBlockFactory,
@@ -48,6 +55,7 @@ from safe_transaction_service.history.tests.factories import (
     InternalTxFactory,
     SafeContractFactory,
 )
+from safe_transaction_service.utils.redis import get_redis
 
 # Well clear of `EthereumBlockFactory.number`'s 1-based sequence.
 BASE_BLOCK = 1_000_000
@@ -59,6 +67,14 @@ class NativeBalanceRollupTestCase(TestCase):
     def setUp(self):
         super().setUp()
         self.next_block = BASE_BLOCK
+        # Redis is not rolled back between tests the way the database is,
+        # so a run manifest (and the cursor pointing at it) outlives the
+        # rows it describes. Same isolation `BackfillRedisMixin` gives the
+        # daily-backfill tests.
+        redis = get_redis()
+        keys = list(redis.scan_iter(match=f"{NATIVE_BALANCE_RUN_KEY_PREFIX}*"))
+        keys.append(NATIVE_BALANCE_CURSOR_KEY)
+        redis.delete(*keys)
 
     def block(self, confirmed: bool = True):
         """A new block, one number above the last one this test made."""
@@ -883,3 +899,144 @@ class TestDriftCheck(NativeBalanceRollupTestCase):
         self.advance_head()
         call_command("backfill_native_balances", stdout=StringIO())
         self.assertEqual(check_native_balance_drift()["orphan_rows"], 0)
+
+
+class TestChunkedCeleryBackfill(NativeBalanceRollupTestCase):
+    """`--celery` is the same walk driven from the worker. It must land on
+    exactly the same rows and the same watermark as the inline mode — the
+    only difference is who holds the loop.
+
+    Eager mode runs the whole chain inside the first `apply_async`, so a
+    `--celery` call here completes before it returns; `chunk_size` is kept
+    small so several chunks actually happen.
+    """
+
+    def backfill(self, **kwargs) -> str:
+        out = StringIO()
+        call_command("backfill_native_balances", stdout=out, stderr=out, **kwargs)
+        return out.getvalue()
+
+    def test_celery_mode_matches_inline_mode(self):
+        safes = [self.safe() for _ in range(5)]
+        block = self.block()
+        for safe in safes[:3]:
+            self.transfer(block, 900, to=safe.address)
+        self.advance_head()
+        head = native_balance_head_block()
+
+        self.backfill(celery=True, chunk_size=2)
+
+        # A row per Safe, all stamped at the same block, watermark handed
+        # over — byte for byte what the inline mode produces.
+        self.assertEqual(SafeNativeBalance.objects.count(), 5)
+        self.assertEqual(
+            set(SafeNativeBalance.objects.values_list("updated_to_block", flat=True)),
+            {head},
+        )
+        self.assertEqual(
+            AnalyticsWatermark.objects.get(name=NATIVE_BALANCE_WATERMARK).block_number,
+            head,
+        )
+        self.assertEqual(self.totals(), _calculate_native_balances_from_db())
+        self.assertEqual(self.totals(), (2_700, 3))
+
+    def test_run_manifest_accounts_for_every_safe(self):
+        for _ in range(5):
+            self.safe()
+        self.advance_head()
+
+        self.backfill(celery=True, chunk_size=2)
+
+        run = load_native_balance_run(latest_native_balance_run_id())
+        self.assertEqual(run["state"], "finished")
+        self.assertEqual(run["safes_seen"], 5)
+        self.assertEqual(run["safes_seeded"], 5)
+        self.assertEqual(run["safes_already_present"], 0)
+        self.assertTrue(run["watermark_written"])
+        # 5 Safes at 2 per chunk: three chunks of work, then one that walks
+        # off the end and closes the run.
+        self.assertEqual(run["chunks_done"], 3)
+        self.assertIsNotNone(run["finished_at"])
+
+    def test_celery_mode_resumes_over_rows_already_written(self):
+        for _ in range(4):
+            self.safe()
+        self.advance_head()
+        self.backfill(chunk_size=2)  # inline first
+        watermark = AnalyticsWatermark.objects.get(
+            name=NATIVE_BALANCE_WATERMARK
+        ).block_number
+
+        self.safe()
+        self.advance_head()
+        self.backfill(celery=True, chunk_size=2)
+
+        run = load_native_balance_run(latest_native_balance_run_id())
+        self.assertEqual(run["safes_already_present"], 4)
+        self.assertEqual(run["safes_seeded"], 1)
+        self.assertEqual(SafeNativeBalance.objects.count(), 5)
+        # Topping up an already-handed-over rollup must not move the
+        # watermark: the Safes it did not touch are only complete through
+        # the old one.
+        self.assertFalse(run["watermark_written"])
+        self.assertEqual(
+            AnalyticsWatermark.objects.get(name=NATIVE_BALANCE_WATERMARK).block_number,
+            watermark,
+        )
+
+    def test_a_failing_chunk_stops_the_chain_and_is_recorded(self):
+        for _ in range(6):
+            self.safe()
+        self.advance_head()
+
+        with patch(
+            "safe_transaction_service.analytics.tasks.seed_missing_native_balances",
+            side_effect=RuntimeError("pg went away"),
+        ):
+            self.backfill(celery=True, chunk_size=2)
+
+        run = load_native_balance_run(latest_native_balance_run_id())
+        self.assertEqual(run["state"], "failed")
+        self.assertIn("pg went away", run["error"])
+        self.assertEqual(run["chunks_done"], 0)
+        # Nothing written, and crucially no watermark — the incremental
+        # task must keep refusing until a run actually completes.
+        self.assertEqual(SafeNativeBalance.objects.count(), 0)
+        self.assertFalse(
+            AnalyticsWatermark.objects.filter(name=NATIVE_BALANCE_WATERMARK).exists()
+        )
+
+        # Re-running finishes the job.
+        self.backfill(celery=True, chunk_size=2)
+        self.assertEqual(SafeNativeBalance.objects.count(), 6)
+        self.assertTrue(
+            AnalyticsWatermark.objects.filter(name=NATIVE_BALANCE_WATERMARK).exists()
+        )
+
+    def test_chunk_task_is_inert_once_the_run_is_closed(self):
+        """Guards the one way a duplicated message could corrupt a run:
+        a late redelivery re-walking a cursor that has already moved."""
+        self.safe()
+        self.advance_head()
+        self.backfill(celery=True, chunk_size=2)
+        run_id = latest_native_balance_run_id()
+        before = load_native_balance_run(run_id)
+
+        backfill_native_balance_chunk(run_id)
+
+        self.assertEqual(load_native_balance_run(run_id), before)
+
+    def test_status_reports_the_celery_run(self):
+        self.safe()
+        self.advance_head()
+        self.backfill(celery=True, chunk_size=2)
+
+        output = self.backfill(status=True)
+
+        self.assertIn("Most recent --celery run", output)
+        self.assertIn("finished", output)
+
+    def test_status_without_a_celery_run_says_so(self):
+        self.safe()
+        self.advance_head()
+        self.assertIn("none recorded", self.backfill(status=True))

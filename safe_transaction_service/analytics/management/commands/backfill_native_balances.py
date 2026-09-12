@@ -21,7 +21,6 @@ import time
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
-from django.utils import timezone
 
 from safe_transaction_service.analytics.models import (
     AnalyticsWatermark,
@@ -31,8 +30,14 @@ from safe_transaction_service.analytics.services.db import relaxed_statement_tim
 from safe_transaction_service.analytics.tasks import (
     NATIVE_BALANCE_WATERMARK,
     _iter_safe_addresses_keyset,
-    _seed_native_balances,
     native_balance_head_block,
+    seed_missing_native_balances,
+    write_native_balance_watermark,
+)
+from safe_transaction_service.analytics.tasks_shards import (
+    latest_native_balance_run_id,
+    load_native_balance_run,
+    start_native_balance_backfill_run,
 )
 from safe_transaction_service.history.models import SafeContract
 
@@ -51,26 +56,17 @@ def _stamp_range() -> tuple[int | None, int | None]:
     return int(low), int(high)
 
 
-def _present_addresses(address_bytes: list[bytes]) -> set[bytes]:
-    if not address_bytes:
-        return set()
-    with connection.cursor() as cursor:
-        cursor.execute(
-            "SELECT safe_address FROM analytics_safenativebalance "
-            "WHERE safe_address = ANY(%s)",
-            [address_bytes],
-        )
-        return {bytes(row[0]) for row in cursor.fetchall()}
-
-
 class Command(BaseCommand):
     help = (
         "Fill analytics_safenativebalance for every Safe as of one fixed "
         "block, then write the `native_balance` watermark so the nightly "
-        "incremental task can take over. Runs inline (no Celery, no task "
-        "timeout) and resumes by default — a row in the table is a Safe "
-        "already done. --status reports progress without writing anything; "
-        "--restart empties the table and starts over."
+        "incremental task can take over. Runs INLINE by default (no Celery, "
+        "no task timeout) and resumes — a row in the table is a Safe already "
+        "done. --celery runs the same walk on the `contracts` queue instead, "
+        "one chunk in flight at a time, so the run outlives this shell; "
+        "--wait N follows it. --status reports progress (the table, plus the "
+        "most recent Celery run) without writing anything; --restart empties "
+        "the table and starts over."
     )
 
     def add_arguments(self, parser):
@@ -105,7 +101,46 @@ class Command(BaseCommand):
         parser.add_argument(
             "--status",
             action="store_true",
-            help="Print rollup progress and exit. Writes nothing.",
+            help=(
+                "Print rollup progress and exit. Writes nothing. Covers both "
+                "the table and the most recent --celery run."
+            ),
+        )
+        parser.add_argument(
+            "--celery",
+            action="store_true",
+            help=(
+                "Dispatch the walk to the `contracts` queue instead of "
+                "running it here: one chunk of --chunk-size Safes per task, "
+                "strictly one in flight, each dispatching the next. The run "
+                "survives this shell exiting. Safe under the task timeout "
+                "because a chunk is bounded work, unlike the 16 TVL shards "
+                "which each own an unbounded slice of history."
+            ),
+        )
+        parser.add_argument(
+            "--wait",
+            type=int,
+            default=0,
+            help=(
+                "--celery only: poll Redis for up to N seconds, printing "
+                "progress, then return. 0 (default) starts the run and "
+                "returns immediately; the run continues on the worker. Exits "
+                "non-zero if the run is still going when N elapses."
+            ),
+        )
+        parser.add_argument(
+            "--poll-interval",
+            type=int,
+            default=15,
+            help="--celery with --wait: seconds between polls (default 15).",
+        )
+        parser.add_argument(
+            "--run-id",
+            help=(
+                "--celery only: explicit run id (default: a timestamp plus a "
+                "random suffix). Shown in the output and accepted by --status."
+            ),
         )
         parser.add_argument(
             "--at-block",
@@ -128,7 +163,15 @@ class Command(BaseCommand):
             self._restart()
 
         head = self._resolve_head(options.get("at_block"))
-        self._run(head, options["chunk_size"])
+        if options["celery"]:
+            return self._run_celery(
+                head,
+                chunk_size=options["chunk_size"],
+                wait_seconds=options["wait"],
+                poll_interval=options["poll_interval"],
+                run_id=options.get("run_id"),
+            )
+        self._run_inline(head, options["chunk_size"])
 
     # ───────────────────────────── status ──────────────────────────────
 
@@ -164,6 +207,14 @@ class Command(BaseCommand):
                 f"(at {watermark.computed_at.isoformat()})"
             )
         self.stdout.write(f"Safe head right now           : {safe_head}")
+
+        run_id = latest_native_balance_run_id()
+        run = load_native_balance_run(run_id) if run_id else None
+        if run is None:
+            self.stdout.write("Celery run                    : none recorded")
+        else:
+            self.stdout.write("Most recent --celery run:")
+            self._print_run(run)
 
     # ──────────────────────────── restart ──────────────────────────────
 
@@ -248,7 +299,7 @@ class Command(BaseCommand):
 
     # ────────────────────────────── run ────────────────────────────────
 
-    def _run(self, head: int, chunk_size: int):
+    def _run_inline(self, head: int, chunk_size: int):
         total_safes = SafeContract.objects.count()
         started = time.time()
         seen = 0
@@ -268,32 +319,23 @@ class Command(BaseCommand):
                 address_bytes = [bytes.fromhex(addr[2:]) for addr in addresses]
                 seen += len(address_bytes)
 
-                present = _present_addresses(address_bytes)
-                todo = [addr for addr in address_bytes if addr not in present]
-                _seed_native_balances(todo, head)
-                seeded += len(todo)
+                computed, present = seed_missing_native_balances(address_bytes, head)
+                seeded += computed
 
                 self.stdout.write(
                     f"  [{seen}/{total_safes}] batch {chunk_index}: "
-                    f"{len(todo)} computed, {len(present)} already done, "
+                    f"{computed} computed, {present} already done, "
                     f"{time.time() - chunk_started:.1f}s"
                 )
                 self.stdout.flush()
 
-        existing = AnalyticsWatermark.objects.filter(
-            name=NATIVE_BALANCE_WATERMARK
-        ).first()
-        if existing is None:
-            AnalyticsWatermark.objects.create(
-                name=NATIVE_BALANCE_WATERMARK,
-                block_number=head,
-                computed_at=timezone.now(),
-            )
+        if write_native_balance_watermark(head):
             self.stdout.write(self.style.SUCCESS(f"Watermark set to {head}."))
         else:
             # Top-up of an already-handed-over rollup: the watermark is the
             # incremental task's, and moving it here would skip every block
             # between it and `head` for the Safes this run did not touch.
+            existing = AnalyticsWatermark.objects.get(name=NATIVE_BALANCE_WATERMARK)
             self.stdout.write(f"Watermark left at {existing.block_number}.")
 
         self.stdout.write(
@@ -306,3 +348,69 @@ class Command(BaseCommand):
                 f"tasks import compute_native_balance_rollup_task as t; t.delay()'`."
             )
         )
+
+    # ─────────────────────────── celery ────────────────────────────────
+
+    def _run_celery(
+        self,
+        head: int,
+        chunk_size: int,
+        wait_seconds: int,
+        poll_interval: int,
+        run_id: str | None,
+    ):
+        """Start a chunked run on the `contracts` queue and optionally watch it.
+
+        Each chunk dispatches its own successor, so exactly one is ever in
+        flight and the cap does not depend on the worker pool size or on
+        this process staying alive. Progress lives in the same two places
+        as the inline mode: the rollup table (what is done) and, for the
+        run itself, a Redis manifest (where the cursor is).
+        """
+        total_safes = SafeContract.objects.count()
+        run = start_native_balance_backfill_run(
+            head, chunk_size, total_safes, run_id=run_id
+        )
+        self.stdout.write(
+            f"Started run {run['run_id']} on the `contracts` queue: "
+            f"{total_safes} Safes as of block {head}, {chunk_size} per chunk."
+        )
+        self.stdout.write("Follow it with: manage.py backfill_native_balances --status")
+
+        if not wait_seconds:
+            return
+
+        deadline = time.time() + wait_seconds
+        while time.time() < deadline:
+            run = load_native_balance_run(run["run_id"]) or run
+            self._print_run(run)
+            if run.get("state") != "running":
+                return
+            time.sleep(min(poll_interval, max(deadline - time.time(), 0)))
+
+        run = load_native_balance_run(run["run_id"]) or run
+        if run.get("state") == "running":
+            raise CommandError(
+                f"Run {run['run_id']} is still going after {wait_seconds}s. "
+                f"It keeps running on the worker — check with --status."
+            )
+
+    def _print_run(self, run: dict) -> None:
+        seen = run.get("safes_seen", 0)
+        total = run.get("total_safes_at_start") or 0
+        pct = f"{100 * seen / total:.1f}%" if total else "?"
+        line = (
+            f"  run {run['run_id']} [{run.get('state')}] "
+            f"chunks={run.get('chunks_done', 0)} "
+            f"seen={seen}/{total} ({pct}) "
+            f"seeded={run.get('safes_seeded', 0)} "
+            f"present={run.get('safes_already_present', 0)} "
+            f"head={run.get('head')}"
+        )
+        if run.get("state") == "failed":
+            self.stderr.write(self.style.ERROR(line))
+            self.stderr.write(self.style.ERROR(f"  error: {run.get('error')}"))
+        elif run.get("state") == "finished":
+            self.stdout.write(self.style.SUCCESS(line))
+        else:
+            self.stdout.write(line)

@@ -1050,6 +1050,79 @@ def native_balance_head_block() -> int | None:
     return head
 
 
+_SAFE_ADDRESSES_PAGE_SQL = """
+SELECT address FROM history_safecontract
+WHERE address > %s
+ORDER BY address
+LIMIT %s
+"""
+
+_SAFE_ADDRESSES_FIRST_PAGE_SQL = """
+SELECT address FROM history_safecontract
+ORDER BY address
+LIMIT %s
+"""
+
+
+def safe_addresses_after(after: bytes | None, limit: int) -> list[bytes]:
+    """One keyset page of ``SafeContract.address``, in PK order.
+
+    The single-page form of ``_iter_safe_addresses_keyset``, for the chunked
+    Celery backfill: each chunk is its own task, so the walk has to be
+    resumable from a cursor carried in the run manifest rather than from a
+    generator living in one process.
+
+    Returns address bytes, so the caller can hand them straight to
+    ``_seed_native_balances`` without a hex round-trip.
+    """
+    with connection.cursor() as cursor:
+        if after is None:
+            cursor.execute(_SAFE_ADDRESSES_FIRST_PAGE_SQL, [limit])
+        else:
+            cursor.execute(_SAFE_ADDRESSES_PAGE_SQL, [after, limit])
+        return [bytes(row[0]) for row in cursor.fetchall()]
+
+
+def seed_missing_native_balances(
+    address_bytes: list[bytes], upto_block: int
+) -> tuple[int, int]:
+    """Seed only the addresses that have no rollup row yet.
+
+    Returns ``(seeded, already_present)``. Shared by the inline command and
+    the chunked Celery task so "resume" means the same thing in both.
+    """
+    if not address_bytes:
+        return 0, 0
+    with connection.cursor() as cursor:
+        cursor.execute(
+            "SELECT safe_address FROM analytics_safenativebalance "
+            "WHERE safe_address = ANY(%s)",
+            [address_bytes],
+        )
+        present = {bytes(row[0]) for row in cursor.fetchall()}
+    todo = [addr for addr in address_bytes if addr not in present]
+    _seed_native_balances(todo, upto_block)
+    return len(todo), len(present)
+
+
+def write_native_balance_watermark(head: int) -> bool:
+    """Hand the rollup over to the incremental task at ``head``.
+
+    No-op when a watermark already exists: that one belongs to the
+    incremental task, and moving it forward here would skip every block
+    between it and ``head`` for the Safes this run did not touch. Returns
+    whether it wrote.
+    """
+    if AnalyticsWatermark.objects.filter(name=NATIVE_BALANCE_WATERMARK).exists():
+        return False
+    AnalyticsWatermark.objects.create(
+        name=NATIVE_BALANCE_WATERMARK,
+        block_number=head,
+        computed_at=timezone.now(),
+    )
+    return True
+
+
 def _unseeded_safe_addresses(limit: int) -> list[bytes] | None:
     """Address bytes of Safes with no ``SafeNativeBalance`` row, at most
     ``limit`` of them. ``None`` means there are more than ``limit`` — see

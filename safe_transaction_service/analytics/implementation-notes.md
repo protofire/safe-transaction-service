@@ -1411,6 +1411,66 @@ rather than a guarantee (both are fire-and-forget dispatches) and does
 not need to be one — a TVL run that overtakes the rollup publishes
 yesterday's native side and the next run catches up.
 
+## `--celery`: the same walk, driven from the worker
+
+Inline stays the default. `--celery` was added because a run over a
+250k-Safe chain outlives the shell that starts it, and `nohup` is a weaker
+answer than "it is on the queue".
+
+**Why this is safe under `task_timeout` when the 16 TVL shards are not.**
+That is the obvious objection, since the timeout is the whole reason this
+branch exists. The difference is the unit of work. A TVL shard owns 1/16 of
+the address space and sums its *entire history* — ~29k addresses on
+Ethereum, unbounded in the chain's age, and it does not finish in 900 s. A
+backfill chunk owns 5000 addresses, which is the batch size
+`BALANCE_BATCH_SQL` was measured at: seconds. The shard's work grows with
+the chain, the chunk's does not. Shrink `--chunk-size` if a chain ever
+proves otherwise.
+
+**Not a chord, unlike `backfill_daily_metrics`.** The dates of a daily
+backfill are known up front, so it can build a manifest listing every
+chunk and fan each one out as a `group`. The native-balance walk is a
+keyset cursor over `history_safecontract.address` — chunk *n+1*'s starting
+address is not known until chunk *n* has run. So each task dispatches its
+own successor, and the manifest carries a cursor plus a running aggregate
+instead of a precomputed chunk list. One chunk is in flight at any time,
+which is the same concurrency guarantee the daily backfill gets from its
+chord chaining, reached more simply.
+
+**The cursor lives in Redis, not in the task signature.** `(run_id)` is
+the whole signature. Putting the address in the arguments would have been
+simpler, but then a lost message is unrecoverable — you cannot re-dispatch
+a chunk you cannot describe. Reading the cursor from the manifest means
+any chunk can be re-dispatched by run id alone.
+
+**Manifest writes happen before `apply_async`, never after.** Under eager
+mode the entire remaining chain executes inside that call, so a write
+afterwards would clobber newer state with a stale copy. Exactly the lesson
+already recorded on `_dispatch_backfill_chunk`.
+
+**A failing chunk stops the chain rather than raising.** The manifest gets
+`state="failed"` and the message, `--status` shows it, and re-running
+resumes — rows already written are skipped, so the cost of a retry is one
+index probe per finished Safe. Raising would have produced a retry storm
+against a database that is, by hypothesis, already unhappy.
+
+**A closed run ignores further chunks.** `backfill_native_balance_chunk`
+returns immediately when `state != "running"`. This is the one way a
+duplicated or late-redelivered message could corrupt a run — by re-walking
+from a cursor that has already moved — and
+`test_chunk_task_is_inert_once_the_run_is_closed` pins it.
+
+Both modes now share `seed_missing_native_balances` and
+`write_native_balance_watermark`, so "resume" and "do not move a watermark
+that is not mine" mean the same thing in each. The watermark rules from
+`_resolve_head` are unchanged and still enforced by the command before
+either mode starts — `--celery` does not get its own head resolution.
+
+`--status` reports both halves: the table (what is done) and the most
+recent run manifest (where the cursor is). They can disagree legitimately —
+a finished run plus later rows from the nightly seed step — and that is
+why they are printed separately rather than reconciled.
+
 ## Drift check: observability first, no self-healing
 
 `check_native_balance_drift_task`, Sundays 05:00. Samples 2000 random
@@ -1480,6 +1540,10 @@ Grouped by the failure each class defends against:
 - `TestTvlReadsTheRollup` — the payload keeps every pre-existing key,
   gains the two new ones, and produces the same native numbers as the
   shard path it replaces.
+- `TestChunkedCeleryBackfill` — `--celery` lands on the same rows, the
+  same stamps and the same watermark as inline; the manifest accounts
+  for every Safe; a failing chunk stops the chain and writes no
+  watermark; a closed run ignores a redelivered chunk.
 - `TestDriftCheck` — clean rollup is quiet, a corrupted row is reported
   with its magnitude, above-watermark activity is not drift, and an
   orphan row is reported.

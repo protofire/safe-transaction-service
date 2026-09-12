@@ -11,6 +11,11 @@ Two independent fan-outs live here:
    ``backfill_done``) — one Celery task per UTC day for the
    ``backfill_daily_metrics`` management command, fanned out one chunk at
    a time: the chord callback of chunk *n* dispatches chunk *n+1*.
+3. **Native-balance backfill** (``backfill_native_balance_chunk``) — the
+   optional ``--celery`` mode of ``backfill_native_balances``. Not a chord:
+   the walk is a keyset cursor over Safe addresses, so each chunk
+   dispatches its own successor and the manifest carries a cursor rather
+   than a precomputed chunk list.
 
 Both shapes use the celery primitives `group` / `chord`; both are eager-mode
 safe so they run inline during tests without a broker.
@@ -395,6 +400,205 @@ def dispatch_tvl_chord() -> None:
         reduce_native_balance_shards.s() | finalize_tvl_snapshot.s(),
     )
     job.apply_async(queue="contracts")
+
+
+# ───────────── Native-balance backfill, chunked on Celery ──────────────
+#
+# The inline `manage.py backfill_native_balances` is still the default and
+# still the one with no task timeout over it. This is the same walk driven
+# from the worker instead, for when the run should outlive the shell that
+# started it.
+#
+# Shape: one chunk of `chunk_size` Safe addresses per task, strictly one in
+# flight, each task dispatching its own successor. Not a chord — the walk
+# is a keyset cursor, so chunk N+1's starting address is not known until
+# chunk N has run. That also means the manifest cannot enumerate its chunks
+# up front the way `build_backfill_run` does for dates; it carries a cursor
+# and a running aggregate instead.
+#
+# Why this is safe under `task_timeout(LOCK_TIMEOUT)` when the 16 TVL
+# shards are not: a shard owns ~1/16 of the address space (~29k addresses
+# of full history on Ethereum) and cannot finish in 900 s. A chunk owns
+# 5000 addresses, which is the batch size the balance SQL was measured at —
+# seconds, not minutes. The unit of work is bounded here and unbounded
+# there.
+
+NATIVE_BALANCE_RUN_KEY_PREFIX = "analytics_native_balance_run:"
+NATIVE_BALANCE_CURSOR_KEY = "analytics_native_balance_cursor"
+
+
+def native_balance_run_key(run_id: str) -> str:
+    return f"{NATIVE_BALANCE_RUN_KEY_PREFIX}{run_id}"
+
+
+def load_native_balance_run(run_id: str) -> dict | None:
+    """Return the run manifest for ``run_id``, or ``None`` if unknown/expired."""
+    return _redis_get_json(native_balance_run_key(run_id))
+
+
+def latest_native_balance_run_id() -> str | None:
+    pointer = _redis_get_json(NATIVE_BALANCE_CURSOR_KEY)
+    if pointer and isinstance(pointer.get("run_id"), str):
+        return pointer["run_id"]
+    return None
+
+
+def build_native_balance_run(
+    head: int, chunk_size: int, total_safes: int, run_id: str | None = None
+) -> dict:
+    """Pure helper: a fresh manifest. Nothing is written or dispatched.
+
+    `total_safes` is only for the progress line — the fleet grows during a
+    long run, so it is a denominator, not a target.
+    """
+    run_id = run_id or new_backfill_run_id()
+    return {
+        "run_id": run_id,
+        "run_key": native_balance_run_key(run_id),
+        "head": int(head),
+        "chunk_size": int(chunk_size),
+        "total_safes_at_start": int(total_safes),
+        "started_at": timezone.now().isoformat(),
+        "finished_at": None,
+        "state": "running",
+        "error": None,
+        # Hex of the last address the walk consumed; None = start from the
+        # beginning. Carried in Redis rather than in the task signature so a
+        # lost message is recoverable by re-dispatching from the manifest.
+        "cursor": None,
+        "chunks_done": 0,
+        "safes_seen": 0,
+        "safes_seeded": 0,
+        "safes_already_present": 0,
+        "watermark_written": False,
+    }
+
+
+def _save_native_balance_run(run: dict) -> None:
+    _redis_set_json(run["run_key"], run)
+
+
+@app.shared_task()
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def backfill_native_balance_chunk(run_id: str) -> dict:
+    """One chunk of the native-balance backfill, then dispatch the next.
+
+    Reads its own starting cursor from the run manifest, so the task
+    signature stays `(run_id)` and a chunk can always be re-dispatched from
+    Redis after a lost message. Exactly one chunk of a run is ever in
+    flight, so the manifest has a single writer and needs no CAS.
+
+    Failure stops the chain rather than raising into a retry storm: the
+    manifest records `state="failed"` with the message, `--status` shows it,
+    and re-running the command resumes (rows already written are skipped).
+    """
+    from safe_transaction_service.analytics.tasks import (
+        safe_addresses_after,
+        seed_missing_native_balances,
+        write_native_balance_watermark,
+    )
+
+    run = load_native_balance_run(run_id)
+    if run is None:
+        logger.warning(
+            "native_balance.backfill: run=%s manifest is gone (expired or "
+            "flushed); stopping the chain",
+            run_id,
+        )
+        return {"run_id": run_id, "state": "unknown"}
+    if run.get("state") != "running":
+        logger.info(
+            "native_balance.backfill: run=%s is %s, not dispatching further chunks",
+            run_id,
+            run.get("state"),
+        )
+        return run
+
+    started = time.time()
+    cursor_hex = run.get("cursor")
+    after = bytes.fromhex(cursor_hex) if cursor_hex else None
+
+    try:
+        with relaxed_statement_timeout():
+            addresses = safe_addresses_after(after, run["chunk_size"])
+            if not addresses:
+                # Walked off the end: hand the rollup over and close the run.
+                wrote = write_native_balance_watermark(run["head"])
+                run["watermark_written"] = wrote
+                run["state"] = "finished"
+                run["finished_at"] = timezone.now().isoformat()
+                _save_native_balance_run(run)
+                logger.info(
+                    "native_balance.backfill: run=%s finished chunks=%d "
+                    "seen=%d seeded=%d already_present=%d watermark=%s",
+                    run_id,
+                    run["chunks_done"],
+                    run["safes_seen"],
+                    run["safes_seeded"],
+                    run["safes_already_present"],
+                    run["head"] if wrote else "left as it was",
+                )
+                return run
+
+            seeded, present = seed_missing_native_balances(addresses, run["head"])
+    except Exception as exc:
+        logger.exception(
+            "native_balance.backfill: run=%s chunk %d failed after %.2fs",
+            run_id,
+            run["chunks_done"] + 1,
+            time.time() - started,
+        )
+        run["state"] = "failed"
+        run["error"] = str(exc)[:500]
+        run["finished_at"] = timezone.now().isoformat()
+        _save_native_balance_run(run)
+        return run
+
+    run["cursor"] = addresses[-1].hex()
+    run["chunks_done"] += 1
+    run["safes_seen"] += len(addresses)
+    run["safes_seeded"] += seeded
+    run["safes_already_present"] += present
+    # Persisted BEFORE the dispatch below and never after it: under eager
+    # mode the whole remaining chain runs inside `apply_async`, so a write
+    # afterwards would clobber newer state with this stale copy. Same
+    # lesson as `_dispatch_backfill_chunk`.
+    _save_native_balance_run(run)
+
+    logger.info(
+        "native_balance.backfill: run=%s chunk %d done in %.2fs seen=%d/%d "
+        "seeded=%d present=%d",
+        run_id,
+        run["chunks_done"],
+        time.time() - started,
+        run["safes_seen"],
+        run["total_safes_at_start"],
+        seeded,
+        present,
+    )
+    backfill_native_balance_chunk.apply_async((run_id,), queue="contracts")
+    return run
+
+
+def start_native_balance_backfill_run(
+    head: int, chunk_size: int, total_safes: int, run_id: str | None = None
+) -> dict:
+    """Persist a new manifest, point the cursor key at it and dispatch the
+    first chunk. Later chunks dispatch themselves on the worker, so the
+    caller may exit immediately.
+    """
+    run = build_native_balance_run(head, chunk_size, total_safes, run_id=run_id)
+    _save_native_balance_run(run)
+    _redis_set_json(
+        NATIVE_BALANCE_CURSOR_KEY,
+        {
+            "run_id": run["run_id"],
+            "run_key": run["run_key"],
+            "started_at": run["started_at"],
+        },
+    )
+    backfill_native_balance_chunk.apply_async((run["run_id"],), queue="contracts")
+    return load_native_balance_run(run["run_id"]) or run
 
 
 # ────────────────────── Backfill sharding ──────────────────────────────
