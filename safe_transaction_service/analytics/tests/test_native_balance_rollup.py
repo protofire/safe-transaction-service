@@ -41,7 +41,7 @@ from safe_transaction_service.analytics.tasks import (
     run_native_balance_rollup,
 )
 from safe_transaction_service.analytics.tasks_shards import HEX_PREFIXES
-from safe_transaction_service.history.models import EthereumTxCallType
+from safe_transaction_service.history.models import EthereumTxCallType, SafeContract
 from safe_transaction_service.history.tests.factories import (
     EthereumBlockFactory,
     EthereumTxFactory,
@@ -288,6 +288,45 @@ class TestSafeIndexedMidWindow(NativeBalanceRollupTestCase):
         self.assertEqual(
             SafeNativeBalance.objects.get(safe_address=latecomer_address).balance_wei,
             Decimal(47),
+        )
+        self.assertEqual(self.totals(), _calculate_native_balances_from_db())
+
+    def test_the_delta_never_creates_a_row(self):
+        """A Safe the indexer writes into `history_safecontract` between
+        the seed query and the delta must not get a row from the delta —
+        it would hold only `(W, head]` and never be seeded again, losing
+        everything below the watermark permanently. Skipping it this run
+        and seeding it on the next one is the correct outcome.
+        """
+        self.initialise()
+        self.safe()
+        self.advance_head()
+        run_native_balance_rollup()
+
+        latecomer = self.safe(block=self.block())
+        funding = self.block()
+        self.transfer(funding, 800, to=latecomer.address)
+        self.advance_head()
+
+        # Stand in for the race: the Safe exists by the time the delta
+        # runs, but was not in the seed step's result set.
+        with patch(
+            "safe_transaction_service.analytics.tasks._unseeded_safe_addresses",
+            return_value=[],
+        ):
+            run_native_balance_rollup()
+
+        self.assertFalse(
+            SafeNativeBalance.objects.filter(safe_address=latecomer.address).exists()
+        )
+
+        # Next run seeds it, bounded at a watermark that now covers the
+        # funding block — so nothing was lost.
+        self.advance_head()
+        run_native_balance_rollup()
+        self.assertEqual(
+            SafeNativeBalance.objects.get(safe_address=latecomer.address).balance_wei,
+            Decimal(800),
         )
         self.assertEqual(self.totals(), _calculate_native_balances_from_db())
 
@@ -819,3 +858,28 @@ class TestDriftCheck(NativeBalanceRollupTestCase):
         call_command("backfill_native_balances", stdout=StringIO())
 
         self.assertEqual(check_native_balance_drift_task.delay().get()["mismatched"], 0)
+
+    def test_orphan_rows_are_reported(self):
+        """A reorg that removes a Safe creation cascades the
+        `history_safecontract` row away and leaves the rollup row behind,
+        still contributing its balance."""
+        safe = self.safe()
+        self.transfer(self.block(), 600, to=safe.address)
+        self.advance_head()
+        call_command("backfill_native_balances", stdout=StringIO())
+
+        SafeContract.objects.filter(address=safe.address).delete()
+
+        with self.assertLogs(
+            "safe_transaction_service.analytics.tasks", level="WARNING"
+        ) as logs:
+            summary = check_native_balance_drift()
+
+        self.assertEqual(summary["orphan_rows"], 1)
+        self.assertIn("no Safe in history_safecontract", logs.output[0])
+
+    def test_no_orphans_on_a_healthy_rollup(self):
+        self.safe()
+        self.advance_head()
+        call_command("backfill_native_balances", stdout=StringIO())
+        self.assertEqual(check_native_balance_drift()["orphan_rows"], 0)

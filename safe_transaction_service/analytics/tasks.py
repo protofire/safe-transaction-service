@@ -946,13 +946,24 @@ LIMIT %s
 # `_METRIC_CORE_MULTISIG_COUNT_SUM_SQL` below: anchor on `etx.block_id`
 # so the block window prunes `etx` before the join.
 #
-# The `EXISTS` against `history_safecontract` sits after the aggregate
-# so it probes the Safe PK once per distinct counterparty rather than
-# once per transfer row; `IN (SELECT address FROM history_safecontract)`
-# would materialise ~460k rows on Ethereum.
+# An UPDATE, not an upsert, and that is load-bearing: **the delta must
+# never create a row**. The seed owns row creation, because only the seed
+# knows to compute the balance below the watermark first. If the delta
+# could insert, a Safe the indexer writes into `history_safecontract`
+# between this run's seed query and this statement would get a row
+# holding only `(W, head]` — missing its entire history below W, and
+# never seeded again, because a row now exists. A silent, permanent
+# undercount. Restricting to rows that already exist means such a Safe
+# is simply skipped this run and seeded correctly by the next one.
+#
+# The join against the rollup also carries the "is it a Safe" filter for
+# free: rows only ever come from the seed, which selects from
+# `history_safecontract`. It probes the rollup PK once per distinct
+# counterparty rather than once per transfer row.
 _NATIVE_BALANCE_DELTA_SQL = """
-INSERT INTO analytics_safenativebalance (safe_address, balance_wei, updated_to_block)
-SELECT d.addr, d.delta, %(head)s
+UPDATE analytics_safenativebalance b
+SET balance_wei = b.balance_wei + d.delta,
+    updated_to_block = %(head)s
 FROM (
     SELECT addr, SUM(signed_value) AS delta
     FROM (
@@ -972,12 +983,7 @@ FROM (
     ) flows
     GROUP BY addr
 ) d
-WHERE EXISTS (
-    SELECT 1 FROM history_safecontract sc WHERE sc.address = d.addr
-)
-ON CONFLICT (safe_address) DO UPDATE
-SET balance_wei = analytics_safenativebalance.balance_wei + EXCLUDED.balance_wei,
-    updated_to_block = EXCLUDED.updated_to_block
+WHERE b.safe_address = d.addr
 """
 
 # Read side. Clamps negatives to zero in the SUM and excludes them from
@@ -1088,7 +1094,12 @@ def _seed_native_balances(address_bytes: list[bytes], upto_block: int) -> int:
 
 def _apply_native_balance_delta(watermark: int, head: int) -> int:
     """Apply the net native flow of ``(watermark, head]`` to the rollup.
-    Returns the number of Safe rows the statement wrote.
+    Returns the number of Safe rows the statement updated.
+
+    Only ever updates rows that already exist — see the SQL's comment.
+    A Safe with flow in this window but no rollup row yet is left for the
+    next run's seed step, which is the only step that knows to compute
+    its balance below the watermark first.
     """
     with connection.cursor() as cursor:
         cursor.execute(
@@ -1254,6 +1265,23 @@ ORDER BY random()
 LIMIT %s
 """
 
+# Rollup rows whose Safe no longer exists. `SafeContract.ethereum_tx` is
+# `on_delete=CASCADE` from `EthereumTx`, which cascades from
+# `EthereumBlock` — so `recover_from_reorg` deletes Safes as well as
+# transfers, and a rollup row for one of them keeps contributing its
+# (real, confirmed-block) balance to a Safe that is no longer a Safe.
+# Rare: it needs a reorg that removes a Safe creation while leaving the
+# funding below the confirmation zone intact. Counted rather than
+# deleted, for the same reason the balance drift is only reported —
+# until one is seen in the wild, "delete it" is a guess.
+_NATIVE_BALANCE_ORPHANS_SQL = """
+SELECT COUNT(*)
+FROM analytics_safenativebalance b
+WHERE NOT EXISTS (
+    SELECT 1 FROM history_safecontract sc WHERE sc.address = b.safe_address
+)
+"""
+
 
 def check_native_balance_drift(
     sample_size: int = NATIVE_BALANCE_DRIFT_SAMPLE_SIZE,
@@ -1310,6 +1338,10 @@ def check_native_balance_drift(
         )
         return None
 
+    with connection.cursor() as cursor:
+        cursor.execute(_NATIVE_BALANCE_ORPHANS_SQL)
+        orphans = int(cursor.fetchone()[0] or 0)
+
     mismatches = []
     total_abs_diff = Decimal(0)
     for address, stored in sample.items():
@@ -1327,8 +1359,19 @@ def check_native_balance_drift(
         "max_abs_diff_wei": (
             int(max(abs(d) for *_, d in mismatches)) if mismatches else 0
         ),
+        "orphan_rows": orphans,
         "elapsed": round(time.time() - started, 2),
     }
+
+    if orphans:
+        logger.warning(
+            "native_balance.drift: %d rollup rows have no Safe in "
+            "history_safecontract. A reorg that removed a Safe creation "
+            "leaves the row behind, still contributing its balance to the "
+            "totals. Rebuild with `manage.py backfill_native_balances "
+            "--restart` to drop them.",
+            orphans,
+        )
 
     if mismatches:
         worst = sorted(mismatches, key=lambda row: abs(row[3]), reverse=True)[:5]
