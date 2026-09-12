@@ -947,6 +947,25 @@ LIMIT %s
 # `_METRIC_CORE_MULTISIG_COUNT_SUM_SQL` below: anchor on `etx.block_id`
 # so the block window prunes `etx` before the join.
 #
+# **The `LATERAL` is load-bearing, not a stylistic choice.** Written as a
+# plain `JOIN … ON it.ethereum_tx_id = etx.tx_hash`, PostgreSQL picks a
+# hash join and scans the whole of `history_internaltx` as the probe
+# side, which on Ethereum is 53M rows — every night, for a window of one
+# day. Measured on the Ethereum production database, 2026-09-12:
+#
+#   plain JOIN     Parallel Hash Join + Parallel Seq Scan, cost 19.1M
+#   + seqscan off  Parallel Hash Join + Bitmap Heap Scan, cost 22.4M
+#   LATERAL        Nested Loop + Index Scan on ethereum_tx_id,
+#                  1601 ms for 720 blocks (~15 s for a day)
+#
+# The index it needs (`history_internaltx_ethereum_tx_id_e6ac35ab`)
+# exists and always did — the planner simply refuses to use it here,
+# because it estimates 621 internal transactions per Ethereum
+# transaction where the real number is 5. A 124x cardinality error makes
+# the nested loop look five times more expensive than the table scan.
+# `LATERAL` does not argue with that estimate; it removes the choice, so
+# the estimate stops mattering. Do not "simplify" this back into a JOIN.
+#
 # An UPDATE, not an upsert, and that is load-bearing: **the delta must
 # never create a row**. The seed owns row creation, because only the seed
 # knows to compute the balance below the watermark first. If the delta
@@ -966,23 +985,23 @@ UPDATE analytics_safenativebalance b
 SET balance_wei = b.balance_wei + d.delta,
     updated_to_block = %(head)s
 FROM (
-    SELECT addr, SUM(signed_value) AS delta
-    FROM (
+    SELECT flows.addr AS addr, SUM(flows.signed_value) AS delta
+    FROM history_ethereumtx etx
+    CROSS JOIN LATERAL (
         SELECT it."to" AS addr, it.value AS signed_value
-        FROM history_ethereumtx etx
-        JOIN history_internaltx it ON it.ethereum_tx_id = etx.tx_hash
-        WHERE etx.block_id > %(watermark)s AND etx.block_id <= %(head)s
+        FROM history_internaltx it
+        WHERE it.ethereum_tx_id = etx.tx_hash
           AND it.call_type = 0 AND it.value > 0 AND it.error IS NULL
           AND it."to" IS NOT NULL
         UNION ALL
         SELECT it."_from" AS addr, -it.value AS signed_value
-        FROM history_ethereumtx etx
-        JOIN history_internaltx it ON it.ethereum_tx_id = etx.tx_hash
-        WHERE etx.block_id > %(watermark)s AND etx.block_id <= %(head)s
+        FROM history_internaltx it
+        WHERE it.ethereum_tx_id = etx.tx_hash
           AND it.call_type = 0 AND it.value > 0 AND it.error IS NULL
           AND it."_from" IS NOT NULL
     ) flows
-    GROUP BY addr
+    WHERE etx.block_id > %(watermark)s AND etx.block_id <= %(head)s
+    GROUP BY flows.addr
 ) d
 WHERE b.safe_address = d.addr
 """
