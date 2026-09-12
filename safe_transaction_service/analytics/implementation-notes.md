@@ -1488,3 +1488,184 @@ The reference in the equality assertions is
 `_calculate_native_balances_from_db`, which is what `TestNativeBalanceShards`
 verified the chord against — so "incremental == sequential == chord"
 closes transitively.
+
+---
+
+# Part 9 — `breakdown=day` on `/token-volume/`
+
+The fourth endpoint to grow the opt-in parameter, and the first where the
+series is nested rather than flat. It exists so the hub's "Top 10 ERC20
+tokens" card can carry a real range (7d / 30d / 90d / custom) instead of
+the hardwired 30-day window it shows today: the producer hands over
+per-day rows, the hub sums whichever days its range covers.
+
+## This reverses decision Q20, on purpose
+
+`phase-b-data-gaps.md` §4.5 says, in as many words, "`/token-volume/`
+gets **no** `breakdown` parameter. It stays a top-tokens list without a
+time series (owner decision, Q20)". That decision is now superseded — the
+card needs a range and there is no other source for one — and the spec
+row should be read as history, not as current contract.
+
+It was the right call at the time for the reason Q20 gives: the ERC20
+*daily* series comes from `/tx-volume/`'s `erc20_transfers` column, so
+nothing needed per-day token rows. What changed is that a *per-token*
+range breakdown was asked for, and `DailyMetric.erc20_transfers` is a
+single number per day with no token dimension.
+
+The consumer-side guard `test_the_probe_is_sent_on_exactly_three_reads`
+(hub, `tests/test_tx_collector_new_endpoints.py`) asserts the old
+decision and will fail the moment the hub starts probing this endpoint.
+That is the hub PR's job, not this one's; it is named here so the failure
+reads as expected rather than as a surprise.
+
+## Why this endpoint can have a breakdown at all
+
+`transfer_count` is an **additive** count. `DailyTokenVolume` is unique
+per `(date, token_address)` and a window read is already a plain `SUM`
+over the day rows (`_token_volume_from_rollup`), so exposing those rows
+lets a consumer re-aggregate over any sub-range and get the same answer
+the producer would.
+
+This is exactly what contract invariant 3 forbids for the T9 series: the
+active-\* rollups are per-day `COUNT(DISTINCT …)` and summing them is
+wrong. The distinction is the whole reason the hub-side plan works, and
+it is worth restating whenever a fourth breakdown is proposed — the
+question to ask is not "does the rollup have day rows" but "is the
+column additive".
+
+## The per-day cap is the one real design decision
+
+An uncapped series is not shippable. The rollup holds a row per
+`(date, token)` and a busy chain has thousands of tokens a day, so a
+90-day response would be tens of thousands of entries.
+
+So each day carries its **own** top-N, N = `TOP_TOKENS_LIMIT` = 20, and
+the payload says so in `days_token_cap`.
+
+Sizing, since it is the argument for 20 rather than 10 or 50. A day's
+token entry is ~140 bytes of JSON, so a 90-day series costs ~250 KB at
+20, ~630 KB at 50, ~125 KB at 10. The hub polls ~111 staging deployments
+a cycle, i.e. ~28 MB a cycle at 20 against ~70 MB at 50. The hub renders
+a top-10, so 20 is twice the depth it draws — headroom for a token that
+ranks 11th on some days and 6th on others — without spending the cycle on
+tokens nothing displays.
+
+**The consequence, stated because it must not be discovered later.**
+Summing the series is exact for a token that makes its day's top-20 and
+**understates** one that never does: the perpetual 21st, busy every day
+and listed on none. The error is one-directional — the series can miss
+volume, never invent it — so a range ranking built from it is right at
+the head and thins out in the tail. For the hub's top-10 this is
+invisible. For anything that wants a *total*, the scalar
+`total_erc20_transfers` beside the series is the uncapped number and is
+what should be used.
+
+`days_token_cap` ships on every `breakdown=day` response including a cold
+one, so the key set does not depend on whether there were rows and the
+cap is never inferred from `len(tokens)` — which would read a quiet day
+as a shallow one.
+
+## The cap is applied in SQL, and the tie-break is load-bearing
+
+`ROW_NUMBER() OVER (PARTITION BY date ORDER BY transfer_count DESC,
+token_address ASC)` filtered to `<= cap` (Django `Window` + `RowNumber`,
+filterable since 4.2). The point is that the capped-out rows are never
+*fetched*, not merely never serialised — capping in Python would still
+drag 450k rows out of Postgres on a 90-day read of a busy chain to emit
+1800.
+
+`token_address ASC` is not decoration. Without a tie-break, which token
+survives a tie at the cap boundary is whatever the planner returned
+first, and a consumer diffing two cycles would see tokens appear and
+vanish with no underlying change.
+`test_a_tie_at_the_cap_boundary_is_broken_by_address` pins it.
+
+## `window_end` is **today**, same as the active-\* pair
+
+This read is `date__gte=since` with no upper bound, so the window
+includes a partial current UTC day and the bounds say so —
+`since … today`, not `since … yesterday`. Part 6 made the same call for
+`/active-safes/` and `/active-owners/` for the same reason: reporting
+yesterday for consistency with `/tx-volume/` would be a lie about which
+days the series can contain, and `test_breakdown_day_series_shape` seeds
+a row dated today to pin that the current day really is served.
+
+This is the asymmetry the workspace contract's endpoint table records,
+and the reason a `token-volume` 30d total is not comparable to a
+`tx-volume` 30d total. Realigning it stays out of scope.
+
+## One `since`, computed once, passed down
+
+`_token_volume_rollup_queryset(since)` is now the single filter both
+halves read, and `_token_volume_from_rollup` takes `since` from the
+caller instead of deriving its own `timezone.now().date()`.
+
+That is not tidying. With two derivations, a request that crosses UTC
+midnight between them would aggregate one span and report the bounds of
+another — a once-a-day off-by-one that would be invisible in tests and
+unexplainable in production.
+
+## The cold path serves a scalar and an empty series
+
+Unlike `/tx-volume/`, this endpoint has a live `ERC20Transfer` fallback,
+so "cold rollup" here does **not** mean an empty payload. The scalar half
+is served live and `days` is `[]`.
+
+That combination is the honest one: an empty `days` is a statement about
+the rollup, never about activity.
+`test_breakdown_day_on_cold_rollup_returns_empty_days` seeds live
+transfers precisely so the two halves disagree, and asserts both.
+
+One nuance worth recording: on that path the scalar comes from
+`timestamp__gte=now - N days`, whose lower edge is the current time of
+day rather than midnight, while `window_start` reports `today - N`. The
+bounds describe the *requested* window, and with `days` empty there is no
+series for them to disagree with — but a consumer that one day starts
+reading `window_start` as the scalar's true lower bound should know it is
+not one on this path.
+
+## Shape: `{date, tokens: [...]}`, and the token is a `top_tokens` entry
+
+Day entries are keyed `date` (ISO `YYYY-MM-DD`), matching T8/T9 and
+unlike `/safe-creations/`'s `period`. Each day's `tokens` entry carries
+the same four keys as a scalar `top_tokens` entry — `address`, `symbol`,
+`transfer_count`, `total_value` — so a consumer parses one shape in both
+halves of the payload.
+
+`symbol` is resolved in **one** `IN (...)` over every address in the
+whole response (`get_token_symbols`, Part 4), not per day. Unknown is
+`null`, never the address, same contract as everywhere else.
+
+A day absent from the rollup is absent from `days`, never zero-filled: a
+gap means "not computed", not "no transfers".
+
+## `TOP_TOKENS_LIMIT` replaces three literals
+
+The scalar `top_tokens` slice on both read paths and the new per-day cap
+were all `20`. They are now one constant, so the relationship is stated
+rather than being a coincidence: a consumer summing the per-day series to
+rank tokens over its own range needs each day at least as deep as the
+ranking it draws.
+
+## Tests
+
+`test_views_v2.py`, three new classes, 15 cases (6 of them subtests):
+
+- `TestTokenVolumeDayBreakdown` — the three §5 cases (absent / valid /
+  invalid), the series shape (order, the served partial current day, the
+  today-2 gap, the out-of-window day, symbol pass-through), the
+  `top_tokens` key set on day entries, the not-capped window, and
+  `test_breakdown_day_sums_to_the_window_total`, which pins the
+  additivity the whole feature rests on.
+  `test_breakdown_day_adds_the_series_and_changes_nothing_else` diffs the
+  `breakdown=day` body key-by-key against the no-parameter body from the
+  same fixture, skipping only `computed_at`.
+- `TestTokenVolumeDayBreakdownCap` — 25 tokens on one day: the cap keeps
+  the N busiest in order, the scalar half still counts all 25 (it is
+  aggregated, not summed from the series), and a tie at the boundary goes
+  to the lower address.
+- `TestTokenVolumeDayBreakdownColdRollup` — the cold half of the rollup
+  pairing, plus a second case pinning that the *no-parameter* response
+  through the live fallback did not grow anything when that branch gained
+  its conditional.
