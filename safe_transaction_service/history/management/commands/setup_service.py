@@ -206,6 +206,14 @@ TASKS = [
         description="Compute Safe creations day-grain time series (daily at 04:30)",
         cron=CronDefinition(minute=30, hour=4),  # 30 4 * * *
     ),
+    CeleryTaskConfiguration(
+        name="safe_transaction_service.analytics.tasks.check_native_balance_drift_task",
+        description=(
+            "Sample the native-balance rollup against a from-scratch "
+            "recompute and report disagreement (every Sunday at 05:00)"
+        ),
+        cron=CronDefinition(minute=0, hour=5, day_of_week=0),  # 0 5 * * 0
+    ),
 ]
 
 

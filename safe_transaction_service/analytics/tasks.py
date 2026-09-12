@@ -1228,6 +1228,148 @@ def compute_native_balance_rollup_task(self):
             return run_native_balance_rollup()
 
 
+# ─────────────── Native-balance rollup drift check ────────────────
+#
+# A running total has no self-healing property: unlike every other
+# analytics rollup, nothing here recomputes a window from scratch and
+# quietly repairs it. One batch applied twice, or not at all, stays wrong
+# forever and looks exactly like a real number. So sample it against an
+# independent computation — the same `BALANCE_BATCH_SQL` family the
+# nightly chord used — and say so out loud when they disagree.
+#
+# Observability first, on purpose: this reports, it does not repair. A
+# self-healing version would have to decide *which* of the two numbers is
+# right, and until we have seen real drift we do not know what causes it.
+
+NATIVE_BALANCE_DRIFT_SAMPLE_SIZE = 2000
+
+# `ORDER BY random()` is a sequential scan plus a sort — tens of ms over
+# ~460k rows, once a week. `TABLESAMPLE` would be cheaper and biased
+# toward physically clustered rows, which is the wrong trade for a check
+# whose whole job is to find an anomaly someone else's bug created.
+_NATIVE_BALANCE_SAMPLE_SQL = """
+SELECT safe_address, balance_wei
+FROM analytics_safenativebalance
+ORDER BY random()
+LIMIT %s
+"""
+
+
+def check_native_balance_drift(
+    sample_size: int = NATIVE_BALANCE_DRIFT_SAMPLE_SIZE,
+) -> dict | None:
+    """Compare a random sample of rollup rows against a from-scratch
+    recompute at the watermark. Returns a summary, or ``None`` when there
+    was nothing to check.
+
+    The recompute is bounded at the watermark, not at the current head:
+    the rollup only claims to be complete through the watermark, so
+    anything above it is not drift, it is just the next run's work.
+    """
+    started = time.time()
+    watermark_row = AnalyticsWatermark.objects.filter(
+        name=NATIVE_BALANCE_WATERMARK
+    ).first()
+    if watermark_row is None:
+        logger.info("native_balance.drift: rollup not initialised, nothing to check")
+        return None
+    watermark = watermark_row.block_number
+
+    with relaxed_statement_timeout():
+        with connection.cursor() as cursor:
+            cursor.execute(_NATIVE_BALANCE_SAMPLE_SQL, [sample_size])
+            sample = {bytes(addr): Decimal(balance) for addr, balance in cursor}
+        if not sample:
+            logger.info("native_balance.drift: rollup is empty, nothing to check")
+            return None
+
+        addresses = list(sample)
+        recomputed: dict[bytes, Decimal] = {}
+        for offset in range(0, len(addresses), NATIVE_BALANCE_SEED_BATCH_SIZE):
+            batch = addresses[offset : offset + NATIVE_BALANCE_SEED_BATCH_SIZE]
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    _NATIVE_BALANCE_SEED_SQL, [batch, watermark, batch, watermark]
+                )
+                recomputed.update({bytes(addr): Decimal(bal) for addr, bal in cursor})
+
+    # If the nightly run landed between the sample and the recompute, the
+    # rows we read describe a different watermark than the one we
+    # recomputed at. That is a race, not drift — say so and come back
+    # next week rather than reporting a difference nobody can act on.
+    if (
+        AnalyticsWatermark.objects.filter(name=NATIVE_BALANCE_WATERMARK)
+        .values_list("block_number", flat=True)
+        .first()
+        != watermark
+    ):
+        logger.info(
+            "native_balance.drift: the rollup advanced past block %d while the "
+            "check was running; skipping this round",
+            watermark,
+        )
+        return None
+
+    mismatches = []
+    total_abs_diff = Decimal(0)
+    for address, stored in sample.items():
+        expected = recomputed.get(address, Decimal(0))
+        diff = stored - expected
+        if diff:
+            mismatches.append((address, stored, expected, diff))
+            total_abs_diff += abs(diff)
+
+    summary = {
+        "watermark": watermark,
+        "sampled": len(sample),
+        "mismatched": len(mismatches),
+        "total_abs_diff_wei": int(total_abs_diff),
+        "max_abs_diff_wei": (
+            int(max(abs(d) for *_, d in mismatches)) if mismatches else 0
+        ),
+        "elapsed": round(time.time() - started, 2),
+    }
+
+    if mismatches:
+        worst = sorted(mismatches, key=lambda row: abs(row[3]), reverse=True)[:5]
+        logger.warning(
+            "native_balance.drift: %d of %d sampled Safes disagree with a "
+            "from-scratch recompute at block %d (total |diff| = %d wei, worst "
+            "= %d wei). Worst offenders: %s. The rollup cannot self-heal — "
+            "rebuild with `manage.py backfill_native_balances --restart` if "
+            "this is not a one-off.",
+            summary["mismatched"],
+            summary["sampled"],
+            watermark,
+            summary["total_abs_diff_wei"],
+            summary["max_abs_diff_wei"],
+            ", ".join(
+                f"0x{address.hex()} stored={stored} expected={expected}"
+                for address, stored, expected, _ in worst
+            ),
+        )
+    else:
+        logger.info(
+            "native_balance.drift: %d sampled Safes all agree at block %d (%.2fs)",
+            summary["sampled"],
+            watermark,
+            summary["elapsed"],
+        )
+    return summary
+
+
+@app.shared_task(bind=True)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT * 2)
+def check_native_balance_drift_task(self):
+    """Weekly sanity check on the incremental rollup (Sundays 05:00 UTC).
+
+    Reports only. See ``check_native_balance_drift``.
+    """
+    with contextlib.suppress(LockError):
+        with only_one_running_task(self):
+            return check_native_balance_drift()
+
+
 @app.shared_task(bind=True)
 @task_timeout(timeout_seconds=LOCK_TIMEOUT * 2)
 def compute_safe_creations_task(self):

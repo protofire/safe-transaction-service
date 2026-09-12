@@ -32,6 +32,8 @@ from safe_transaction_service.analytics.models import (
 from safe_transaction_service.analytics.tasks import (
     NATIVE_BALANCE_WATERMARK,
     _calculate_native_balances_from_db,
+    check_native_balance_drift,
+    check_native_balance_drift_task,
     compute_native_balance_rollup_task,
     compute_tvl_task,
     native_balance_head_block,
@@ -751,3 +753,69 @@ class TestTvlReadsTheRollup(NativeBalanceRollupTestCase):
         self.assertEqual(payload["native_balance_wei"], "9000")
         self.assertEqual(payload["native_source"], "shards")
         self.assertIsNone(payload["native_updated_to_block"])
+
+
+class TestDriftCheck(NativeBalanceRollupTestCase):
+    """The rollup has no self-healing property — a batch applied twice
+    stays wrong forever and looks like a real number. This check is the
+    only thing that would ever notice."""
+
+    def test_clean_rollup_reports_no_drift(self):
+        for _ in range(3):
+            safe = self.safe()
+            self.transfer(self.block(), 600, to=safe.address)
+        self.advance_head()
+        call_command("backfill_native_balances", stdout=StringIO())
+
+        summary = check_native_balance_drift()
+
+        self.assertEqual(summary["sampled"], 3)
+        self.assertEqual(summary["mismatched"], 0)
+        self.assertEqual(summary["total_abs_diff_wei"], 0)
+
+    def test_corrupted_row_is_reported_with_its_magnitude(self):
+        safe = self.safe()
+        self.transfer(self.block(), 600, to=safe.address)
+        self.advance_head()
+        call_command("backfill_native_balances", stdout=StringIO())
+
+        # Exactly the shape a double-applied delta leaves behind.
+        SafeNativeBalance.objects.filter(safe_address=safe.address).update(
+            balance_wei=Decimal(1_200)
+        )
+
+        with self.assertLogs(
+            "safe_transaction_service.analytics.tasks", level="WARNING"
+        ) as logs:
+            summary = check_native_balance_drift()
+
+        self.assertEqual(summary["mismatched"], 1)
+        self.assertEqual(summary["total_abs_diff_wei"], 600)
+        self.assertEqual(summary["max_abs_diff_wei"], 600)
+        self.assertIn("--restart", logs.output[0])
+
+    def test_blocks_above_the_watermark_are_not_drift(self):
+        """The rollup only claims completeness through the watermark, so a
+        transfer the next run has yet to apply must not be reported."""
+        safe = self.safe()
+        self.transfer(self.block(), 600, to=safe.address)
+        self.advance_head()
+        call_command("backfill_native_balances", stdout=StringIO())
+
+        self.transfer(self.block(), 999, to=safe.address)
+        self.advance_head()
+
+        summary = check_native_balance_drift()
+        self.assertEqual(summary["mismatched"], 0)
+
+    def test_uninitialised_rollup_is_skipped_quietly(self):
+        self.safe()
+        self.advance_head()
+        self.assertIsNone(check_native_balance_drift())
+
+    def test_task_runs_the_check(self):
+        self.safe()
+        self.advance_head()
+        call_command("backfill_native_balances", stdout=StringIO())
+
+        self.assertEqual(check_native_balance_drift_task.delay().get()["mismatched"], 0)
