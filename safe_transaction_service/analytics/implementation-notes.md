@@ -1087,3 +1087,369 @@ yet — custom ranges keep falling back to 90d until such a path exists.
 This is the producer half standing alone, which the merge order in the
 workspace contract allows precisely because the parameter-absent response
 is unchanged.
+
+# Part 8 — Native balance: from a nightly full recompute to an incremental rollup
+
+## What was actually broken
+
+`compute_tvl_task` fanned out a 16-shard chord every night at 03:15. Each
+shard ran `BALANCE_BATCH_SQL` over its 1/16 of the address space — a sum
+of the **entire** native-transfer history of those Safes, every night.
+That is O(all history) per run, and the chain only ever gets longer.
+
+Measured on `transaction-ethereum.safe.protofire.io`, 2026-09-11:
+
+```
+GET /api/v2/analytics/tvl/
+{"computed_at":"2026-09-11T03:44:08Z","total_shards":16,"partial_shards":16,
+ "erc20_token_count":36737,"native_balance_wei":"0","total_safes_with_balance":0}
+```
+
+Sixteen of sixteen shards failing, every run since 09-09. 463 174 Safes /
+16 ≈ 28 900 addresses per shard, six batches of 5000 each, against a
+`task_timeout(LOCK_TIMEOUT)` of 900 s. Sonic (6928 Safes) passes today
+but showed `partial_shards: 6` on 09-06 — the same ceiling, further away.
+
+Tuning the timeout does not fix a workload that grows linearly with the
+age of the chain. Neither does adding shards: 256 two-nibble shards would
+buy one more doubling and cost 256 concurrent slots the pool does not
+have. The work itself had to stop being proportional to history.
+
+So: keep a per-Safe running total, and each night add only what happened
+since last night. `SafeNativeBalance` + one `AnalyticsWatermark` row.
+A run now costs O(rows in the new blocks), and `partial_shards` stops
+being a thing that can happen at all.
+
+## The confirmation boundary is the whole design
+
+This is the one decision everything else hangs off.
+
+Every other analytics rollup recomputes a whole UTC day from scratch and
+therefore self-heals: re-run the day, get the right answer, nobody needs
+to know what went wrong. A running total does not have that property. An
+increment applied from rows that later vanish cannot be un-applied,
+because the rows are gone.
+
+And they do vanish. `reorg_service.recover_from_reorg` (`history/services/
+reorg_service.py:178-180`) does `EthereumBlock.objects.filter(number__gte=
+reorg_block).delete()`, and the FK cascade takes `EthereumTx` and
+`InternalTx` with it. No tombstone, no audit trail — just fewer rows than
+there were.
+
+So the rollup only ever consumes blocks a reorg cannot reach:
+
+```python
+head = min(MAX(number) WHERE confirmed, MAX(number) - settings.ETH_REORG_BLOCKS)
+```
+
+Both terms, deliberately, because they fail differently:
+
+- `confirmed` is the indexer's own statement that it has stopped
+  re-checking a block (`check_reorgs` sets it at
+  `number <= current - eth_reorg_blocks`). It is the authoritative
+  signal — but only on a deployment where that task is actually running.
+- the depth subtraction is an independent backstop that needs no task to
+  be alive.
+
+Taking the *minimum* means the rollup stalls (correctly, visibly) rather
+than advancing on either signal alone. A stalled `check_reorgs` shows up
+as a rollup that quietly stops moving and nothing else would report it,
+so `native_balance_head_block` logs a WARNING when the confirmed head
+falls more than `10 × ETH_REORG_BLOCKS` behind the depth bound.
+
+If the watermark is ever found *ahead* of the safe head, the run refuses
+outright and logs ERROR pointing at `--restart`. That state means blocks
+this rollup already applied were deleted — a reorg deeper than the
+confirmation zone, or a database restore. It is not something to be
+clever about: the whole service's data has moved, not just ours.
+
+## Seeding is bounded by the OLD watermark, not by the head
+
+A Safe enters `history_safecontract` when the indexer gets to it, which
+can be well after the transfers it already received. Every run therefore
+starts by seeding Safes with no rollup row — and the bound on that seed
+is the run's *incoming* watermark `W`, not `head`:
+
+```
+  W ──────────────────────────────────────► head
+  ├─ (1) SEED   missing Safes, blocks <= W
+  ├─ (2) DELTA  one pass over (W, head], applied with +=
+  └─ (3) MARK   watermark := head
+```
+
+Bound it at `head` and any transfer inside `(W, head]` gets counted
+twice — once by the seed, once by the delta. Bound it at the Safe's
+creation block and everything it received before the indexer noticed it
+is lost forever. `W` is the only bound that counts every block exactly
+once, and both failure modes are silent, which is why there are tests for
+each direction (`TestSafeIndexedMidWindow`).
+
+Steps (2) and (3) share a transaction. A crash between them either loses
+the range or applies it twice, and a signed running total cannot tell the
+difference afterwards. With them atomic, a re-run at the same watermark
+is a no-op — that is the entire idempotency story, and `TestAtomicity`
+pins it.
+
+Step (1) is deliberately *outside* that transaction: the seed insert is
+`ON CONFLICT DO NOTHING`, so a failure after it leaves rows the next run
+simply finds already present.
+
+## Every Safe gets a row, including zero-balance ones
+
+"Absent from `analytics_safenativebalance`" is the signal the seed step
+keys on. If Safes with no native flow were omitted, every single run
+would rediscover the entire fleet as "new" and re-seed it — the
+full-history recompute, back again, wearing a different hat. So the
+backfill and the seed both write a row per Safe, `balance_wei = 0`
+included. On Ethereum that is ~463k rows, which is nothing.
+
+## The sign is stored, the clamp is on read
+
+`BALANCE_BATCH_SQL` sums `CASE WHEN balance > 0 THEN balance ELSE 0 END`
+and counts `FILTER (WHERE balance > 0)`. Negative balances happen — an
+outgoing transfer is indexed and the matching incoming one is not yet —
+and the old code clamped them per-Safe at aggregation time.
+
+The rollup stores the true signed balance and applies the identical clamp
+at read time:
+
+```sql
+SELECT COALESCE(SUM(CASE WHEN balance_wei > 0 THEN balance_wei ELSE 0 END), 0),
+       COUNT(*) FILTER (WHERE balance_wei > 0)
+FROM analytics_safenativebalance
+```
+
+Clamping on write would make an indexing gap permanent: a row floored at
+zero can never be lifted back into the positive by the missing incoming
+transfer, because the deficit it should cancel is gone. And because the
+read-side clamp is byte-for-byte what the shards did, the numbers on
+`/tvl/` do not move when the producer switches —
+`TestTvlReadsTheRollup.test_native_numbers_match_the_shard_path_they_replace`
+asserts exactly that, running both paths over the same fixture.
+
+## Why the delta joins `history_ethereumtx` and the seed does not
+
+`InternalTx.block_number` is a plain `PositiveIntegerField` with no index
+(`history/models.py:1170`, absent from `Meta.indexes`). A range filter on
+it is a sequential scan of tens of millions of rows.
+
+The delta is driven *by the block window*, so it has to anchor on
+something indexed on that dimension: `history_ethereumtx.block_id`
+(`history_ethereumtx_block_id_92e7f70e`), joining `history_internaltx` on
+the FK afterwards. This is the same idiom, and the same reason, as
+`_METRIC_CORE_MULTISIG_COUNT_SUM_SQL` — whose comment (`tasks.py:981-988`)
+records the ~40 min/day the ORM form cost before it.
+
+The seed is driven *by an address list*, so the block is a residual
+filter and can use `it.block_number` directly, keeping the proven partial
+covering indexes (`history_internal_transfer_idx` /
+`history_internal_transfer_from`, which even carry `block_number` in
+their `INCLUDE`). That asymmetry is load-bearing on one assumption:
+`it.block_number == etx.block_id` for every row. It holds by
+construction — `InternalTx.build_from_trace` sets
+`block_number=ethereum_tx.block_id` (`history/models.py:866`) and
+`safe_events_indexer` sets it from the log's own `blockNumber`
+(`indexers/safe_events_indexer.py:567`). If that ever stops being true,
+the seed and the delta will disagree about who owns a block boundary.
+
+`EXISTS (SELECT 1 FROM history_safecontract …)` sits *after* the
+aggregate, so it probes the Safe PK once per distinct counterparty rather
+than once per transfer row. `IN (SELECT address FROM history_safecontract)`
+would materialise ~460k rows on Ethereum.
+
+**Not verified at scale.** Local EXPLAIN runs against empty tables, so it
+confirms syntax and that the access paths exist, not that the planner
+picks them under production statistics. No index was added to
+`history_internaltx` — that would be a deliberate crossing of the scope
+boundary, and the `etx.block_id` anchor is the documented way around it.
+If the delta turns out to be slow on Ethereum, that is the finding to
+raise, not a detail to fix quietly.
+
+## The task lives in `tasks.py`, and that is not cosmetic
+
+`config/settings/base.py` (~line 316) routes only
+`safe_transaction_service.analytics.tasks.*` and `…tasks_shards.*` to the
+`contracts` queue. A new `tasks_balances.py` would have gone to the
+default queue and been silently never consumed — no error, no log, just a
+rollup that never advances. Putting the task in `tasks.py` avoids
+touching the routing table at all, so this change needs no edit to
+`config/settings/base.py`.
+
+Two files outside `analytics/` are touched, both documented exceptions:
+`history/management/commands/setup_service.py` for the two beat entries
+(`compute_native_balance_rollup_task` daily 03:05, ten minutes ahead of
+`compute_tvl_task`; `check_native_balance_drift_task` Sundays 05:00).
+
+## The chord is kept, and is now the fallback
+
+Options were: make `finalize_tvl_snapshot` a plain task, or keep the
+chord for ERC20's sake. Took the first — the chord existed only to
+parallelise the native side, and the native side no longer needs
+parallelising. `compute_tvl_task` reads the rollup (milliseconds) and
+calls `dispatch_tvl_finalize`, which dispatches `finalize_tvl_snapshot`
+directly. No chord, no fan-out, and no result backend in a TVL run at all
+— which also removes the *"Starting chords requires a result backend to
+be configured"* failure mode from this path entirely.
+
+But `dispatch_tvl_chord`, `compute_native_balance_shard`,
+`reduce_native_balance_shards`, `_calculate_native_balances_from_db` and
+`BALANCE_BATCH_SQL` all stay, for three reasons:
+
+1. **Un-backfilled instances.** `compute_tvl_task` falls back to the
+   chord when the rollup has no watermark. An instance that has migrated
+   but not yet run `backfill_native_balances` keeps serving the number it
+   served before rather than a zero — which matters because a zero and
+   "a fleet holding nothing" are indistinguishable in the payload.
+   The fleet upgrades at different times; this is what lets the deploy
+   and the backfill be separate events.
+2. **The drift check** recomputes against `_NATIVE_BALANCE_SEED_SQL`,
+   which is the same family. An independent reference has to exist.
+3. Deleting a working fallback to save a diff is a bad trade on a
+   producer that ~111 staging services poll.
+
+## `/tvl/` payload: two keys added, none removed
+
+Workspace contract: adding a key is safe, removing or renaming one is
+breaking and must land consumer-first. So:
+
+- `partial_shards` **stays**, and the rollup path writes `0` — exactly
+  what the hub reads as "complete" when it gates USD pricing
+  (`collectors/tx_service.py:874-906`) and filters dashboard rows
+  (`dashboard/data.py:710`, `:758`).
+- `total_shards` **stays** at `0`. The hub reads it nowhere (checked by
+  grep), but a key nobody reads is still a key that cannot be removed
+  from the producer first.
+
+Both are vestigial on the rollup path. What actually describes a run now
+is additive:
+
+- `native_source`: `"rollup"` | `"shards"` | `null`. The `null` is the
+  phase-1 placeholder, which previously relied on `total_shards == 0` to
+  mark itself as never-computed — a discriminator the rollup path took
+  away. `computed_at: null` remains the primary cold-read signal
+  (contract invariant 1) and is unaffected.
+- `native_updated_to_block`: the block the native side is complete
+  through. This is the one that pays for itself in triage: "how stale is
+  this number" is now answerable from the payload, without reading worker
+  logs or opening a shell.
+
+`EMPTY_TVL_PAYLOAD` gains both as `null` so a cold read stays
+shape-identical to a warm one.
+
+No hub change is required or included. The hub ignores unknown keys, and
+every key it reads today still means what it meant.
+
+## Backfill: the only place the full recompute still happens
+
+`manage.py backfill_native_balances` does the one full pass, inline, with
+no Celery anywhere near it — which is the entire point, because
+`task_timeout` is what kills the shards and nothing here is a task.
+
+Progress is the rollup table itself: a row is a Safe already computed.
+Crash, re-run, it skips what is done. No Redis manifest (unlike
+`backfill_daily_metrics`) because the table is already a perfectly good
+journal.
+
+`_resolve_head` is the subtle part. Two passes at two different blocks
+would leave rows complete through different heights, and one watermark
+cannot describe both — the earlier rows would silently lose everything in
+between. So:
+
+- **interrupted first run** (rows exist, no watermark): resume at the
+  block those rows are stamped with, not at today's head.
+- **already-watermarked rollup**: top up Safes that have no row, at the
+  existing watermark, and leave the watermark alone. This is the same
+  operation the nightly seed step does, available by hand.
+- **rows stamped at two different blocks with no watermark**: refuse.
+  The lower block double-counts, the higher one skips, and guessing
+  between them is worse than stopping. `--restart`.
+- `--at-block` above the safe head: refused, for the reason in the
+  confirmation-boundary section.
+
+`--restart` `TRUNCATE`s the table and drops the watermark.
+
+`warm_analytics_cache` gained the rollup task, ordered before `tvl`. Its
+`_is_fresh` probe now tolerates a `None` Redis key — the rollup's
+freshness lives in a Postgres watermark, not a Redis payload, so it is
+never skipped by `--skip-if-fresh`. It does not need to be: the task
+no-ops when there is nothing new to consume. The ordering is a hint
+rather than a guarantee (both are fire-and-forget dispatches) and does
+not need to be one — a TVL run that overtakes the rollup publishes
+yesterday's native side and the next run catches up.
+
+## Drift check: observability first, no self-healing
+
+`check_native_balance_drift_task`, Sundays 05:00. Samples 2000 random
+rollup rows and recomputes them from scratch at the watermark, logging
+WARNING with the mismatch count, the total and worst |diff|, and the five
+worst addresses.
+
+Bounded **at the watermark**, not at the current head: the rollup only
+claims completeness through the watermark, so anything above it is the
+next run's work, not drift. If the watermark moves while the check is
+running, the round is skipped — that is a race, not a discrepancy anybody
+can act on.
+
+Deliberately not self-healing on the first iteration. Repairing means
+deciding which of the two numbers is right, and until real drift has been
+observed we do not know what produces it. `ORDER BY random()` over
+`TABLESAMPLE` for the same reason: a sequential scan plus sort is tens of
+ms once a week, and `TABLESAMPLE`'s bias toward physically clustered rows
+is the wrong trade for a check whose job is to find an anomaly.
+
+## Rollout
+
+1. `migrate` — two empty tables, nothing reads them.
+2. `manage.py backfill_native_balances` (inline, `nohup`, `--status` to
+   watch). Until it finishes and writes the watermark, `/tvl/` keeps
+   using the chord.
+3. Nothing else. The next `compute_tvl_task` picks the rollup up on its
+   own; `native_source` in the payload says which producer ran.
+
+Verified against Sonic staging, whose current chord output is honest
+(`partial_shards: 0`, `native_balance_wei:
+1030423823669599423227126788`, `total_safes_with_balance: 628`) —
+`native_balance_wei` after the backfill must match it exactly.
+
+## What `makemigrations` also wanted, and did not get
+
+Migration 0008 omits four `AlterField` operations turning the `Daily*`
+rollup PKs from `AutoField` into `BigAutoField`. That drift predates this
+branch — `makemigrations analytics --check` reports it on `staging`
+without any of these changes — and rewriting four rollup tables is not
+this change's business.
+
+## Tests — `tests/test_native_balance_rollup.py` (new)
+
+Grouped by the failure each class defends against:
+
+- `TestHeadBlock` — confirmed flag bounds the head; reorg depth bounds
+  it; neither present ⇒ `None`.
+- `TestIncrementalMatchesFullRecompute` — the headline property, over
+  three successive windows with both signs, plus Safe-to-Safe transfers
+  netting out and non-Safe counterparties never getting a row.
+- `TestIdempotency` — a second run with no new blocks moves nothing;
+  zero-balance Safes are not re-seeded every run.
+- `TestSafeIndexedMidWindow` — both directions of the seed bound: a Safe
+  whose transfers predate its `history_safecontract` row keeps them, and
+  a transfer inside `(W, head]` is counted once, not twice.
+- `TestConfirmationBoundary` — an unconfirmed block is not consumed, and
+  is picked up on the run after it confirms.
+- `TestNegativeBalances` — stored signed, excluded from both aggregates,
+  and back in the positive once the missing transfer is indexed.
+- `TestAtomicity` — a failure between the delta and the watermark leaves
+  neither, and the retry applies the range exactly once.
+- `TestRefusalPaths` — uninitialised, watermark ahead of head, too many
+  Safes to seed: all refuse loudly and change nothing.
+- `TestBackfillCommand` — full pass, handover, resume, restart, and each
+  `_resolve_head` refusal.
+- `TestTvlReadsTheRollup` — the payload keeps every pre-existing key,
+  gains the two new ones, and produces the same native numbers as the
+  shard path it replaces.
+- `TestDriftCheck` — clean rollup is quiet, a corrupted row is reported
+  with its magnitude, above-watermark activity is not drift.
+
+The reference in the equality assertions is
+`_calculate_native_balances_from_db`, which is what `TestNativeBalanceShards`
+verified the chord against — so "incremental == sequential == chord"
+closes transitively.
