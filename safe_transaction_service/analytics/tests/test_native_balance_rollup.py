@@ -25,6 +25,7 @@ from django.test import TestCase
 from eth_account import Account
 
 from safe_transaction_service.analytics.models import (
+    AnalyticsSnapshot,
     AnalyticsWatermark,
     SafeNativeBalance,
 )
@@ -32,10 +33,12 @@ from safe_transaction_service.analytics.tasks import (
     NATIVE_BALANCE_WATERMARK,
     _calculate_native_balances_from_db,
     compute_native_balance_rollup_task,
+    compute_tvl_task,
     native_balance_head_block,
     read_native_balance_rollup,
     run_native_balance_rollup,
 )
+from safe_transaction_service.analytics.tasks_shards import HEX_PREFIXES
 from safe_transaction_service.history.models import EthereumTxCallType
 from safe_transaction_service.history.tests.factories import (
     EthereumBlockFactory,
@@ -667,3 +670,84 @@ class TestBackfillCommand(NativeBalanceRollupTestCase):
 
         self.backfill()
         self.assertIn("Watermark", self.backfill(status=True))
+
+
+class TestTvlReadsTheRollup(NativeBalanceRollupTestCase):
+    """`/tvl/`'s payload is the contract with the hub. It may gain keys; it
+    may not lose or rename one without the consumer stopping reading it
+    first. So the switch has to keep every key it had — `partial_shards`
+    in particular, which the hub gates USD pricing on."""
+
+    # Every key `finalize_tvl_snapshot` wrote before the rollup existed.
+    PRE_EXISTING_KEYS = {
+        "total_safes_with_balance",
+        "native_balance_wei",
+        "erc20_token_count",
+        "top_tokens",
+        "partial_shards",
+        "total_shards",
+        "computed_at",
+    }
+
+    def snapshot(self) -> dict:
+        return AnalyticsSnapshot.objects.get(name="tvl").payload
+
+    def test_payload_keeps_every_key_and_gains_two(self):
+        safe = self.safe()
+        self.transfer(self.block(), 12_345, to=safe.address)
+        self.advance_head()
+        call_command("backfill_native_balances", stdout=StringIO())
+
+        compute_tvl_task()
+        payload = self.snapshot()
+
+        self.assertTrue(self.PRE_EXISTING_KEYS.issubset(payload))
+        self.assertEqual(payload["native_source"], "rollup")
+        self.assertEqual(
+            payload["native_updated_to_block"], native_balance_head_block()
+        )
+        # A rollup run is a complete run — no shards to be partial about.
+        self.assertEqual(payload["partial_shards"], 0)
+        self.assertEqual(payload["native_balance_wei"], "12345")
+        self.assertEqual(payload["total_safes_with_balance"], 1)
+
+    def test_native_numbers_match_the_shard_path_they_replace(self):
+        for _ in range(3):
+            safe = self.safe()
+            self.transfer(self.block(), 4_000, to=safe.address)
+        self.advance_head()
+
+        # Chord path first, on an un-backfilled rollup.
+        compute_tvl_task()
+        via_shards = self.snapshot()
+        self.assertEqual(via_shards["native_source"], "shards")
+        self.assertEqual(via_shards["total_shards"], len(HEX_PREFIXES))
+
+        call_command("backfill_native_balances", stdout=StringIO())
+        compute_tvl_task()
+        via_rollup = self.snapshot()
+
+        self.assertEqual(via_rollup["native_source"], "rollup")
+        self.assertEqual(
+            via_rollup["native_balance_wei"], via_shards["native_balance_wei"]
+        )
+        self.assertEqual(
+            via_rollup["total_safes_with_balance"],
+            via_shards["total_safes_with_balance"],
+        )
+
+    def test_uninitialised_rollup_falls_back_instead_of_publishing_zero(self):
+        """An instance that has migrated but not run the backfill keeps
+        serving the number it served before. Publishing the empty rollup's
+        zero would look exactly like a fleet holding nothing."""
+        safe = self.safe()
+        self.transfer(self.block(), 9_000, to=safe.address)
+        self.advance_head()
+        self.assertIsNone(read_native_balance_rollup())
+
+        compute_tvl_task()
+        payload = self.snapshot()
+
+        self.assertEqual(payload["native_balance_wei"], "9000")
+        self.assertEqual(payload["native_source"], "shards")
+        self.assertIsNone(payload["native_updated_to_block"])

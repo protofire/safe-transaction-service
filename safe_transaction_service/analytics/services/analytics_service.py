@@ -185,10 +185,15 @@ EMPTY_TVL_PAYLOAD: dict = {
     "native_balance_wei": "0",
     "erc20_token_count": 0,
     "top_tokens": [],
-    # 0/0 distinguishes "snapshot never computed" from a real partial run
-    # (where total_shards == 16 and partial_shards > 0).
+    # Vestigial since the native balance became an incremental rollup —
+    # it has no shards and a real run writes 0/0 here too. Kept because
+    # the hub reads `partial_shards` (USD pricing is gated on it being 0)
+    # and removing a payload key is a breaking change that has to land
+    # consumer-first. `computed_at: None` is what marks a cold read.
     "partial_shards": 0,
     "total_shards": 0,
+    "native_source": None,
+    "native_updated_to_block": None,
     "computed_at": None,
 }
 

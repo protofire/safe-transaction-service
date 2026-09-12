@@ -201,13 +201,23 @@ def finalize_tvl_snapshot(reduced: dict) -> bool:
     """Chord callback that turns the reduced native balance into the final
     ``tvl`` snapshot.
 
-    Receives ``{"balance_wei", "safes_with_balance"}`` from
-    ``reduce_native_balance_shards``, runs the ERC20 net-flow aggregation,
-    and overwrites the phase-1 placeholder ``compute_tvl_task`` wrote up
-    front. Living in the chord callback (instead of the parent task) is
-    what removes the synchronous ``.get()`` block that previously had
-    ``compute_tvl_task`` hanging on a result key the gevent worker pool
-    sometimes never observed.
+    Receives ``{"balance_wei", "safes_with_balance"}`` from whichever
+    producer computed the native side, runs the ERC20 net-flow
+    aggregation, and overwrites the phase-1 placeholder
+    ``compute_tvl_task`` wrote up front.
+
+    Two producers now feed it. The normal one is
+    ``read_native_balance_rollup`` — ``compute_tvl_task`` reads the
+    incremental rollup in milliseconds and calls this directly, no chord
+    involved. The fallback is the original
+    ``reduce_native_balance_shards`` chord, still used on instances whose
+    rollup has not been backfilled yet. ``reduced`` says which via
+    ``native_source``; when the key is absent the caller was the chord.
+
+    Living outside the parent task is what removes the synchronous
+    ``.get()`` block that previously had ``compute_tvl_task`` hanging on a
+    result key the gevent worker pool sometimes never observed — true of
+    both producers.
 
     Failure stays local: the placeholder snapshot is left in place so the
     endpoint keeps serving a coherent zero payload until the next run.
@@ -229,6 +239,9 @@ def finalize_tvl_snapshot(reduced: dict) -> bool:
     total_safes_with_balance = int(reduced.get("safes_with_balance", 0))
     partial_shards = int(reduced.get("partial_shards", 0))
     total_shards = int(reduced.get("total_shards", 0))
+    # Absent means the 16-shard chord called us — it predates the key.
+    native_source = reduced.get("native_source", "shards")
+    native_updated_to_block = reduced.get("native_updated_to_block")
 
     try:
         safe_addrs_subq = SafeContract.objects.values("address")
@@ -306,23 +319,36 @@ def finalize_tvl_snapshot(reduced: dict) -> bool:
                 }
                 for addr, bal in top_tokens
             ],
-            # Surface partial-shard state so consumers can detect that
-            # this snapshot was computed from a subset of the address
-            # space (one or more shards failed). When zero shards
-            # failed both fields are zero/total and the payload reads
-            # as fully-computed.
+            # `partial_shards` / `total_shards` describe a sharded run
+            # that did not fully reduce. The rollup producer has no
+            # shards and writes 0/0 — which the hub reads as "complete",
+            # exactly as intended (it gates USD pricing on
+            # `partial_shards == 0`). The keys stay in the payload
+            # because removing one is a breaking change and would have to
+            # land consumer-first; on the rollup path they are
+            # vestigial, and `native_source` is what actually describes
+            # the run.
             "partial_shards": partial_shards,
             "total_shards": total_shards,
+            # Additive, so older consumers ignore them: which producer
+            # computed the native side, and the block it is complete
+            # through. The second answers "how fresh is this number"
+            # straight from the payload, without reading worker logs.
+            "native_source": native_source,
+            "native_updated_to_block": native_updated_to_block,
             "computed_at": timezone.now().isoformat(),
         }
         _write_snapshot("tvl", payload)
         logger.info(
             "finalize_tvl_snapshot: completed in %.2fs native_wei=%d "
-            "safes_with_balance=%d erc20_tokens=%d partial_shards=%d/%d",
+            "safes_with_balance=%d erc20_tokens=%d native_source=%s "
+            "native_updated_to_block=%s partial_shards=%d/%d",
             time.time() - started,
             native_balance_wei,
             total_safes_with_balance,
             len(token_balances),
+            native_source,
+            native_updated_to_block,
             partial_shards,
             total_shards,
         )
@@ -336,14 +362,33 @@ def finalize_tvl_snapshot(reduced: dict) -> bool:
         return False
 
 
+def dispatch_tvl_finalize(reduced: dict) -> None:
+    """Fire-and-forget ``finalize_tvl_snapshot`` with an already-computed
+    native side.
+
+    The normal path since the native balance became an incremental
+    rollup: ``compute_tvl_task`` reads the totals in milliseconds and
+    hands them straight here, so there is no chord, no fan-out and no
+    result backend involved in a TVL run at all.
+    """
+    finalize_tvl_snapshot.apply_async((reduced,), queue="contracts")
+
+
 def dispatch_tvl_chord() -> None:
-    """Fire-and-forget the TVL chord.
+    """Fire-and-forget the TVL chord — the fallback path.
 
     Builds ``(16 native shards) → reduce_native_balance_shards →
     finalize_tvl_snapshot`` and submits it to the ``contracts`` queue.
     The parent task (``compute_tvl_task``) does NOT block — the final
     snapshot is written by ``finalize_tvl_snapshot`` when the chord
     resolves. Eager mode runs the whole chain inline.
+
+    Still reached on instances that have migrated but not yet run
+    ``manage.py backfill_native_balances``: there the rollup has no
+    watermark, and falling back here keeps them serving the number they
+    served before rather than a zero. It is also the independent
+    reference the weekly drift check compares the rollup against, which
+    is why none of this machinery was deleted with the switch.
     """
     job = chord(
         (compute_native_balance_shard.s(p) for p in HEX_PREFIXES),

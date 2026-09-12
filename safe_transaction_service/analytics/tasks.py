@@ -745,21 +745,27 @@ def compute_safe_segments_task(self):
 def compute_tvl_task(self):
     """Fire-and-forget driver for the TVL pipeline.
 
-    Writes a phase-1 placeholder snapshot only if none exists yet, then
-    dispatches the chord ``(16 native shards) → reduce → finalize_tvl_snapshot``
-    on the ``contracts`` queue and returns immediately. The final
-    snapshot is written by ``finalize_tvl_snapshot`` when the chord
-    resolves — see ``analytics.tasks_shards.finalize_tvl_snapshot``.
+    Writes a phase-1 placeholder snapshot only if none exists yet, gets
+    the native side, and dispatches ``finalize_tvl_snapshot`` on the
+    ``contracts`` queue to do the ERC20 aggregation and write the real
+    snapshot. Returns immediately either way — success of the heavy work
+    is observable via the snapshot's ``computed_at`` advancing past the
+    placeholder. (The shape before that was a blocking ``.get()`` on the
+    chord, which hung indefinitely on gevent workers + Redis result
+    backend.)
 
-    The previous shape blocked on ``.get()`` waiting for the chord, which
-    hung indefinitely on gevent workers + Redis result backend. The new
-    shape is event-driven: success of the heavy aggregation is observable
-    via the snapshot's ``computed_at`` advancing past the placeholder.
+    The native side is normally a millisecond read of the incremental
+    rollup. On an instance that has migrated but not yet run
+    ``manage.py backfill_native_balances`` the rollup has no watermark,
+    and we fall back to the 16-shard chord — the number it served before,
+    rather than a zero. That fallback is the only reason the shard
+    machinery is still here.
     """
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
             from safe_transaction_service.analytics.tasks_shards import (
                 dispatch_tvl_chord,
+                dispatch_tvl_finalize,
             )
 
             started = time.time()
@@ -774,23 +780,59 @@ def compute_tvl_task(self):
                     "native_balance_wei": "0",
                     "erc20_token_count": 0,
                     "top_tokens": [],
-                    # 0/0 marks this as a "never-computed" placeholder so
-                    # consumers can distinguish it from a real partial run
-                    # written by `finalize_tvl_snapshot`.
+                    # 0/0 marked this as a "never-computed" placeholder
+                    # back when a real run wrote 16 into `total_shards`.
+                    # The rollup path writes 0/0 too, so the discriminator
+                    # is now `computed_at` (null on a cold read) and
+                    # `native_source` (null here, set by a real run).
                     "partial_shards": 0,
                     "total_shards": 0,
+                    "native_source": None,
+                    "native_updated_to_block": None,
                     "computed_at": timezone.now().isoformat(),
                 }
                 _write_snapshot("tvl", placeholder)
                 logger.info("compute_tvl_task: phase1 placeholder snapshot written")
 
-            # Phase 2 — fire-and-forget. The chord callback
-            # (`finalize_tvl_snapshot`) does the ERC20 aggregation and
-            # writes the real snapshot when shards + reduce resolve.
-            dispatch_tvl_chord()
+            # Phase 2 — fire-and-forget. `finalize_tvl_snapshot` does the
+            # ERC20 aggregation and writes the real snapshot.
+            rollup = read_native_balance_rollup()
+            if rollup is None:
+                logger.info(
+                    "analytics.rollup.cold_window key=native_balance — no "
+                    "watermark, falling back to the 16-shard chord. Run "
+                    "`manage.py backfill_native_balances` to switch this "
+                    "instance over."
+                )
+                dispatch_tvl_chord()
+                logger.info(
+                    "compute_tvl_task: chord dispatched in %.2fs",
+                    time.time() - started,
+                )
+                return True
+
+            dispatch_tvl_finalize(
+                {
+                    "balance_wei": rollup["balance_wei"],
+                    "safes_with_balance": rollup["safes_with_balance"],
+                    # No shards on this path; 0/0 is what the hub reads as
+                    # a complete run. Kept because dropping a payload key
+                    # is a breaking change that has to land consumer-first.
+                    "partial_shards": 0,
+                    "total_shards": 0,
+                    "native_source": "rollup",
+                    "native_updated_to_block": rollup["updated_to_block"],
+                }
+            )
             logger.info(
-                "compute_tvl_task: chord dispatched in %.2fs",
+                "compute_tvl_task: finalize dispatched in %.2fs from the "
+                "rollup (native_wei=%d safes_with_balance=%d "
+                "updated_to_block=%d over %d rows)",
                 time.time() - started,
+                rollup["balance_wei"],
+                rollup["safes_with_balance"],
+                rollup["updated_to_block"],
+                rollup["safe_rows"],
             )
             return True
 
