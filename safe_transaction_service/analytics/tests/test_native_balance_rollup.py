@@ -15,8 +15,11 @@ blocks a test actually wrote to.
 """
 
 from decimal import Decimal
+from io import StringIO
 from unittest.mock import patch
 
+from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import TestCase
 
 from eth_account import Account
@@ -492,3 +495,175 @@ class TestCeleryTask(NativeBalanceRollupTestCase):
         compute_native_balance_rollup_task.delay()
 
         self.assertEqual(self.totals(), (64, 1))
+
+
+class TestBackfillCommand(NativeBalanceRollupTestCase):
+    """`backfill_native_balances` is the one-time full pass the nightly run
+    no longer does. Its hazards are all about *which block* it pins to:
+    two passes at two different blocks leave rows that are complete
+    through different heights, and a single watermark cannot describe
+    both."""
+
+    def backfill(self, **kwargs) -> str:
+        out = StringIO()
+        call_command("backfill_native_balances", stdout=out, stderr=out, **kwargs)
+        return out.getvalue()
+
+    def test_fills_every_safe_and_hands_over_the_watermark(self):
+        safes = [self.safe() for _ in range(3)]
+        block = self.block()
+        self.transfer(block, 700, to=safes[0].address)
+        self.transfer(block, 40, _from=safes[1].address)
+        self.advance_head()
+        head = native_balance_head_block()
+
+        self.backfill()
+
+        # A row per Safe, zero-balance ones included.
+        self.assertEqual(SafeNativeBalance.objects.count(), 3)
+        self.assertEqual(
+            set(SafeNativeBalance.objects.values_list("updated_to_block", flat=True)),
+            {head},
+        )
+        self.assertEqual(
+            AnalyticsWatermark.objects.get(name=NATIVE_BALANCE_WATERMARK).block_number,
+            head,
+        )
+        self.assertEqual(self.totals(), _calculate_native_balances_from_db())
+        self.assertEqual(self.totals(), (700, 1))
+
+    def test_incremental_takes_over_where_the_backfill_stopped(self):
+        safe = self.safe()
+        self.transfer(self.block(), 1_000, to=safe.address)
+        self.advance_head()
+        self.backfill()
+
+        self.transfer(self.block(), 250, to=safe.address)
+        self.advance_head()
+        run_native_balance_rollup()
+
+        self.assertEqual(self.totals(), (1_250, 1))
+        self.assertEqual(self.totals(), _calculate_native_balances_from_db())
+
+    def test_resume_skips_safes_already_computed(self):
+        for _ in range(3):
+            self.safe()
+        self.advance_head()
+        self.backfill()
+
+        # A Safe indexed after the first pass; the watermark is already
+        # set, so this is a top-up and must not move it.
+        watermark = AnalyticsWatermark.objects.get(
+            name=NATIVE_BALANCE_WATERMARK
+        ).block_number
+        self.safe()
+        self.advance_head()
+
+        output = self.backfill()
+
+        self.assertIn("3 already done", output)
+        self.assertEqual(SafeNativeBalance.objects.count(), 4)
+        self.assertEqual(
+            AnalyticsWatermark.objects.get(name=NATIVE_BALANCE_WATERMARK).block_number,
+            watermark,
+        )
+
+    def test_restart_rebuilds_from_scratch(self):
+        safe = self.safe()
+        self.transfer(self.block(), 88, to=safe.address)
+        self.advance_head()
+        self.backfill()
+
+        self.advance_head()
+        self.backfill(restart=True)
+
+        new_head = native_balance_head_block()
+        self.assertEqual(
+            AnalyticsWatermark.objects.get(name=NATIVE_BALANCE_WATERMARK).block_number,
+            new_head,
+        )
+        self.assertEqual(self.totals(), (88, 1))
+
+    def test_at_block_above_the_safe_head_is_refused(self):
+        self.safe()
+        self.advance_head()
+        with self.assertRaises(CommandError) as ctx:
+            self.backfill(at_block=native_balance_head_block() + 1)
+        self.assertIn("safe head", str(ctx.exception))
+
+    def test_topping_up_at_a_different_block_is_refused(self):
+        self.safe()
+        self.advance_head()
+        self.backfill()
+        self.advance_head()
+
+        with self.assertRaises(CommandError) as ctx:
+            self.backfill(at_block=native_balance_head_block())
+        self.assertIn("--restart", str(ctx.exception))
+
+    def test_interrupted_run_resumes_at_its_own_block(self):
+        """No watermark yet, rows stamped at an older block: continue
+        there. Finishing at today's head instead would leave the early
+        rows short of everything in between, and the watermark would then
+        claim otherwise."""
+        first, second = self.safe(), self.safe()
+        self.transfer(self.block(), 500, to=first.address)
+        self.advance_head()
+        interrupted_head = native_balance_head_block()
+        # Stand in for a crash after the first batch: one row written, no
+        # watermark.
+        SafeNativeBalance.objects.create(
+            safe_address=first.address,
+            balance_wei=Decimal(500),
+            updated_to_block=interrupted_head,
+        )
+
+        # The chain moves on before the operator re-runs.
+        self.transfer(self.block(), 70, to=second.address)
+        self.advance_head()
+        self.assertGreater(native_balance_head_block(), interrupted_head)
+
+        output = self.backfill()
+
+        self.assertIn(
+            f"Resuming an interrupted run at block {interrupted_head}", output
+        )
+        self.assertEqual(
+            AnalyticsWatermark.objects.get(name=NATIVE_BALANCE_WATERMARK).block_number,
+            interrupted_head,
+        )
+        # The 70 landed above that block, so it is the incremental run's
+        # to apply — not the backfill's to quietly absorb.
+        self.assertEqual(self.totals(), (500, 1))
+        run_native_balance_rollup()
+        self.assertEqual(self.totals(), (570, 2))
+        self.assertEqual(self.totals(), _calculate_native_balances_from_db())
+
+    def test_inconsistent_stamps_are_refused_rather_than_guessed(self):
+        first, second = self.safe(), self.safe()
+        self.advance_head()
+        head = native_balance_head_block()
+        SafeNativeBalance.objects.create(
+            safe_address=first.address, balance_wei=Decimal(0), updated_to_block=head
+        )
+        SafeNativeBalance.objects.create(
+            safe_address=second.address,
+            balance_wei=Decimal(0),
+            updated_to_block=head - 2,
+        )
+
+        with self.assertRaises(CommandError) as ctx:
+            self.backfill()
+        self.assertIn("--restart", str(ctx.exception))
+
+    def test_status_reports_without_writing(self):
+        self.safe()
+        self.advance_head()
+
+        output = self.backfill(status=True)
+
+        self.assertIn("NOT SET", output)
+        self.assertEqual(SafeNativeBalance.objects.count(), 0)
+
+        self.backfill()
+        self.assertIn("Watermark", self.backfill(status=True))
