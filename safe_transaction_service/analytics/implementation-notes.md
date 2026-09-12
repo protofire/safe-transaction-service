@@ -1252,10 +1252,44 @@ construction — `InternalTx.build_from_trace` sets
 (`indexers/safe_events_indexer.py:567`). If that ever stops being true,
 the seed and the delta will disagree about who owns a block boundary.
 
-`EXISTS (SELECT 1 FROM history_safecontract …)` sits *after* the
-aggregate, so it probes the Safe PK once per distinct counterparty rather
-than once per transfer row. `IN (SELECT address FROM history_safecontract)`
-would materialise ~460k rows on Ethereum.
+## The delta is an UPDATE, and that is load-bearing
+
+The delta statement can only ever update rows that already exist. The
+seed owns row creation, because only the seed knows to compute the
+balance below the watermark first.
+
+An upsert here looks natural and is wrong. A Safe the indexer writes into
+`history_safecontract` *between* this run's seed query and the delta
+statement — seconds to minutes apart on a busy chain, so not exotic —
+would get a row holding only `(W, head]`. Everything it received below
+`W` would be missing, and it would never be seeded again, because a row
+now exists. Silent, permanent undercount.
+
+As an `UPDATE … FROM`, such a Safe is simply skipped this run and seeded
+correctly by the next one, whose watermark covers the window it just
+missed. `TestIncrementalMatchesFullRecompute.test_the_delta_never_creates_a_row`
+pins it by patching the seed's result set to empty.
+
+The join against the rollup also carries the "is it a Safe" filter for
+free — rows only ever come from the seed, which selects from
+`history_safecontract` — and probes the rollup PK once per distinct
+counterparty rather than once per transfer row. `IN (SELECT address FROM
+history_safecontract)` would materialise ~460k rows on Ethereum.
+
+## Orphan rows: known, counted, not repaired
+
+`SafeContract.ethereum_tx` is `on_delete=CASCADE` from `EthereumTx`,
+which cascades from `EthereumBlock` — so `recover_from_reorg` deletes
+Safes, not just transfers. A rollup row for a deleted Safe stays behind
+and keeps contributing a balance that is itself real (it came from
+confirmed blocks) to an address that is no longer a Safe.
+
+It needs a reorg that removes a Safe creation while leaving its funding
+below the confirmation zone intact, so it is rare. The drift check counts
+these rows and logs WARNING; `--restart` is the repair. Counted rather
+than deleted for the same reason the balance drift is only reported: until
+one has been seen in the wild, "delete it" is a guess about what the row
+means.
 
 **Not verified at scale.** Local EXPLAIN runs against empty tables, so it
 confirms syntax and that the access paths exist, not that the planner
@@ -1382,7 +1416,7 @@ yesterday's native side and the next run catches up.
 `check_native_balance_drift_task`, Sundays 05:00. Samples 2000 random
 rollup rows and recomputes them from scratch at the watermark, logging
 WARNING with the mismatch count, the total and worst |diff|, and the five
-worst addresses.
+worst addresses. It also counts orphan rows (see above) in the same pass.
 
 Bounded **at the watermark**, not at the current head: the rollup only
 claims completeness through the watermark, so anything above it is the
@@ -1447,7 +1481,8 @@ Grouped by the failure each class defends against:
   gains the two new ones, and produces the same native numbers as the
   shard path it replaces.
 - `TestDriftCheck` — clean rollup is quiet, a corrupted row is reported
-  with its magnitude, above-watermark activity is not drift.
+  with its magnitude, above-watermark activity is not drift, and an
+  orphan row is reported.
 
 The reference in the equality assertions is
 `_calculate_native_balances_from_db`, which is what `TestNativeBalanceShards`
