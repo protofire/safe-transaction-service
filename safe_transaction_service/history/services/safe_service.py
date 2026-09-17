@@ -2,6 +2,8 @@ import logging
 from dataclasses import dataclass, replace
 from datetime import datetime
 
+from eth_abi import decode as decode_abi
+from eth_abi.exceptions import DecodingError
 from eth_typing import ChecksumAddress
 from eth_utils import event_abi_to_log_topic
 from hexbytes import HexBytes
@@ -19,6 +21,9 @@ from web3 import Web3
 from web3.exceptions import Web3RPCError
 
 from safe_transaction_service.account_abstraction import models as aa_models
+from safe_transaction_service.utils.abis.delegation_manager import (
+    delegation_manager_abi,
+)
 from safe_transaction_service.utils.abis.gelato import gelato_relay_1_balance_v2_abi
 
 from ..exceptions import (
@@ -37,6 +42,10 @@ from ..models import (
 logger = logging.getLogger(__name__)
 
 EthereumAddress = str
+
+# ERC-7579 `ModeCode` `callType` (first byte of the `bytes32` mode)
+CALLTYPE_SINGLE = 0x00
+CALLTYPE_BATCH = 0x01
 
 
 @dataclass
@@ -97,6 +106,9 @@ class SafeService:
         self.cpk_proxy_factory_contract = get_cpk_factory_contract(dummy_w3)
         self.gelato_relay_1_balance_v2_contract = dummy_w3.eth.contract(
             abi=gelato_relay_1_balance_v2_abi
+        )
+        self.delegation_manager_contract = dummy_w3.eth.contract(
+            abi=delegation_manager_abi
         )
         self.proxy_creation_event_topic = event_abi_to_log_topic(
             self.proxy_factory_v1_4_1_contract.events.ProxyCreation().abi
@@ -279,7 +291,8 @@ class SafeService:
 
         For L2 networks the data for the whole transaction will be decoded, so an approximation must
         be done to find the function parameters. There could be more than one `ProxyCreationData` when
-        deploying Safes via contracts like `MultiSend`. `MultiSend` and `Gelato Relay` transactions are supported.
+        deploying Safes via contracts like `MultiSend`. `MultiSend`, `Gelato Relay` and MetaMask's
+        `DelegationManager.redeemDelegations` (smart account gas sponsorship) transactions are supported.
 
         :return: `ProxyCreationData`, `None` if it cannot be decoded
         """
@@ -295,8 +308,10 @@ class SafeService:
         ] or [data]
         results = []
         for data in multisend_data:
-            result = self._decode_proxy_factory(data) or self._decode_cpk_proxy_factory(
-                data
+            result = (
+                self._decode_proxy_factory(data)
+                or self._decode_cpk_proxy_factory(data)
+                or self._decode_redeem_delegations(data)
             )
             if result:
                 results.append(result)
@@ -316,6 +331,57 @@ class SafeService:
             return HexBytes(decoded_gelato_data["_data"])
         except ValueError:
             return data
+
+    def _decode_redeem_delegations(self, data: bytes) -> ProxyCreationData | None:
+        """
+        Try to decode a MetaMask Smart Account `DelegationManager.redeemDelegations` call
+        (EIP-7702 + ERC-7579/ERC-7710 Delegation Framework, used for gas sponsorship), unwrapping
+        the ``ModeCode``/``executionCallData`` pairs to find the wrapped ProxyFactory deployment call
+
+        More info: https://docs.gator.metamask.io/
+
+        :param data:
+        :return: `ProxyCreationData`, `None` if it cannot be decoded
+        """
+        if not data:
+            return None
+        try:
+            _, data_decoded = self.delegation_manager_contract.decode_function_input(
+                data
+            )
+        except ValueError:
+            return None
+
+        modes = data_decoded.get("_modes", [])
+        execution_call_datas = data_decoded.get("_executionCallDatas", [])
+
+        for mode, execution_call_data in zip(modes, execution_call_datas, strict=False):
+            call_type = mode[0]
+            if call_type == CALLTYPE_SINGLE:
+                # `executionCallData` is packed: `target (20 bytes) | value (32 bytes) | callData`
+                if len(execution_call_data) < 52:
+                    continue
+                call_datas = [execution_call_data[52:]]
+            elif call_type == CALLTYPE_BATCH:
+                # `executionCallData` is `abi.encode(Execution[])`, `Execution = (address, uint256, bytes)`
+                try:
+                    executions = decode_abi(
+                        ["(address,uint256,bytes)[]"], execution_call_data
+                    )[0]
+                except DecodingError:
+                    continue
+                call_datas = [call_data for _, _, call_data in executions]
+            else:
+                continue
+
+            for call_data in call_datas:
+                proxy_creation_data = self._decode_proxy_factory(
+                    bytes(call_data)
+                ) or self._decode_cpk_proxy_factory(bytes(call_data))
+                if proxy_creation_data:
+                    return proxy_creation_data
+
+        return None
 
     def _decode_proxy_factory(self, data: bytes) -> ProxyCreationData | None:
         """

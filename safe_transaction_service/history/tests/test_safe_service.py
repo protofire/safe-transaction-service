@@ -23,6 +23,7 @@ from .mocks.mocks_safe_creation import (
     gelato_relay_creation_mock,
     multiple_safes_same_tx_creation_mock,
     multisend_creation_mock,
+    redeem_delegations_creation_mock,
 )
 from .mocks.traces import create_trace, creation_internal_txs
 
@@ -222,7 +223,11 @@ class TestSafeService(SafeTestCaseMixin, TestCase):
         self.assertEqual(safe_info.version, None)
 
     def test_decode_creation_data(self):
-        for creation_mock in (multisend_creation_mock, gelato_relay_creation_mock):
+        for creation_mock in (
+            multisend_creation_mock,
+            gelato_relay_creation_mock,
+            redeem_delegations_creation_mock,
+        ):
             with self.subTest(creation_mock=creation_mock):
                 proxy_creation_data_list = self.safe_service._decode_creation_data(
                     creation_mock["data"]
