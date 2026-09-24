@@ -2238,6 +2238,29 @@ class SafeRelevantTransaction(models.Model):
         ]
 
 
+class HederaSafeTransferCursor(models.Model):
+    """
+    Tracks, per Safe, the Hedera account id it maps to and how far native
+    (non-EVM) HBAR transfer indexing has progressed for it.
+    """
+
+    safe_contract = models.OneToOneField(
+        SafeContract,
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="hedera_transfer_cursor",
+    )
+    hedera_account_id = models.CharField(max_length=32, null=True, blank=True)
+    last_consensus_timestamp = models.CharField(max_length=32, null=True, blank=True)
+    updated = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return (
+            f"Hedera transfer cursor for safe={self.safe_contract_id} "
+            f"account={self.hedera_account_id}"
+        )
+
+
 class SafeStatusBase(models.Model):
     """Shared Safe state representation produced after processing an internal transaction."""
 
