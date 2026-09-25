@@ -2,6 +2,7 @@ import datetime
 from unittest.mock import MagicMock
 
 from django.test import SimpleTestCase, TestCase
+from django.urls import reverse
 
 from ..indexers.hedera_native_transfer_indexer import (
     HederaNativeTransferIndexer,
@@ -467,3 +468,41 @@ class TestHederaNativeTransferVisibleThroughExistingConsumers(TestCase):
         )
         self.assertEqual(len(ether_transfers), 1)
         self.assertEqual(ether_transfers[0]._value, 500_000_000 * 10**10)
+
+    def test_all_transactions_api_never_returns_null_block_number_or_execution_date(
+        self,
+    ):
+        # A synthetic EthereumTx has no linked EthereumBlock until a real
+        # EthereumBlock row for its resolved block number exists locally
+        # (see test_leaves_ethereum_tx_block_none_when_no_matching_block_exists).
+        # Downstream API consumers (e.g. the Safe Client Gateway) validate
+        # this endpoint's blockNumber/executionDate as always-present, so
+        # EthereumTx.execution_date and the serializer's get_block_number
+        # must fall back to the InternalTx leg's own (always-set) values
+        # rather than ever surfacing null for these fields.
+        client = MagicMock()
+        client.resolve_account_id.return_value = "0.0.10127045"
+        client.resolve_block_number.return_value = 12345
+        client.resolve_evm_address.return_value = (
+            "0xaaaa00000000000000000000000000000000aaaa"
+        )
+        client.get_crypto_transfers.return_value = iter([INCOMING_TX])
+
+        safe_contract = SafeContractFactory(
+            address="0x1234567890123456789012345678901234567890"
+        )
+        indexer = HederaNativeTransferIndexer(client=client)
+        indexer.process_safe(safe_contract)
+
+        internal_tx = InternalTx.objects.get()
+        self.assertIsNone(internal_tx.ethereum_tx.block_id)
+
+        response = self.client.get(
+            reverse("v2:history:all-transactions", args=(safe_contract.address,))
+        )
+        self.assertEqual(response.status_code, 200)
+        results = response.json()["results"]
+        self.assertEqual(len(results), 1)
+        self.assertIsNotNone(results[0]["blockNumber"])
+        self.assertEqual(results[0]["blockNumber"], internal_tx.block_number)
+        self.assertIsNotNone(results[0]["executionDate"])

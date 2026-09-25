@@ -453,7 +453,14 @@ class EthereumTx(TimeStampedModel):
     def execution_date(self) -> datetime.datetime | None:
         if self.block_id is not None:
             return self.block.timestamp
-        return None
+        # Synthetic EthereumTx rows (Hedera native transfers indexed
+        # before their resolved block number has a corresponding
+        # EthereumBlock row) have no linked block. Fall back to the
+        # InternalTx leg's own timestamp, which is always set directly
+        # from the real source of truth (e.g. Mirror Node's
+        # consensus_timestamp) regardless of whether `block` is linked.
+        internal_tx = self.internal_txs.first()
+        return internal_tx.timestamp if internal_tx else None
 
     @property
     def success(self) -> bool | None:
