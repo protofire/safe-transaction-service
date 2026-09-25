@@ -453,7 +453,14 @@ class EthereumTx(TimeStampedModel):
     def execution_date(self) -> datetime.datetime | None:
         if self.block_id is not None:
             return self.block.timestamp
-        return None
+        # Synthetic EthereumTx rows (Hedera native transfers indexed
+        # before their resolved block number has a corresponding
+        # EthereumBlock row) have no linked block. Fall back to the
+        # InternalTx leg's own timestamp, which is always set directly
+        # from the real source of truth (e.g. Mirror Node's
+        # consensus_timestamp) regardless of whether `block` is linked.
+        internal_tx = self.internal_txs.first()
+        return internal_tx.timestamp if internal_tx else None
 
     @property
     def success(self) -> bool | None:
@@ -2236,6 +2243,29 @@ class SafeRelevantTransaction(models.Model):
                 safe=event_data["args"]["to"],
             ),
         ]
+
+
+class HederaSafeTransferCursor(models.Model):
+    """
+    Tracks, per Safe, the Hedera account id it maps to and how far native
+    (non-EVM) HBAR transfer indexing has progressed for it.
+    """
+
+    safe_contract = models.OneToOneField(
+        SafeContract,
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="hedera_transfer_cursor",
+    )
+    hedera_account_id = models.CharField(max_length=32, null=True, blank=True)
+    last_consensus_timestamp = models.CharField(max_length=32, null=True, blank=True)
+    updated = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return (
+            f"Hedera transfer cursor for safe={self.safe_contract_id} "
+            f"account={self.hedera_account_id}"
+        )
 
 
 class SafeStatusBase(models.Model):

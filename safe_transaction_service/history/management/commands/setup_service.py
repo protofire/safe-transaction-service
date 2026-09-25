@@ -97,6 +97,13 @@ TASKS = [
         enabled=not settings.ETH_L2_NETWORK,
     ),
     CeleryTaskConfiguration(
+        name="safe_transaction_service.history.tasks.index_hedera_native_transfers_task",
+        description="Index Hedera native (non-EVM) HBAR transfers (every 60 seconds)",
+        interval=60,
+        period=IntervalSchedule.SECONDS,
+        enabled=bool(settings.HEDERA_MIRROR_NODE_URL),
+    ),
+    CeleryTaskConfiguration(
         name="safe_transaction_service.history.tasks.index_safe_events_task",
         description="Index Safe events (L2) (every 5 seconds)",
         interval=5,

@@ -576,6 +576,21 @@ ETHEREUM_4337_SUPPORTED_SAFE_MODULES = env.list(
 # Tracing indexing configuration (not useful for L2 indexing)
 # ------------------------------------------------------------------------------
 ETHEREUM_TRACING_NODE_URL = env("ETHEREUM_TRACING_NODE_URL", default=None)
+
+# Hedera Mirror Node (native, non-EVM HBAR transfer indexing)
+# ------------------------------------------------------------------------------
+HEDERA_MIRROR_NODE_URL = env("HEDERA_MIRROR_NODE_URL", default=None)
+HEDERA_MIRROR_NODE_API_KEY = env("HEDERA_MIRROR_NODE_API_KEY", default=None)
+HEDERA_MIRROR_NODE_RATE_LIMIT_RPS = env.int(
+    "HEDERA_MIRROR_NODE_RATE_LIMIT_RPS", default=10
+)
+HEDERA_MIRROR_NODE_REQUEST_TIMEOUT = env.int(
+    "HEDERA_MIRROR_NODE_REQUEST_TIMEOUT", default=10
+)
+HEDERA_NATIVE_TRANSFER_MAX_TXS_PER_SAFE_PER_RUN = env.int(
+    "HEDERA_NATIVE_TRANSFER_MAX_TXS_PER_SAFE_PER_RUN", default=500
+)
+
 ETH_INTERNAL_TXS_BLOCK_PROCESS_LIMIT = env.int(
     "ETH_INTERNAL_TXS_BLOCK_PROCESS_LIMIT", default=10_000
 )  # Initial number of blocks for `trace_filter` or for the same `trace_block` batch
