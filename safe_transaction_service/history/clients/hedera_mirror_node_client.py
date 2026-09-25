@@ -115,9 +115,18 @@ class HederaMirrorNodeClient(BaseHTTPClient):
             url = urljoin(self.base_url, next_link) if next_link else None
 
     def resolve_block_number(self, consensus_timestamp: str) -> int | None:
+        # A bare `timestamp=<value>` filter matches only a block whose `to`
+        # boundary exactly equals `<value>` (i.e. only when the target
+        # transaction happens to be the very last one in its block) and
+        # silently returns nothing otherwise — confirmed against the real
+        # Mirror Node API, not just documentation. `gte:` + `order=asc` +
+        # `limit=1` reliably returns the first (and only) block whose range
+        # actually contains the timestamp, regardless of the transaction's
+        # position within it.
         data = self._get(
             urljoin(
-                self.base_url, f"api/v1/blocks?timestamp={consensus_timestamp}&limit=1"
+                self.base_url,
+                f"api/v1/blocks?timestamp=gte:{consensus_timestamp}&order=asc&limit=1",
             )
         )
         blocks = data.get("blocks") or []

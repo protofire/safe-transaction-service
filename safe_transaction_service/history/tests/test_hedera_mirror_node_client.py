@@ -122,6 +122,15 @@ class TestHederaMirrorNodeClient(TestCase):
         self.assertEqual(
             self.client.resolve_block_number("1787164650.039440869"), 12345
         )
+        # Real-world regression: a bare `timestamp=<value>` filter only
+        # matches a block whose `to` boundary exactly equals the value
+        # (i.e. only when the target transaction happens to be the very
+        # last one in its block) and silently returns nothing for any
+        # other transaction — confirmed against the real Mirror Node API.
+        # `gte:` + `order=asc` reliably finds the containing block instead.
+        called_url = self.client.http_session.get.call_args[0][0]
+        self.assertIn("timestamp=gte:1787164650.039440869", called_url)
+        self.assertIn("order=asc", called_url)
 
     def test_resolve_block_number_returns_none_when_no_block_found(self):
         self.client.http_session.get = MagicMock(

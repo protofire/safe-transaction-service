@@ -21,13 +21,6 @@ logger = logging.getLogger(__name__)
 
 TINYBAR_TO_WEIBAR = 10**10
 
-# Hedera system accounts that collect network/node fees and staking rewards.
-# These never represent a real counterparty and must be excluded when
-# figuring out who a Safe actually transacted with.
-FEE_COLLECTOR_ACCOUNT_IDS = frozenset(
-    {f"0.0.{n}" for n in range(3, 101)} | {"0.0.800", "0.0.801"}
-)
-
 
 def consensus_timestamp_to_datetime(consensus_timestamp: str) -> datetime.datetime:
     """
@@ -57,103 +50,71 @@ def datetime_to_consensus_timestamp(dt: datetime.datetime) -> str:
 def extract_transfer_legs(mirror_tx: dict, safe_account_id: str) -> list[dict]:
     """
     Turn a Mirror Node ``CRYPTOTRANSFER`` transaction into the list of HBAR
-    movements between ``safe_account_id`` and each real counterparty.
-
-    Anchored on the Safe's own net HBAR change (``safe_net``) rather than
-    trusting every remaining non-fee leg wholesale — a Mirror Node
-    ``transfers`` list can contain legs unrelated to the Safe's own side of
-    the transfer (e.g. the Safe is only the fee payer for a transfer between
-    two other parties, or one sender pays multiple receivers and the Safe is
-    only one of them). Only legs moving HBAR in the opposite direction of
-    ``safe_net`` are real counterparties to the Safe; same-direction legs are
-    other parties on the *same* side and are not attributed to the Safe.
-
-    Excludes Hedera's fee-collector/staking-reward accounts. When exactly one
-    counterparty remains, the Safe's own net amount is used directly. For a
-    true multi-party split, the Safe's net amount is apportioned across
-    counterparties in proportion to their own reported (fee-adjusted) leg
-    magnitudes, so returned amounts always sum to exactly ``safe_net`` — the
-    Safe's credited/debited total can never be inflated by a leg that isn't
-    really part of its side of the transfer. The last leg absorbs any
-    integer-division remainder so the sum is always exact.
+    movements from each real sender to ``safe_account_id``.
 
     :param mirror_tx: One entry from Mirror Node's
         ``/api/v1/transactions?transactiontype=CRYPTOTRANSFER`` response.
     :param safe_account_id: The Safe's own Hedera account id, e.g. ``"0.0.X"``.
     :return: ``[{"counterparty_account_id": str, "amount_tinybar": int}, ...]``,
-        where ``amount_tinybar`` is signed from the Safe's perspective
-        (positive = Safe received).
+        where ``amount_tinybar`` is always positive (HBAR received by the Safe).
     """
     transfers = mirror_tx.get("transfers") or []
     safe_leg = next((t for t in transfers if t["account"] == safe_account_id), None)
-    if not safe_leg:
+    if not safe_leg or safe_leg["amount"] <= 0:
         return []
 
+    safe_net = safe_leg["amount"]
     payer_account_id = mirror_tx["transaction_id"].split("-")[0]
     charged_tx_fee = mirror_tx.get("charged_tx_fee") or 0
 
-    # The Safe's own net HBAR change due to this transaction, fee-adjusted
-    # if the Safe itself paid the fee (its raw ledger leg would otherwise
-    # include the fee it paid, not just the amount actually transferred).
-    safe_net = safe_leg["amount"]
-    if payer_account_id == safe_account_id:
-        safe_net += charged_tx_fee
-
-    if safe_net == 0:
-        # The Safe only paid the transaction fee (or the fee-adjustment
-        # exactly cancels its raw leg) — no real transfer touched the Safe.
-        return []
-
-    counterparty_legs = []
+    sender_legs = []
     for t in transfers:
-        if t["account"] == safe_account_id or t["account"] in FEE_COLLECTOR_ACCOUNT_IDS:
+        if t["account"] == safe_account_id or t["amount"] >= 0:
+            # Not a real sender: either a fee-collector/reward account
+            # or another simultaneous receiver in the same transaction.
             continue
         amount = t["amount"]
-        if t["account"] == payer_account_id and amount < 0:
+        if t["account"] == payer_account_id:
             # This account absorbed the transaction fee as its payer; remove
-            # it so the leg reflects only the HBAR actually transferred.
+            # it so the leg reflects only the HBAR actually sent.
             amount += charged_tx_fee
-        if amount == 0:
+        if amount >= 0:
+            # The payer only paid the fee and sent nothing themselves.
             continue
-        if (amount > 0) == (safe_net > 0):
-            # Same direction as the Safe's own change — another party on the
-            # Safe's own side of the transfer, not a counterparty to it.
-            continue
-        counterparty_legs.append({"account": t["account"], "amount": amount})
+        sender_legs.append({"account": t["account"], "amount": amount})
 
-    if not counterparty_legs:
+    if not sender_legs:
         return []
 
-    if len(counterparty_legs) == 1:
+    if len(sender_legs) == 1:
         return [
             {
-                "counterparty_account_id": counterparty_legs[0]["account"],
+                "counterparty_account_id": sender_legs[0]["account"],
                 "amount_tinybar": safe_net,
             }
         ]
 
     logger.info(
-        "Multi-party Hedera crypto transfer %s involving safe=%s: "
-        "apportioning the Safe's net amount across %d counterparties",
+        "Multi-party Hedera crypto transfer %s to safe=%s: apportioning "
+        "the Safe's net amount across %d senders",
         mirror_tx["transaction_id"],
         safe_account_id,
-        len(counterparty_legs),
+        len(sender_legs),
     )
 
-    total_counterparty_magnitude = sum(abs(leg["amount"]) for leg in counterparty_legs)
-    safe_sign = 1 if safe_net > 0 else -1
+    total_sender_magnitude = sum(abs(leg["amount"]) for leg in sender_legs)
     result = []
     allocated = 0
-    for index, leg in enumerate(counterparty_legs):
-        if index == len(counterparty_legs) - 1:
-            share = abs(safe_net) - allocated
+    for index, leg in enumerate(sender_legs):
+        if index == len(sender_legs) - 1:
+            share = safe_net - allocated
         else:
-            share = abs(safe_net) * abs(leg["amount"]) // total_counterparty_magnitude
+            share = safe_net * abs(leg["amount"]) // total_sender_magnitude
             allocated += share
         result.append(
             {
                 "counterparty_account_id": leg["account"],
-                "amount_tinybar": safe_sign * share,
+                "amount_tinybar": share,
             }
         )
     return result
@@ -283,15 +244,8 @@ class HederaNativeTransferIndexer:
                         data=None,
                         nonce=0,
                         type=0,
-                        # `_from`/`to` are set below from the first leg,
-                        # mirroring how a real single-hop EVM ether transfer
-                        # reports the actual sender/receiver at the top
-                        # level (EthereumTxWithTransfersResponseSerializer
-                        # surfaces these directly as "from"/"to" in the
-                        # all-transactions API, separately from the nested
-                        # `transfers[]` entries built from InternalTx).
                         _from=None,
-                        to=None,
+                        to=safe_contract.address,
                         value=0,
                     )
                     ethereum_txs.append(ethereum_tx)
@@ -307,32 +261,20 @@ class HederaNativeTransferIndexer:
                             counterparty_account_id
                         ]
 
-                        amount_tinybar = leg["amount_tinybar"]
-                        value_weibar = abs(amount_tinybar) * TINYBAR_TO_WEIBAR
-                        if amount_tinybar > 0:
-                            from_address = counterparty_evm_address
-                            to_address = safe_contract.address
-                        else:
-                            from_address = safe_contract.address
-                            to_address = counterparty_evm_address
+                        value_weibar = leg["amount_tinybar"] * TINYBAR_TO_WEIBAR
 
                         if index == 0:
-                            # For a true multi-party split there's no single
-                            # correct top-level from/to; the first leg is the
-                            # most representative choice and matches the
-                            # common single-leg case exactly.
-                            ethereum_tx._from = from_address
-                            ethereum_tx.to = to_address
+                            ethereum_tx._from = counterparty_evm_address
 
                         internal_txs.append(
                             InternalTx(
                                 ethereum_tx=ethereum_tx,
                                 timestamp=timestamp,
                                 block_number=block_number,
-                                _from=from_address,
+                                _from=counterparty_evm_address,
                                 gas=0,
                                 data=None,
-                                to=to_address,
+                                to=safe_contract.address,
                                 value=value_weibar,
                                 gas_used=0,
                                 contract_address=None,
@@ -372,11 +314,6 @@ class HederaNativeTransferIndexer:
             if block_number in existing_block_numbers:
                 ethereum_tx.block_id = block_number
 
-        # Every InternalTx built above already has the Safe as either `to`
-        # or `_from` (extract_transfer_legs only returns legs the Safe is a
-        # party to), so every one of them needs a SafeRelevantTransaction —
-        # unlike the EVM indexer, an outgoing native transfer has no
-        # MultisigTransaction to otherwise surface it in the Safe's feed.
         safe_relevant_txs = [
             SafeRelevantTransaction(
                 ethereum_tx=internal_tx.ethereum_tx,

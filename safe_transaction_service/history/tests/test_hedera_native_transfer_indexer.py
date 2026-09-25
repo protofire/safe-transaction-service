@@ -42,7 +42,13 @@ class TestExtractTransferLegsSimple(SimpleTestCase):
             [{"counterparty_account_id": "0.0.1111111", "amount_tinybar": 500_000_000}],
         )
 
-    def test_outgoing_transfer_where_safe_is_the_payer(self):
+    def test_safe_leg_not_positive_returns_empty(self):
+        # A Safe's Hedera account has no externally-held key (it's created
+        # with a self-referencing ContractID key), so only the Safe
+        # contract's own EVM execution can move value out of it — a Safe
+        # can never be the payer/sender in a native CryptoTransfer. This
+        # guard is defensive: it should never see a non-positive Safe leg
+        # in practice, but must not misbehave if it ever did.
         mirror_tx = {
             "transaction_id": f"{SAFE_ACCOUNT_ID}-1700000000-000000002",
             "charged_tx_fee": 1_200_000,
@@ -53,16 +59,7 @@ class TestExtractTransferLegsSimple(SimpleTestCase):
                 {"account": "0.0.2222222", "amount": 300_000_000},
             ],
         }
-        legs = extract_transfer_legs(mirror_tx, SAFE_ACCOUNT_ID)
-        self.assertEqual(
-            legs,
-            [
-                {
-                    "counterparty_account_id": "0.0.2222222",
-                    "amount_tinybar": -300_000_000,
-                }
-            ],
-        )
+        self.assertEqual(extract_transfer_legs(mirror_tx, SAFE_ACCOUNT_ID), [])
 
     def test_safe_not_a_party_returns_empty(self):
         mirror_tx = {
@@ -104,23 +101,6 @@ class TestExtractTransferLegsSimple(SimpleTestCase):
             ],
         )
 
-    def test_safe_only_pays_fee_for_unrelated_transfer_returns_empty(self):
-        # Safe is only the transaction's payer/fee-sponsor; the actual transfer
-        # is between two unrelated other accounts. No real transfer touched
-        # the Safe, so this must return nothing.
-        mirror_tx = {
-            "transaction_id": f"{SAFE_ACCOUNT_ID}-1700000000-000000005",
-            "charged_tx_fee": 1_200_000,
-            "transfers": [
-                {"account": SAFE_ACCOUNT_ID, "amount": -1_200_000},
-                {"account": "0.0.7", "amount": 400_000},
-                {"account": "0.0.98", "amount": 800_000},
-                {"account": "0.0.1111111", "amount": -500_000_000},
-                {"account": "0.0.2222222", "amount": 500_000_000},
-            ],
-        }
-        self.assertEqual(extract_transfer_legs(mirror_tx, SAFE_ACCOUNT_ID), [])
-
     def test_one_sender_multiple_receivers_including_safe_credits_only_safes_share(
         self,
     ):
@@ -146,8 +126,9 @@ class TestExtractTransferLegsSimple(SimpleTestCase):
         )
 
     def test_third_party_fee_sponsor_leg_does_not_produce_zero_amount_leg(self):
-        # A third party (not the Safe, not the counterparty) sponsors the fee.
-        # Their leg, after fee-adjustment, nets to zero and must not appear.
+        # A third party (not the Safe, not the real sender) sponsors the
+        # fee and sends nothing itself. Their leg, after fee-adjustment,
+        # nets to zero and must not appear.
         mirror_tx = {
             "transaction_id": "0.0.9999999-1700000000-000000007",
             "charged_tx_fee": 1_000_000,
@@ -155,19 +136,39 @@ class TestExtractTransferLegsSimple(SimpleTestCase):
                 {"account": "0.0.9999999", "amount": -1_000_000},
                 {"account": "0.0.7", "amount": 400_000},
                 {"account": "0.0.98", "amount": 600_000},
-                {"account": SAFE_ACCOUNT_ID, "amount": -500_000_000},
-                {"account": "0.0.2222222", "amount": 500_000_000},
+                {"account": "0.0.1111111", "amount": -500_000_000},
+                {"account": SAFE_ACCOUNT_ID, "amount": 500_000_000},
             ],
         }
         legs = extract_transfer_legs(mirror_tx, SAFE_ACCOUNT_ID)
         self.assertEqual(
             legs,
-            [
-                {
-                    "counterparty_account_id": "0.0.2222222",
-                    "amount_tinybar": -500_000_000,
-                }
+            [{"counterparty_account_id": "0.0.1111111", "amount_tinybar": 500_000_000}],
+        )
+
+    def test_unrecognized_fee_collector_account_is_naturally_excluded(self):
+        # Real-world regression: 0.0.802 (a real Hedera fee-collector account
+        # observed on mainnet) isn't a node/staking-reward account an
+        # earlier version of this function had to explicitly enumerate to
+        # exclude. Since a Safe can only ever receive (never send) in a
+        # native transfer, every fee-collector leg is positive — same sign
+        # as the Safe's own positive receipt — so it's excluded by the sign
+        # check alone, with no need to recognize the specific account.
+        mirror_tx = {
+            "transaction_id": "0.0.1111111-1700000000-000000008",
+            "charged_tx_fee": 150_000,
+            "transfers": [
+                {"account": "0.0.1111111", "amount": -(500_000_000 + 150_000)},
+                {"account": "0.0.7", "amount": 50_000},
+                {"account": "0.0.98", "amount": 50_000},
+                {"account": "0.0.802", "amount": 50_000},
+                {"account": SAFE_ACCOUNT_ID, "amount": 500_000_000},
             ],
+        }
+        legs = extract_transfer_legs(mirror_tx, SAFE_ACCOUNT_ID)
+        self.assertEqual(
+            legs,
+            [{"counterparty_account_id": "0.0.1111111", "amount_tinybar": 500_000_000}],
         )
 
 
@@ -197,16 +198,16 @@ INCOMING_TX = {
     ],
 }
 
-OUTGOING_TX = {
-    "transaction_id": "0.0.10127045-1700000100-000000002",
+SECOND_INCOMING_TX = {
+    "transaction_id": "0.0.2222222-1700000100-000000002",
     "consensus_timestamp": "1700000100.000000002",
     "result": "SUCCESS",
     "charged_tx_fee": 1_200_000,
     "transfers": [
-        {"account": "0.0.10127045", "amount": -(300_000_000 + 1_200_000)},
+        {"account": "0.0.2222222", "amount": -(300_000_000 + 1_200_000)},
         {"account": "0.0.7", "amount": 400_000},
         {"account": "0.0.98", "amount": 800_000},
-        {"account": "0.0.2222222", "amount": 300_000_000},
+        {"account": "0.0.10127045", "amount": 300_000_000},
     ],
 }
 
@@ -289,25 +290,16 @@ class TestHederaNativeTransferIndexerProcessSafe(TestCase):
         internal_tx = InternalTx.objects.get()
         self.assertIsNone(internal_tx.ethereum_tx.block_id)
 
-    def test_creates_safe_relevant_transaction_for_both_directions(self):
-        self.client.get_crypto_transfers.return_value = iter([INCOMING_TX, OUTGOING_TX])
+    def test_creates_safe_relevant_transaction_for_each_incoming_transfer(self):
+        self.client.get_crypto_transfers.return_value = iter(
+            [INCOMING_TX, SECOND_INCOMING_TX]
+        )
         self.indexer.process_safe(self.safe_contract)
 
         relevant = SafeRelevantTransaction.objects.filter(
             safe=self.safe_contract.address
         )
         self.assertEqual(relevant.count(), 2)
-
-    def test_outgoing_transfer_sets_correct_from_and_to(self):
-        self.client.get_crypto_transfers.return_value = iter([OUTGOING_TX])
-        self.indexer.process_safe(self.safe_contract)
-
-        internal_tx = InternalTx.objects.get()
-        self.assertEqual(internal_tx._from, self.safe_contract.address)
-        self.assertEqual(internal_tx.to, "0xbbBB00000000000000000000000000000000bBbb")
-        self.assertEqual(internal_tx.value, 300_000_000 * 10**10)
-        self.assertEqual(internal_tx.ethereum_tx._from, internal_tx._from)
-        self.assertEqual(internal_tx.ethereum_tx.to, internal_tx.to)
 
     def test_multi_leg_transfer_uses_first_legs_direction_for_wrapping_ethereum_tx(
         self,
@@ -328,12 +320,10 @@ class TestHederaNativeTransferIndexerProcessSafe(TestCase):
                 {"account": "0.0.10127045", "amount": 300_000_000},
             ],
         }
-        self.client.resolve_evm_address.side_effect = (
-            lambda account_id: {
-                "0.0.1111111": "0xAAAA00000000000000000000000000000000aaaa",
-                "0.0.3333333": "0xcCcc00000000000000000000000000000000cCcC",
-            }[account_id]
-        )
+        self.client.resolve_evm_address.side_effect = lambda account_id: {
+            "0.0.1111111": "0xAAAA00000000000000000000000000000000aaaa",
+            "0.0.3333333": "0xcCcc00000000000000000000000000000000cCcC",
+        }[account_id]
         self.client.get_crypto_transfers.return_value = iter([multi_leg_tx])
 
         created_count = self.indexer.process_safe(self.safe_contract)
