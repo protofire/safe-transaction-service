@@ -35,6 +35,8 @@ from django.db.models import Count, Sum
 from django.utils import timezone
 
 from celery import app, chord, group
+from gevent import Timeout as GeventTimeout
+from redis.exceptions import LockError
 
 from safe_transaction_service.analytics.catchup.day import DayStatus, compute_day
 from safe_transaction_service.analytics.catchup.gate import (
@@ -86,6 +88,27 @@ def bump_dispatch_seq(run: dict, save_fn: Callable[[dict], None]) -> int:
     run["dispatch_seq"] = run.get("dispatch_seq", 0) + 1
     save_fn(run)
     return run["dispatch_seq"]
+
+
+# Floor shared by the native chunk backfill and the ERC-20 chunk phase's
+# heavy-chunk shrink: a chunk still too heavy at this size fails the run
+# outright (the existing retry cap then applies) instead of shrinking
+# further. The ERC-20 whale phase has its own, much larger floor
+# (`whale_block_range`, blocks rather than Safes) -- see
+# `ERC20_BALANCE_BACKFILL_WHALE_BLOCK_RANGE_FLOOR` in `tasks.py`.
+BACKFILL_CHUNK_SIZE_FLOOR = 250
+
+
+def halved_or_none(current: int, floor: int) -> int | None:
+    """Half of `current`, floored at `floor`, or `None` when `current` is
+    already at or below `floor` -- the caller's signal to fail the run
+    instead of shrinking further. Shared by the native chunk backfill and
+    the ERC-20 chunk/whale backfill's heavy-chunk shrink: a size never
+    grows back within a run, so every call here only ever produces a
+    smaller (or equal, at the floor) value than it was given."""
+    if current <= floor:
+        return None
+    return max(floor, current // 2)
 
 
 # ────────────────────── Native-balance sharding ────────────────────────
@@ -557,6 +580,69 @@ def next_native_balance_dispatch_seq(run: dict) -> int:
     return bump_dispatch_seq(run, _save_native_balance_run)
 
 
+def _release_native_balance_lock(lock, run_id: str, context: str) -> None:
+    """Release the shared rollup lock, tolerating the case where it is
+    already gone (the TTL expired before this chunk got to it). Logged as
+    a WARNING, not a failure -- committed work stays either way, and
+    losing the lock never turns an otherwise successful chunk into a
+    failed one."""
+    try:
+        lock.release()
+    except LockError:
+        logger.warning(
+            "native_balance.backfill: run=%s lock already lost by the "
+            "time release was attempted (%s); committed work stays",
+            run_id,
+            context,
+        )
+
+
+def _shrink_native_balance_chunk_or_fail(run: dict, reason: str) -> dict:
+    """Halve `chunk_size` in a native backfill's manifest after a chunk
+    proved too heavy (the task's hard time limit fired), per
+    `BACKFILL_CHUNK_SIZE_FLOOR`, and redispatch the same chunk at the
+    smaller size -- or fail the run once already at the floor, so the
+    existing retry cap (6h cooldown, 3 failures) applies. The chunk's own
+    watermark write only happens after a full, uninterrupted pass
+    (`seed_missing_native_balances` / `write_native_balance_watermark`
+    above), and `seed_missing_native_balances` only ever inserts rows for
+    addresses it first confirms are missing, so a chunk interrupted
+    mid-way is safe to retry from the same cursor at a smaller size --
+    never a bigger one within this run.
+    """
+    new_size = halved_or_none(run["chunk_size"], BACKFILL_CHUNK_SIZE_FLOOR)
+    if new_size is None:
+        run["state"] = "failed"
+        run["error"] = (
+            f"chunk_size is already at the floor "
+            f"({BACKFILL_CHUNK_SIZE_FLOOR} Safes) and the chunk is still "
+            f"too heavy ({reason})."
+        )
+        run["finished_at"] = timezone.now().isoformat()
+        logger.warning(
+            "native_balance.backfill: run=%s chunk_size at floor (%d), failing: %s",
+            run["run_id"],
+            BACKFILL_CHUNK_SIZE_FLOOR,
+            reason,
+        )
+        _save_native_balance_run(run)
+        return run
+
+    run["chunk_size"] = new_size
+    logger.warning(
+        "native_balance.backfill: run=%s chunk too heavy (%s); halving "
+        "chunk_size to %d and retrying the same position",
+        run["run_id"],
+        reason,
+        new_size,
+    )
+    next_seq = next_native_balance_dispatch_seq(run)
+    backfill_native_balance_chunk.apply_async(
+        (run["run_id"], next_seq), queue="contracts"
+    )
+    return run
+
+
 @app.shared_task()
 @task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def backfill_native_balance_chunk(run_id: str, dispatch_seq: int) -> dict:
@@ -652,22 +738,36 @@ def backfill_native_balance_chunk(run_id: str, dispatch_seq: int) -> dict:
     cursor_hex = run.get("cursor")
     after = bytes.fromhex(cursor_hex) if cursor_hex else None
 
+    # See `backfill_erc20_balance_chunk_task`'s own comment on `released`
+    # (`tasks.py`): the same guarantee-exactly-one-release shape applies
+    # here -- `except GeventTimeout` releases early because the shrink
+    # helper's redispatch runs the next task inline under eager mode, and
+    # `finally` covers the success path and any other `BaseException`.
+    released = False
     try:
-        try:
-            with relaxed_statement_timeout():
-                addresses = safe_addresses_after(after, run["chunk_size"])
-                if addresses:
-                    seeded, present = seed_missing_native_balances(
-                        addresses, run["head"]
-                    )
-                else:
-                    # Walked off the end: hand the rollup over under the
-                    # same lock that serialises it against the nightly
-                    # task, and close the run.
-                    wrote = write_native_balance_watermark(run["head"])
-        finally:
-            lock.release()
+        with relaxed_statement_timeout():
+            addresses = safe_addresses_after(after, run["chunk_size"])
+            if addresses:
+                seeded, present = seed_missing_native_balances(addresses, run["head"])
+            else:
+                # Walked off the end: hand the rollup over under the
+                # same lock that serialises it against the nightly
+                # task, and close the run.
+                wrote = write_native_balance_watermark(run["head"])
+    except GeventTimeout:
+        _release_native_balance_lock(lock, run_id, "after a hard-limit timeout")
+        released = True
+        # The hard limit can fire mid DB-query; the connection may be left
+        # mid-query and unusable until closed, so neither the manifest
+        # save below nor (under eager-mode tests) the redispatched chunk
+        # running inline right after it inherits a broken one.
+        connection.close()
+        return _shrink_native_balance_chunk_or_fail(
+            run, reason="the task's hard time limit fired mid-chunk"
+        )
     except Exception as exc:
+        _release_native_balance_lock(lock, run_id, "after a failed chunk")
+        released = True
         logger.exception(
             "native_balance.backfill: run=%s chunk %d failed after %.2fs",
             run_id,
@@ -679,6 +779,9 @@ def backfill_native_balance_chunk(run_id: str, dispatch_seq: int) -> dict:
         run["finished_at"] = timezone.now().isoformat()
         _save_native_balance_run(run)
         return run
+    finally:
+        if not released:
+            _release_native_balance_lock(lock, run_id, "after a successful chunk")
 
     if not addresses:
         run["watermark_written"] = wrote

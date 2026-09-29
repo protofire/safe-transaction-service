@@ -1424,8 +1424,11 @@ the address space and sums its *entire history* — ~29k addresses on
 Ethereum, unbounded in the chain's age, and it does not finish in 900 s. A
 backfill chunk owns 5000 addresses, which is the batch size
 `BALANCE_BATCH_SQL` was measured at: seconds. The shard's work grows with
-the chain, the chunk's does not. Shrink `--chunk-size` if a chain ever
-proves otherwise.
+the chain, the chunk's does not. `--chunk-size` remains a manual override if a chain ever
+proves otherwise, but as of the backfill-liveness hardening pass (2026-09-29, below) a chunk
+that hits the task's hard time limit shrinks itself — halves `chunk_size` in the manifest,
+floor 250, then fails the run at the floor — so an operator no longer has to notice and
+retune it by hand.
 
 **Not a chord, unlike `backfill_daily_metrics`.** The dates of a daily
 backfill are known up front, so it can build a manifest listing every
@@ -2694,14 +2697,18 @@ broker restart doesn't strand an hours-long Optimism run.
    a *broker* restart, as opposed to a *worker* restart, still loses an in-flight message
    outright. Layer 2 is what recovers from that.
 2. **Heartbeat + watchdog.** `_save_erc20_balance_backfill_run` refreshes `run["heartbeat_at"]`
-   on every write (every slice's start, success and failure) — one line, not a `_touch()`
-   call threaded through three task bodies, so it can't be forgotten at a new call site
-   later. `erc20_balance_backfill_watchdog_task` (new beat entry, every 5 minutes,
+   on every write — originally every slice's start, success and failure; the backfill-liveness
+   hardening pass below (2026-09-29) tightened this to after every *committed chunk or whale
+   range*, not just slice boundaries, so a slow-but-alive slice never looks dead. One line, not
+   a `_touch()` call threaded through three task bodies, so it can't be forgotten at a new call
+   site later. `erc20_balance_backfill_watchdog_task` (new beat entry, every 5 minutes,
    `setup_service.py`) re-dispatches the chain when `erc20_balance_backfill_looks_stalled()`
-   says a run is mid-flight (progress rows exist, `erc20_balance` doesn't), its manifest is
-   still `"running"`, and the heartbeat is older than `ERC20_BALANCE_BACKFILL_STALE_SECONDS`
-   (15 min) — then, separately, checks the shared lock is free *right now* before acting
-   (a held lock means genuine work, not a stall; try again next beat). Considered extending
+   says its manifest is `"running"` with no completion watermark, the heartbeat is older than
+   `ERC20_BALANCE_BACKFILL_STALE_SECONDS` (15 min), and the shared lock is free *right now* —
+   originally this also required the progress watermarks to already exist, which is exactly
+   what left Berachain/Astar/Flow/Abstract stuck "running, 0 chunks" forever when their first
+   task was lost before writing them; that precondition was dropped in the hardening pass (see
+   below) and the resumed chunk task's own `resolve_run` creates the progress rows. Considered extending
    `analytics_catchup_task` ("self-healing daily analytics") instead of a new beat task, per
    the architect's "prefer it if it fits" — it doesn't: that task is entirely `DailyMetric`
    catch-up domain logic guarded by `compute_daily_metrics_task`'s own lock, with no natural
@@ -3117,3 +3124,149 @@ snapshot — and `None` if building it raises, so a bootstrap-reporting bug can 
 rest of the summary payload down with it. Existing keys and the warming semantics (empty
 payload, `computed_at: null`, on a cold snapshot) are unchanged. No hub change consumes this
 yet — that's a later, separate hub PR.
+
+---
+
+# Backfill liveness hardening (lessons from the production rollout, 2026-09-29)
+
+Spec: `docs/specs/backfill-liveness-hardening.md` (workspace root). The first production
+bootstrap rollout finished 66/85 services; BASE, Optimism, and four stuck chains
+(Berachain, Astar, Flow, Abstract) needed a human with shell access — exactly what the
+bootstrap exists to avoid. This pass makes the ERC-20 backfill (and, for the shrink
+behaviour, the native backfill) recover from all four failure modes on its own. Producer
+only; see the spec's §6 for the hub work this deliberately leaves out.
+
+## Slices are time-budgeted, not just count-bounded
+
+`run_chunk_slice` / `run_whale_slice` (`backfill_erc20_balances.py`) now take an optional
+`budget_seconds`. A Celery slice stops starting another chunk or whale range once it has
+run for `ERC20_BALANCE_BACKFILL_SLICE_BUDGET_SECONDS` (`tasks.py`) — `LOCK_TIMEOUT / 3`,
+named so a slice always hands off with headroom for the in-flight chunk to finish, the
+manifest save, and the next dispatch, comfortably inside the shared `task_timeout` bound.
+`--task-chunks` (`DEFAULT_TASK_CHUNKS = 20`) stays an upper bound on top of this, not a
+replacement for it — a slice can still end early on the count. `--inline` passes no budget
+at all: it holds the whole run under one lock and has no task hard limit to stay clear of.
+This is what let BASE's 20-chunk slices outrun the 15-minute task limit and get killed
+silently every time; a budgeted slice now hands off before that happens. **The manual flags
+(`--task-chunks`, `--chunk-size`) are overrides for the rare case the automatic budget isn't
+right for a given chain — not a workaround an operator needs to reach for by default
+anymore.** Don't advise `--task-chunks 1` or a small `--chunk-size` as the fix for a heavy
+chain; the automatic budget and the shrink behaviour below are that fix now.
+
+## Progress is per-chunk, not per-slice
+
+Both chain tasks now pass a `progress_cb` into the slice functions; on each committed chunk
+or whale range it folds the delta straight into the run manifest and calls
+`_save_erc20_balance_backfill_run` immediately (`_chunk_progress_cb` / `_whale_progress_cb`,
+`tasks.py`), instead of only at slice end. That single small Redis write per chunk is also
+what refreshes `heartbeat_at` per chunk rather than per slice — a slow-but-alive run no
+longer goes quiet for up to a whole slice's worth of chunks.
+
+## Heavy-chunk shrink: a chunk retries itself smaller instead of failing at the same size
+
+"Too heavy" is either of two things, both now explicit outcomes instead of a silent kill or
+a bare failure:
+
+- the task's hard time limit fires mid-chunk — a gevent `Timeout`, a `BaseException` that
+  bypasses `except Exception` unless caught by name. All three chunk-shaped tasks
+  (`backfill_erc20_balance_chunk_task` / `_whale_task` in `tasks.py`,
+  `backfill_native_balance_chunk` in `tasks_shards.py`) now catch `GeventTimeout` explicitly,
+  close the (possibly broken, mid-query) DB connection, and shrink;
+- the ERC-20 chunk phase's existing second-statement-timeout path (seed times out again
+  after run-time whale detection) — this used to raise a bare `CommandError`; it now raises
+  the dedicated `Erc20BalanceBackfillChunkTooHeavy` so the Celery chunk task can tell "too
+  heavy" apart from every other failure. `--inline` still just raises it unchanged — an
+  operator at the shell sees the same message as before.
+
+Either one halves the size in the manifest (`tasks_shards.halved_or_none`, shared by all
+three) — `chunk_size` floor `BACKFILL_CHUNK_SIZE_FLOOR = 250` Safes (ERC-20 chunk phase and
+native both), `whale_block_range` floor `ERC20_BALANCE_BACKFILL_WHALE_BLOCK_RANGE_FLOOR =
+10,000` blocks — logs a WARNING, and redispatches the *same position*: the interrupted
+chunk's transaction already rolled back, so nothing was double-applied. At the floor the run
+goes `"failed"` instead of shrinking further, and the existing retry policy (6h cooldown, 3
+failures, then give up) applies from there. The size never grows back within a run — a new
+run starts at the default again. This was the rollout's worst pattern: Optimism's first
+5,000-Safe chunk retried at full size twice, 40 minutes of heavy database load each time, on
+its way to giving up. `--inline` has no shrink path at all — its own hard-limit handling (or
+lack of one) is unchanged, since it isn't a Celery task and has no task hard limit to hit.
+
+## Losing the lock is a warning, not a failure
+
+A `LockError` (covers `LockNotOwnedError`) on `lock.extend()` or `lock.release()` is caught
+and logged at WARNING, never turned into a task failure — work already committed stays, and
+`dispatch_seq` still guarantees only one chain is live. Release is now wrapped so it happens
+exactly once on every exit path of all three ERC-20 chain tasks and the native chunk task
+(`_release_erc20_backfill_lock` / `_release_native_balance_lock`, plus a `released` flag and
+a `finally`) — the old `try/finally: lock.release()` shape would have let a bare
+`lock.release()` raise a second, unwanted exception on top of whatever the `except` clause
+was already handling. A lock lost *while extending mid-slice* (as opposed to at the final
+release) is different from a lock lost at the end: `run_chunk_slice` / `run_whale_slice` stop
+at the next chunk/range boundary and let the caller hand off normally, exactly as if the
+slice had hit its budget — this is Celery-only; `--inline` still raises on a lost extend,
+since it holds the lock for the whole run and a loss there is a real problem the operator
+needs to see. This is what turned Optimism's "Cannot release a lock that's no longer owned"
+into two full failed runs instead of one warning and a continued chain.
+
+## Stall detection no longer requires progress rows
+
+`erc20_balance_backfill_looks_stalled()` dropped the precondition that the progress
+watermarks already exist. It now requires only: no completion watermark, a `"running"`
+manifest, the shared rollup lock free *right now* (a new non-blocking acquire-and-release
+probe, mirroring native's own check), and `heartbeat_at` (falling back to `started_at`)
+older than `ERC20_BALANCE_BACKFILL_STALE_SECONDS`. This is the rule native already used, and
+it directly unblocks the failure mode that left Berachain, Astar, Flow and Abstract
+"running, 0 chunks" forever: their very first chunk task was lost before it ever wrote the
+progress watermarks, so the old rule could never recognise the run as stalled at all. The
+watchdog resumes at the manifest's own `phase` — for a lost-first-task run that's still
+`"chunks"` — and the chunk task's `resolve_run` creates the progress rows itself the first
+time it runs, same as a brand-new run. **Nothing about stall detection needs database
+progress rows to exist; don't reintroduce that precondition or describe it as required.**
+
+## Whale-phase progress
+
+In phase `"whales"`, `Erc20Stage.progress()` (`bootstrap/erc20.py`) and
+`backfill_erc20_balances --status` both gained `whale_progress_from_run` — the whale
+watermark block reached, the fixed head, the fraction done, the ranges remaining at the
+current `whale_block_range`, and the whale count (`Erc20BalanceWhale.objects.count()`).
+Sourced only from `AnalyticsWatermark`, `Erc20BalanceWhale` and the manifest — never the
+transfer tables — so it's cheap enough for a status line. These keys
+(`whale_progress_block`, `whale_head`, `whale_fraction_done`, `whale_ranges_remaining`,
+`whale_count`) are additive and appear only in phase `"whales"`; every other phase omits
+them entirely rather than sending `null`. They surface in three places that all read the
+same function, so they can't disagree: `analytics_bootstrap --status`, `/summary/`'s
+`bootstrap.stages.erc20`, and a new `whales: …` line in `backfill_erc20_balances --status`.
+Before this, the whale walk was invisible — a long walk and a hang looked identical.
+
+## Token holdings: computed-but-empty is data, not warming
+
+`_token_holdings_chain_level_or_none` (`analytics_service.py`) used to treat "the
+`token_holdings` `AnalyticsSnapshot` row is missing" and "the row exists but `TokenHolding`
+has no rows" as the same "warming" signal, dispatching a refresh either way. It now returns
+`None` (warming) only for the first case. Once the snapshot exists, an empty `TokenHolding`
+table — a chain with no ERC-20 activity at all, or one where every token's last holder
+exited — is a real, computed result: `/token-holdings/` returns the snapshot's
+`computed_at`, `as_of_block`, `as_of_timestamp` and chain-level fields with `tokens: []` and
+no `next_cursor`, and dispatches nothing. This matches how `/summary/`, `/safe-segments/`
+and `/tvl/` already treat an empty-but-computed snapshot, and stops the 30-minute rollup
+re-run that tiny chains (Ault, Etherlink Shadownet, TAC Saint Petersburg) triggered forever.
+`--restart` still deletes the snapshot outright, so a wiped instance correctly goes back to
+warming. Cursor and 409 semantics are unchanged — an empty result simply has no pages.
+**An empty `TokenHolding` no longer means warming by itself; only a missing snapshot row
+does. Don't describe the two as equivalent.**
+
+Contract: the only externally visible change is `/token-holdings/` reporting a real
+`computed_at` instead of `null` for an empty-but-computed chain — additive in meaning, and
+the hub needs no change to tolerate it (it already treats `computed_at` truthiness as "not
+warming"). The workspace `CLAUDE.md` invariant 1 wording was updated to match.
+
+## Tests
+
+Eager mode against real Postgres/Redis, per this repo's usual convention: budget hand-off
+before `task_chunks`; per-chunk counters and heartbeat, including a slice interrupted
+partway through; a hard-limit `Timeout` and the second statement timeout both halving
+`chunk_size` and retrying the same position, and failing at the floor; `LockError` on
+release or extend logging a warning without failing the run; `looks_stalled` firing for a
+running manifest with no progress rows, with the watchdog resume creating them and
+completing; whale-phase progress fields; the native chunk's own shrink/floor/lock-loss
+mirror; and the token-holdings view returning a computed empty result with no dispatch,
+alongside the existing warming/cursor/409 tests unchanged.

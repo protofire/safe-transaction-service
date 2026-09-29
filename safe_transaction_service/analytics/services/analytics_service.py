@@ -465,12 +465,14 @@ EMPTY_TVL_PAYLOAD: dict = {
     "native_updated_to_block": None,
     "computed_at": None,
 }
-# Warming shape for `/token-holdings/` (spec §5 "Warming" + §12 P5 Notes):
-# `AnalyticsSnapshot(name='token_holdings')` missing OR `TokenHolding` empty
-# both mean "the rollup hasn't run yet" and return this, HTTP 200. The
-# chain-level keys mirror exactly what `rebuild_token_holdings` / P2's
-# `run_erc20_balance_rollup` writes into the snapshot payload, so a warm
-# response is this dict's keys plus real values, never a different shape.
+# Warming shape for `/token-holdings/` (spec §5 "Warming" + §12 P5 Notes).
+# Returned, HTTP 200, only when `AnalyticsSnapshot(name='token_holdings')`
+# is missing -- "the rollup hasn't run yet". An empty `TokenHolding` table
+# with a snapshot present is a computed, not warming, result (see
+# `_token_holdings_chain_level_or_none`). The chain-level keys mirror
+# exactly what `rebuild_token_holdings` / P2's `run_erc20_balance_rollup`
+# writes into the snapshot payload, so a warm response is this dict's keys
+# plus real values, never a different shape.
 EMPTY_TOKEN_HOLDINGS_PAYLOAD: dict = {
     "as_of_block": None,
     "as_of_timestamp": None,
@@ -1514,18 +1516,22 @@ class AnalyticsService:
     def _token_holdings_chain_level_or_none(self) -> dict | None:
         """Read ``AnalyticsSnapshot(name='token_holdings')``.
 
-        Returns ``None`` when the snapshot is missing *or* ``TokenHolding``
-        has no rows — both mean "warming" per spec §5, and the caller
-        returns ``EMPTY_TOKEN_HOLDINGS_PAYLOAD`` immediately. Either miss
-        fire-and-forget dispatches ``compute_erc20_balance_rollup_task``,
-        wrapped exactly like every other snapshot read
-        (``_maybe_dispatch_refresh`` swallows broker errors) so a down
-        broker never fails the request.
+        Returns ``None`` only when the snapshot row itself is missing — that
+        is the sole "warming" signal. Once a snapshot exists, an empty
+        ``TokenHolding`` table
+        (e.g. a chain with no ERC-20 activity at all, or every token's last
+        holder exited) is a real, computed result, not warming: the caller
+        returns the chain-level payload with ``tokens: []`` and no refresh
+        is dispatched, matching how ``/summary/``, ``/safe-segments/`` and
+        ``/tvl/`` treat an empty-but-computed snapshot. This also stops the
+        30-minute rollup re-run on chains that will never hold ERC-20.
+
+        A missing snapshot fire-and-forget dispatches
+        ``compute_erc20_balance_rollup_task``, wrapped exactly like every
+        other snapshot read (``_maybe_dispatch_refresh`` swallows broker
+        errors) so a down broker never fails the request.
         """
-        from safe_transaction_service.analytics.models import (
-            AnalyticsSnapshot,
-            TokenHolding,
-        )
+        from safe_transaction_service.analytics.models import AnalyticsSnapshot
         from safe_transaction_service.analytics.tasks import (
             compute_erc20_balance_rollup_task,
         )
@@ -1534,14 +1540,6 @@ class AnalyticsService:
             snap = AnalyticsSnapshot.objects.get(name="token_holdings")
         except AnalyticsSnapshot.DoesNotExist:
             logger.info("analytics.snapshot.cold_read name=token_holdings")
-            self._maybe_dispatch_refresh(
-                "token_holdings", compute_erc20_balance_rollup_task
-            )
-            return None
-        if not TokenHolding.objects.exists():
-            logger.info(
-                "analytics.snapshot.cold_read name=token_holdings (empty TokenHolding)"
-            )
             self._maybe_dispatch_refresh(
                 "token_holdings", compute_erc20_balance_rollup_task
             )

@@ -67,16 +67,31 @@ class Erc20Stage(Stage):
 
     def progress(self) -> dict | None:
         """Cheap progress straight from the current run's manifest -- no
-        counting query. ``None`` if there is no run (never started, or
-        the manifest expired)."""
+        counting query, except for the whale phase's `Erc20BalanceWhale`
+        count (`whale_progress_from_run`, itself a cheap lookup, not a
+        scan). ``None`` if there is no run (never started, or the
+        manifest expired).
+
+        In phase ``"whales"``, adds the whale-walk fields from
+        `whale_progress_from_run`: additive keys, omitted (not even as
+        ``null``) in every other phase, since they mean nothing before
+        the walk starts.
+        """
         run = self._current_run()
         if run is None:
             return None
-        return {
+        result = {
             "phase": run.get("phase"),
             "chunks_done": run.get("chunks_done"),
             "safes_seen": run.get("safes_seen"),
         }
+        if run.get("phase") == "whales":
+            from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
+                whale_progress_from_run,
+            )
+
+            result.update(whale_progress_from_run(run))
+        return result
 
     def start_or_resume(self) -> None:
         """Adopt an orphaned run or start a fresh one. Never resumes a
