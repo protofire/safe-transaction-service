@@ -20,9 +20,12 @@ from unittest.mock import patch
 
 from django.core.management import call_command
 from django.core.management.base import CommandError
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 
+import redis.lock
 from eth_account import Account
+from gevent import Timeout as GeventTimeout
+from redis.exceptions import LockNotOwnedError
 
 from safe_transaction_service.analytics.models import (
     AnalyticsSnapshot,
@@ -41,6 +44,7 @@ from safe_transaction_service.analytics.tasks import (
     run_native_balance_rollup,
 )
 from safe_transaction_service.analytics.tasks_shards import (
+    BACKFILL_CHUNK_SIZE_FLOOR,
     HEX_PREFIXES,
     NATIVE_BALANCE_CURSOR_KEY,
     NATIVE_BALANCE_RUN_KEY_PREFIX,
@@ -57,6 +61,7 @@ from safe_transaction_service.history.tests.factories import (
     SafeMasterCopyFactory,
 )
 from safe_transaction_service.utils.redis import get_redis
+from safe_transaction_service.utils.tasks import get_task_lock_name
 
 # Well clear of `EthereumBlockFactory.number`'s 1-based sequence.
 BASE_BLOCK = 1_000_000
@@ -1174,3 +1179,151 @@ class TestChunkedCeleryBackfill(NativeBalanceRollupTestCase):
         self.safe()
         self.advance_head()
         self.assertIn("none recorded", self.backfill(status=True))
+
+
+# ═══════════════ Heavy-chunk shrink, hard-limit, lock loss ═════════════
+#
+# The native side: the chunk task's hard-limit `Timeout` halves
+# `chunk_size` (floor 250 Safes, shared with the ERC-20 chunk phase's own
+# floor) and retries the same cursor, or fails at the floor. A lost lock
+# on `release` is a warning, never a failure -- native's chunk task is one
+# chunk per task with no sub-chunk loop, so there is no `extend` call to
+# lose the lock mid-slice the way the ERC-20 chain has.
+
+
+class TestChunkLockLostOnReleaseIsWarningNotFailure(TestChunkedCeleryBackfill):
+    """A `LockNotOwnedError` on release means the TTL already expired --
+    the key is really gone. `flaky_release` below deletes it before
+    raising, instead of just raising, so the fake matches what a real
+    expiry leaves behind: nothing to leak into the next test."""
+
+    def setUp(self):
+        super().setUp()
+        self._lock_name = get_task_lock_name(compute_native_balance_rollup_task.name)
+        get_redis().delete(self._lock_name)
+        self.addCleanup(lambda: get_redis().delete(self._lock_name))
+
+    def test_lock_not_owned_on_release_is_a_warning_and_the_run_completes(self):
+        for _ in range(3):
+            self.safe()
+        self.advance_head()
+        head = native_balance_head_block()
+
+        original_release = redis.lock.Lock.release
+        release_calls = {"n": 0}
+
+        def flaky_release(lock_self, *args, **kwargs):
+            release_calls["n"] += 1
+            if release_calls["n"] == 1:
+                # The first chunk's own release, right after it seeded
+                # every Safe successfully. Simulate the TTL having
+                # already expired -- the key is really gone, not just a
+                # raised exception.
+                get_redis().delete(lock_self.name)
+                raise LockNotOwnedError("Cannot release a lock that's no longer owned")
+            return original_release(lock_self, *args, **kwargs)
+
+        with patch.object(redis.lock.Lock, "release", flaky_release):
+            self.backfill(celery=True, chunk_size=10)
+
+        self.assertGreaterEqual(release_calls["n"], 1)
+        run = load_native_balance_run(latest_native_balance_run_id())
+        self.assertEqual(run["state"], "finished")
+        self.assertEqual(SafeNativeBalance.objects.count(), 3)
+        self.assertEqual(
+            AnalyticsWatermark.objects.get(name=NATIVE_BALANCE_WATERMARK).block_number,
+            head,
+        )
+
+
+class NativeBalanceRollupHardLimitTestCase(TransactionTestCase):
+    """`TransactionTestCase`, not `TestCase`: same reasoning as
+    `Erc20BalanceBackfillHardLimitTestCase`
+    (`test_backfill_erc20_balances.py`) -- the hard-limit `Timeout`
+    handler calls `django.db.connection.close()`, which `TestCase`'s
+    per-test atomic-block wrapping turns into `ProgrammingError: Cannot
+    open a new connection in an atomic block` the moment the redispatched
+    chunk (eager mode: inline, in the same test) runs its next query.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.next_block = 1_000
+        redis = get_redis()
+        keys = list(redis.scan_iter(match=f"{NATIVE_BALANCE_RUN_KEY_PREFIX}*"))
+        keys.append(NATIVE_BALANCE_CURSOR_KEY)
+        redis.delete(*keys)
+
+    def block(self, confirmed: bool = True):
+        self.next_block += 1
+        return EthereumBlockFactory(number=self.next_block, confirmed=confirmed)
+
+    def safe(self, block=None):
+        return SafeContractFactory(
+            ethereum_tx=EthereumTxFactory(block=block or self.block())
+        )
+
+    def advance_head(self, blocks: int = 3):
+        for _ in range(blocks):
+            self.block(confirmed=True)
+
+    def backfill(self, **kwargs) -> str:
+        out = StringIO()
+        call_command("backfill_native_balances", stdout=out, stderr=out, **kwargs)
+        return out.getvalue()
+
+
+class TestChunkHardLimitTimeoutShrinksAndCompletes(
+    NativeBalanceRollupHardLimitTestCase
+):
+    def test_hard_limit_timeout_during_a_chunk_halves_chunk_size_and_completes(self):
+        for _ in range(3):
+            self.safe()
+        self.advance_head()
+        head = native_balance_head_block()
+
+        import safe_transaction_service.analytics.tasks as tasks_module
+
+        original_seed = tasks_module.seed_missing_native_balances
+        calls = {"n": 0}
+
+        def flaky(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise GeventTimeout()
+            return original_seed(*args, **kwargs)
+
+        with patch(
+            "safe_transaction_service.analytics.tasks.seed_missing_native_balances",
+            side_effect=flaky,
+        ):
+            self.backfill(celery=True, chunk_size=500)
+
+        run = load_native_balance_run(latest_native_balance_run_id())
+        self.assertEqual(run["state"], "finished")
+        self.assertEqual(run["chunk_size"], 250)
+        self.assertEqual(SafeNativeBalance.objects.count(), 3)
+        self.assertEqual(
+            AnalyticsWatermark.objects.get(name=NATIVE_BALANCE_WATERMARK).block_number,
+            head,
+        )
+
+
+class TestChunkHardLimitTimeoutAtFloorFails(NativeBalanceRollupHardLimitTestCase):
+    def test_hard_limit_timeout_at_the_floor_fails_the_run(self):
+        self.safe()
+        self.advance_head()
+
+        def always_timeout(*args, **kwargs):
+            raise GeventTimeout()
+
+        with patch(
+            "safe_transaction_service.analytics.tasks.seed_missing_native_balances",
+            side_effect=always_timeout,
+        ):
+            self.backfill(celery=True, chunk_size=BACKFILL_CHUNK_SIZE_FLOOR)
+
+        run = load_native_balance_run(latest_native_balance_run_id())
+        self.assertEqual(run["state"], "failed")
+        self.assertIn(str(BACKFILL_CHUNK_SIZE_FLOOR), run["error"])
+        self.assertIn("floor", run["error"])

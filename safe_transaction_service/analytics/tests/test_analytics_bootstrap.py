@@ -64,7 +64,10 @@ from safe_transaction_service.analytics.management.commands.backfill_erc20_balan
 from safe_transaction_service.analytics.management.commands.backfill_native_balances import (
     Command as NativeBackfillCommand,
 )
-from safe_transaction_service.analytics.models import AnalyticsWatermark
+from safe_transaction_service.analytics.models import (
+    AnalyticsWatermark,
+    Erc20BalanceWhale,
+)
 from safe_transaction_service.analytics.tasks import (
     ERC20_BALANCE_BACKFILL_CURSOR_KEY,
     ERC20_BALANCE_BACKFILL_RUN_KEY_PREFIX,
@@ -174,6 +177,29 @@ class AnalyticsBootstrapTestCase(TestCase):
         )
         with patch.object(
             tasks_module.backfill_erc20_balance_chunk_task, "apply_async"
+        ):
+            run = dispatch_erc20_balance_backfill_run(run)
+        return run
+
+    def fabricate_whale_phase_run(
+        self, *, head: int, whale_block_range: int = 500_000, **run_kwargs
+    ):
+        """A manifest already in the whale-walk phase with a known fixed
+        `head` -- built directly rather than walked through the chunk
+        phase, so the test controls `head` and `whale_block_range`
+        precisely."""
+        run = build_erc20_balance_backfill_run(
+            chunk_size=run_kwargs.get("chunk_size", 10),
+            whale_min_frequency=run_kwargs.get("whale_min_frequency", 0.001),
+            whale_row_threshold=run_kwargs.get("whale_row_threshold", 10),
+            whale_block_range=whale_block_range,
+            statement_timeout_ms=run_kwargs.get("statement_timeout_ms", 1_000),
+            task_chunks=run_kwargs.get("task_chunks", 10),
+            phase="whales",
+        )
+        run["head"] = head
+        with patch.object(
+            tasks_module.backfill_erc20_balance_whale_task, "apply_async"
         ):
             run = dispatch_erc20_balance_backfill_run(run)
         return run
@@ -804,6 +830,64 @@ class TestErc20StatusReportsFailed(SettledGateMixin, AnalyticsBootstrapTestCase)
         self.assertNotEqual(new_run_id, run["run_id"])
         new_run = load_erc20_balance_backfill_run(new_run_id)
         self.assertEqual(new_run["state"], "finished")
+
+
+# ═══════════════════ ERC-20 stage whale-phase progress ═══════════════════
+
+
+class TestErc20StageWhaleProgress(SettledGateMixin, AnalyticsBootstrapTestCase):
+    """`Erc20Stage.progress()` adds the whale-walk fields once the
+    manifest reaches phase `"whales"`, sourced only from the whale
+    watermark, `Erc20BalanceWhale` and the manifest -- never a query over
+    the transfer tables."""
+
+    def test_whale_fields_present_and_correct_in_the_whale_phase(self):
+        self.fabricate_whale_phase_run(head=1_000_000, whale_block_range=100_000)
+        AnalyticsWatermark.objects.create(
+            name=backfill_module._WHALE_PROGRESS_WATERMARK,
+            block_number=300_000,
+            computed_at=self.clock,
+        )
+        for _ in range(3):
+            Erc20BalanceWhale.objects.create(safe_address=self.safe().address)
+
+        progress = Erc20Stage().progress()
+
+        self.assertEqual(progress["phase"], "whales")
+        self.assertEqual(progress["whale_progress_block"], 300_000)
+        self.assertEqual(progress["whale_head"], 1_000_000)
+        self.assertEqual(progress["whale_fraction_done"], round(300_000 / 1_000_000, 4))
+        # ceil((1_000_000 - 300_000) / 100_000) == 7
+        self.assertEqual(progress["whale_ranges_remaining"], 7)
+        self.assertEqual(progress["whale_count"], 3)
+
+    def test_whale_progress_block_defaults_to_zero_with_no_watermark_row_yet(self):
+        self.fabricate_whale_phase_run(head=500_000, whale_block_range=100_000)
+
+        progress = Erc20Stage().progress()
+
+        self.assertEqual(progress["whale_progress_block"], 0)
+        self.assertEqual(progress["whale_fraction_done"], 0.0)
+        self.assertEqual(progress["whale_ranges_remaining"], 5)
+        self.assertEqual(progress["whale_count"], 0)
+
+    def test_whale_fields_are_absent_outside_the_whale_phase(self):
+        self.safe()
+        self.advance_head()
+        run = self.fabricate_stalled_run()
+
+        progress = Erc20Stage().progress()
+
+        self.assertEqual(run["phase"], "chunks")
+        self.assertEqual(progress["phase"], "chunks")
+        for key in (
+            "whale_progress_block",
+            "whale_head",
+            "whale_fraction_done",
+            "whale_ranges_remaining",
+            "whale_count",
+        ):
+            self.assertNotIn(key, progress)
 
 
 # ═══════════════════ Retry cooldown / give-up cap (tick step 6) ═════════

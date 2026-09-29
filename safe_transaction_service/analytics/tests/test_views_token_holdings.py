@@ -128,22 +128,26 @@ class TestWarming(TokenHoldingsTestMixin, APITestCase):
     @patch(
         "safe_transaction_service.analytics.tasks.compute_erc20_balance_rollup_task.delay"
     )
-    def test_snapshot_present_but_token_holding_empty_is_still_warming(
+    def test_snapshot_present_but_token_holding_empty_is_computed_not_warming(
         self, mock_delay
     ):
-        """§5 warming applies when *either* the snapshot is missing *or*
-        `TokenHolding` has no rows — a snapshot can exist from a previous
-        run while every row was since deleted (every token's last holder
-        exited)."""
-        _write_snapshot(as_of_block=100)
+        """Once the snapshot row exists, an empty `TokenHolding` table --
+        e.g. every token's last holder exited, or the chain never held any
+        ERC-20 -- is a real, computed result, not warming, and no refresh
+        is dispatched."""
+        _write_snapshot(as_of_block=100, tokens_with_holders=0, safes_with_any_erc20=0)
         self.assertFalse(TokenHolding.objects.exists())
 
         response = self.client.get(self.url, **self.auth_header)
 
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         self.assertEqual(response.data["tokens"], [])
-        self.assertIsNone(response.data["computed_at"])
-        mock_delay.assert_called_once()
+        self.assertIsNotNone(response.data["computed_at"])
+        self.assertEqual(response.data["as_of_block"], 100)
+        self.assertEqual(response.data["tokens_with_holders"], 0)
+        self.assertEqual(response.data["safes_with_any_erc20"], 0)
+        self.assertIsNone(response.data["next_cursor"])
+        mock_delay.assert_not_called()
 
 
 class TestParamValidation(TokenHoldingsTestMixin, APITestCase):
@@ -290,6 +294,36 @@ class TestStaleCursor(TokenHoldingsTestMixin, APITestCase):
         response = self.client.get(
             self.url, {"cursor": stale_cursor}, **self.auth_header
         )
+        self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
+        self.assertIn("error", response.data)
+
+
+class TestEmptySnapshotCursor(TokenHoldingsTestMixin, APITestCase):
+    """Cursor behaviour against a computed-but-empty snapshot: an empty
+    result still has pages in principle, so the cursor rules stay
+    exactly as they are for a non-empty one."""
+
+    def test_cursor_matching_as_of_block_on_empty_snapshot_yields_empty_page(self):
+        _write_snapshot(as_of_block=100, tokens_with_holders=0, safes_with_any_erc20=0)
+        self.assertFalse(TokenHolding.objects.exists())
+        cursor = _encode_cursor(100, 10, Account.create().address)
+
+        response = self.client.get(self.url, {"cursor": cursor}, **self.auth_header)
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.data["tokens"], [])
+        self.assertIsNone(response.data["next_cursor"])
+        self.assertIsNotNone(response.data["computed_at"])
+
+    def test_cursor_mismatched_as_of_block_on_empty_snapshot_is_still_409(self):
+        _write_snapshot(as_of_block=100, tokens_with_holders=0, safes_with_any_erc20=0)
+        self.assertFalse(TokenHolding.objects.exists())
+        stale_cursor = _encode_cursor(99, 10, Account.create().address)
+
+        response = self.client.get(
+            self.url, {"cursor": stale_cursor}, **self.auth_header
+        )
+
         self.assertEqual(response.status_code, status.HTTP_409_CONFLICT)
         self.assertIn("error", response.data)
 

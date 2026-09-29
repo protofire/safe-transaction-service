@@ -13,6 +13,7 @@ from django.utils import timezone
 
 from celery import app
 from dateutil.relativedelta import relativedelta
+from gevent import Timeout as GeventTimeout
 from hexbytes import HexBytes
 from redis.exceptions import LockError
 
@@ -2675,16 +2676,19 @@ def compute_erc20_balance_rollup_task(self):
 #      *worker* restart, still loses an in-flight message outright. Layer
 #      2 below is what recovers from that.
 #   2. A heartbeat on the run manifest (`heartbeat_at`, refreshed by
-#      every `_save_erc20_balance_backfill_run` call — i.e. on every
-#      slice's start, success and failure) plus
+#      every `_save_erc20_balance_backfill_run` call — after every
+#      committed chunk or whale range, not just on a slice's start,
+#      success and failure) plus
 #      `erc20_balance_backfill_watchdog_task`, a beat task (every 5
-#      minutes, `setup_service.py`) that re-dispatches the chain when the
-#      progress watermarks say a run is mid-flight, its manifest is still
-#      `"running"`, the heartbeat has gone stale
-#      (`ERC20_BALANCE_BACKFILL_STALE_SECONDS`), and the shared lock is
-#      free right now (proof nothing legitimate is in flight this
-#      instant). See `erc20_balance_backfill_looks_stalled` and
-#      `erc20_balance_backfill_watchdog_task` below.
+#      minutes, `setup_service.py`) that re-dispatches the chain when its
+#      manifest is still `"running"` with no completion watermark, the
+#      heartbeat has gone stale (`ERC20_BALANCE_BACKFILL_STALE_SECONDS`),
+#      and the shared lock is free right now (proof nothing legitimate is
+#      in flight this instant). No progress watermarks are required to
+#      exist: a run whose very first chunk task was lost before it wrote
+#      them looks stalled too, and the resumed chunk task's own
+#      `resolve_run` creates them. See `erc20_balance_backfill_looks_stalled`
+#      and `erc20_balance_backfill_watchdog_task` below.
 
 ERC20_BALANCE_BACKFILL_RUN_KEY_PREFIX = "analytics_erc20_balance_backfill_run:"
 ERC20_BALANCE_BACKFILL_CURSOR_KEY = "analytics_erc20_balance_backfill_cursor"
@@ -2702,6 +2706,25 @@ ERC20_BALANCE_BACKFILL_LOCK_RETRY_COUNTDOWN = 15
 # never trips it, short enough that a genuine stall does not sit silent
 # for hours on an Optimism-sized run.
 ERC20_BALANCE_BACKFILL_STALE_SECONDS = 15 * 60
+
+# Time budget for one Celery chunk/whale slice, spec's "about a third of
+# the task's hard limit": leaves headroom, after the budget trips, for the
+# chunk (or whale range) already in flight to finish, the manifest save,
+# and dispatching the next task -- all comfortably inside the
+# `task_timeout(LOCK_TIMEOUT)` bound these tasks share with
+# `backfill_native_balance_chunk`. `--task-chunks` stays an upper bound on
+# top of this; a slice can still end early on the count, same as always.
+# `--inline` never sees this constant -- it has no task hard limit to stay
+# clear of, so it calls `run_chunk_slice` / `run_whale_slice` with no
+# budget at all.
+ERC20_BALANCE_BACKFILL_SLICE_BUDGET_SECONDS = LOCK_TIMEOUT / 3
+
+# Floor for the whale-walk phase's `whale_block_range`, in blocks -- the
+# ERC-20 chunk phase's own floor (Safes per chunk) is
+# `tasks_shards.BACKFILL_CHUNK_SIZE_FLOOR`, shared with the native
+# backfill. A whale range that is still too heavy at this floor fails the
+# run outright instead of shrinking further.
+ERC20_BALANCE_BACKFILL_WHALE_BLOCK_RANGE_FLOOR = 10_000
 
 
 def erc20_balance_backfill_run_key(run_id: str) -> str:
@@ -2846,6 +2869,71 @@ def dispatch_erc20_balance_backfill_run(run: dict) -> dict:
     return load_erc20_balance_backfill_run(run["run_id"]) or run
 
 
+def _release_erc20_backfill_lock(lock, run_id: str, context: str) -> None:
+    """Release the shared rollup lock, tolerating the case where it is
+    already gone (the TTL expired before this slice got to it, or a lost
+    lock was already logged mid-slice by `run_chunk_slice` /
+    `run_whale_slice`). Logged as a WARNING, not a failure -- committed
+    work stays either way, and losing the lock never turns an otherwise
+    successful slice into a failed one."""
+    try:
+        lock.release()
+    except LockError:
+        logger.warning(
+            "erc20_balance.backfill: run=%s lock already lost by the time "
+            "release was attempted (%s); committed work stays",
+            run_id,
+            context,
+        )
+
+
+def _erc20_backfill_shrink_or_fail(
+    run: dict, *, field: str, floor: int, unit: str, reason: str
+) -> dict:
+    """Halve ``run[field]`` after a chunk or whale range proved too heavy,
+    per the given floor, save the manifest, and redispatch the run's
+    current phase at the smaller size -- or, once already at the floor,
+    fail the run so the existing retry cap (6h cooldown, 3 failures)
+    applies. Shared by the chunk phase (``field="chunk_size"``) and the
+    whale-walk phase (``field="whale_block_range"``); the interrupted
+    chunk's or range's own transaction already rolled back (see
+    ``run_chunk_slice`` / ``run_whale_slice``), so retrying means the same
+    position, a smaller batch -- the size never grows back within a run.
+    """
+    new_size = tasks_shards.halved_or_none(run[field], floor)
+    if new_size is None:
+        run["state"] = "failed"
+        run["error"] = (
+            f"{field} is already at the floor ({floor} {unit}) and still "
+            f"too heavy ({reason})."
+        )
+        run["finished_at"] = timezone.now().isoformat()
+        logger.warning(
+            "erc20_balance.backfill: run=%s %s at floor (%d %s), failing: %s",
+            run["run_id"],
+            field,
+            floor,
+            unit,
+            reason,
+        )
+        _save_erc20_balance_backfill_run(run)
+        return run
+
+    run[field] = new_size
+    logger.warning(
+        "erc20_balance.backfill: run=%s %s too heavy (%s); halving %s to "
+        "%d and retrying the same position",
+        run["run_id"],
+        field,
+        reason,
+        field,
+        new_size,
+    )
+    bump_erc20_balance_dispatch_seq(run)
+    _erc20_backfill_dispatch_phase(run)
+    return run
+
+
 @app.shared_task(acks_late=True, reject_on_worker_lost=True)
 @task_timeout(timeout_seconds=LOCK_TIMEOUT)
 def backfill_erc20_balance_chunk_task(run_id: str, dispatch_seq: int) -> dict:
@@ -2862,6 +2950,7 @@ def backfill_erc20_balance_chunk_task(run_id: str, dispatch_seq: int) -> dict:
     see that function's docstring.
     """
     from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
+        Erc20BalanceBackfillChunkTooHeavy,
         run_chunk_slice,
     )
 
@@ -2911,31 +3000,86 @@ def backfill_erc20_balance_chunk_task(run_id: str, dispatch_seq: int) -> dict:
         )
         return run
 
+    def _chunk_progress_cb(event: str, data: dict) -> None:
+        # Progress after every committed chunk, not just at slice end: a
+        # slow-but-alive slice never looks dead, and a slice that raises
+        # partway through leaves the manifest showing exactly the chunks
+        # that committed before the exception, not the whole slice's
+        # eventual (never-returned) total.
+        if event != "chunk":
+            return
+        run["chunks_done"] += 1
+        run["safes_seen"] += data["chunk_seen"]
+        run["safes_seeded"] += data["seeded"]
+        run["pairs_touched"] += data["inserted"]
+        run["whale_skipped"] += data["whale_skipped"]
+        _save_erc20_balance_backfill_run(run)
+
     started = time.time()
+    # `released` plus the `finally` below guarantee exactly one release no
+    # matter how this task exits: the three `except` clauses each release
+    # early and set it, because under eager mode the shrink/fail helper's
+    # redispatch runs the next task inline and needs the lock free to
+    # re-acquire it; `finally` then covers the success path and anything
+    # none of those `except` clauses caught (`SystemExit`,
+    # `KeyboardInterrupt`, or any other `BaseException`), so the lock is
+    # never left held past this task on any exit.
+    released = False
     try:
-        try:
-            result = run_chunk_slice(
-                _erc20_backfill_options_from_run(run),
-                lock,
-                max_chunks=run["task_chunks"],
-            )
-        finally:
-            lock.release()
+        result = run_chunk_slice(
+            _erc20_backfill_options_from_run(run),
+            lock,
+            max_chunks=run["task_chunks"],
+            budget_seconds=ERC20_BALANCE_BACKFILL_SLICE_BUDGET_SECONDS,
+            progress_cb=_chunk_progress_cb,
+        )
+    except GeventTimeout:
+        _release_erc20_backfill_lock(lock, run_id, "after a hard-limit timeout")
+        released = True
+        # The hard limit can fire mid DB-query; the connection may be left
+        # mid-query and unusable until closed, so neither the manifest
+        # save below nor (under eager-mode tests) the redispatched chunk
+        # running inline right after it inherits a broken one.
+        connection.close()
+        return _erc20_backfill_shrink_or_fail(
+            run,
+            field="chunk_size",
+            floor=tasks_shards.BACKFILL_CHUNK_SIZE_FLOOR,
+            unit="Safes",
+            reason="the task's hard time limit fired mid-chunk",
+        )
+    except Erc20BalanceBackfillChunkTooHeavy:
+        _release_erc20_backfill_lock(lock, run_id, "after a second statement timeout")
+        released = True
+        return _erc20_backfill_shrink_or_fail(
+            run,
+            field="chunk_size",
+            floor=tasks_shards.BACKFILL_CHUNK_SIZE_FLOOR,
+            unit="Safes",
+            reason=(
+                "the chunk's seed timed out a second time after run-time "
+                "whale detection"
+            ),
+        )
     except Exception as exc:
+        _release_erc20_backfill_lock(lock, run_id, "after a failed chunk slice")
+        released = True
         logger.exception("erc20_balance.backfill: run=%s chunk slice failed", run_id)
         run["state"] = "failed"
         run["error"] = str(exc)[:500]
         run["finished_at"] = timezone.now().isoformat()
         _save_erc20_balance_backfill_run(run)
         return run
+    finally:
+        if not released:
+            _release_erc20_backfill_lock(lock, run_id, "after a successful chunk slice")
 
     run["slices_done"] += 1
-    run["chunks_done"] += result["chunks_done"]
-    run["safes_seen"] += result["seen"]
-    run["safes_seeded"] += result["seeded_safes"]
-    run["pairs_touched"] += result["pairs_inserted"]
-    run["whale_skipped"] += result["whale_skipped"]
     run["head"] = result["head"]
+    # `chunks_done` / `safes_seen` / `safes_seeded` / `pairs_touched` /
+    # `whale_skipped` were already folded into `run` per chunk by
+    # `_chunk_progress_cb` above -- adding `result`'s slice totals here
+    # too would double-count them.
     # Persisted BEFORE the dispatch below and never after it — same reason
     # as `backfill_native_balance_chunk`'s own comment: under eager mode
     # the rest of the chain runs inside `apply_async`, so a write
@@ -3032,32 +3176,62 @@ def backfill_erc20_balance_whale_task(run_id: str, dispatch_seq: int) -> dict:
         )
         return run
 
+    def _whale_progress_cb(event: str, data: dict) -> None:
+        # Same per-range progress as the chunk phase's callback above --
+        # see its comment.
+        if event != "whale_range":
+            return
+        run["whale_ranges_done"] += 1
+        run["pairs_touched"] += data["rows_touched"]
+        _save_erc20_balance_backfill_run(run)
+
     started = time.time()
     whale_addresses: list = []
+    # See `backfill_erc20_balance_chunk_task`'s own comment on `released`:
+    # the same guarantee-exactly-one-release shape applies here.
+    released = False
     try:
-        try:
-            boundary = read_boundary()
-            head = read_head()
-            whale_addresses = whale_addresses_upto_boundary(boundary)
-            result = run_whale_slice(
-                whale_addresses,
-                head,
-                _erc20_backfill_options_from_run(run),
-                lock,
-                max_ranges=run["task_chunks"],
-            )
-        finally:
-            lock.release()
+        boundary = read_boundary()
+        head = read_head()
+        whale_addresses = whale_addresses_upto_boundary(boundary)
+        result = run_whale_slice(
+            whale_addresses,
+            head,
+            _erc20_backfill_options_from_run(run),
+            lock,
+            max_ranges=run["task_chunks"],
+            budget_seconds=ERC20_BALANCE_BACKFILL_SLICE_BUDGET_SECONDS,
+            progress_cb=_whale_progress_cb,
+        )
+    except GeventTimeout:
+        _release_erc20_backfill_lock(lock, run_id, "after a hard-limit timeout")
+        released = True
+        # Same reasoning as the chunk task: the hard limit can fire mid
+        # DB-query and leave the connection unusable until closed.
+        connection.close()
+        return _erc20_backfill_shrink_or_fail(
+            run,
+            field="whale_block_range",
+            floor=ERC20_BALANCE_BACKFILL_WHALE_BLOCK_RANGE_FLOOR,
+            unit="blocks",
+            reason="the task's hard time limit fired mid-range",
+        )
     except Exception as exc:
+        _release_erc20_backfill_lock(lock, run_id, "after a failed whale slice")
+        released = True
         logger.exception("erc20_balance.backfill: run=%s whale slice failed", run_id)
         run["state"] = "failed"
         run["error"] = str(exc)[:500]
         run["finished_at"] = timezone.now().isoformat()
         _save_erc20_balance_backfill_run(run)
         return run
+    finally:
+        if not released:
+            _release_erc20_backfill_lock(lock, run_id, "after a successful whale slice")
 
-    run["whale_ranges_done"] += result["ranges_done"]
-    run["pairs_touched"] += result["rows_touched"]
+    # `whale_ranges_done` / `pairs_touched` were already folded into `run`
+    # per range by `_whale_progress_cb` above -- adding `result`'s slice
+    # totals here too would double-count them.
     if result["finished"]:
         run["whale_safes_summed"] = len(whale_addresses)
     _save_erc20_balance_backfill_run(run)
@@ -3148,23 +3322,31 @@ def backfill_erc20_balance_finish_task(run_id: str, dispatch_seq: int) -> dict:
         )
         return run
 
+    # See `backfill_erc20_balance_chunk_task`'s own comment on `released`:
+    # the same guarantee-exactly-one-release shape applies here, including
+    # for a `GeventTimeout` -- this task has no shrink path of its own, so
+    # it is not caught specially and falls through to `finally` like any
+    # other `BaseException` would.
+    released = False
     try:
-        try:
-            # Read BEFORE `finish_run`, which deletes both progress rows
-            # (`_PROGRESS_WATERMARK`, `_BOUNDARY_WATERMARK`) as part of its
-            # own transaction — reading them after would find nothing.
-            head = read_head()
-            boundary = read_boundary()
-            chain_level = finish_run(head, boundary)
-        finally:
-            lock.release()
+        # Read BEFORE `finish_run`, which deletes both progress rows
+        # (`_PROGRESS_WATERMARK`, `_BOUNDARY_WATERMARK`) as part of its own
+        # transaction — reading them after would find nothing.
+        head = read_head()
+        boundary = read_boundary()
+        chain_level = finish_run(head, boundary)
     except Exception as exc:
+        _release_erc20_backfill_lock(lock, run_id, "after a failed finish step")
+        released = True
         logger.exception("erc20_balance.backfill: run=%s finish step failed", run_id)
         run["state"] = "failed"
         run["error"] = str(exc)[:500]
         run["finished_at"] = timezone.now().isoformat()
         _save_erc20_balance_backfill_run(run)
         return run
+    finally:
+        if not released:
+            _release_erc20_backfill_lock(lock, run_id, "after a successful finish step")
 
     run["state"] = "finished"
     run["phase"] = "done"
@@ -3215,21 +3397,24 @@ def _erc20_backfill_dispatch_phase(run: dict) -> None:
 
 
 def erc20_balance_backfill_looks_stalled() -> dict | None:
-    """The stalled run manifest to resume, or `None`. Pure/read-only (no
-    lock touch) so `--status` can show the same verdict the watchdog acts
-    on. Requires: progress watermarks exist and the completion one
-    doesn't, a `"running"` manifest, and `heartbeat_at`/`started_at`
-    older than `ERC20_BALANCE_BACKFILL_STALE_SECONDS` -- falling back to
-    `started_at` so a run whose first slice never got the chance to
-    heartbeat isn't read as fresh forever.
-    """
-    from safe_transaction_service.analytics.management.commands.backfill_erc20_balances import (
-        _PROGRESS_WATERMARK,
-    )
+    """The stalled run manifest to resume, or `None`. Pure/read-only (a
+    non-blocking acquire-and-release probe of the shared lock, same as
+    `native_balance_backfill_looks_stalled`, but no lock held or
+    manifest write) so `--status` can show the same verdict the watchdog
+    acts on. Requires: no completion watermark, a `"running"` manifest,
+    the shared rollup lock free RIGHT NOW, and `heartbeat_at`/
+    `started_at` older than `ERC20_BALANCE_BACKFILL_STALE_SECONDS` --
+    falling back to `started_at` so a run whose first slice never got the
+    chance to heartbeat isn't read as fresh forever.
 
+    Does NOT require progress watermarks to exist: a run whose very
+    first chunk task was lost before it ever wrote them looks exactly
+    like this too, and is exactly the case that used to stay "running,
+    0 chunks" forever. The resumed chunk task's own `resolve_run` creates
+    the progress watermarks the first time it runs, same as a brand-new
+    run.
+    """
     if AnalyticsWatermark.objects.filter(name=ERC20_BALANCE_WATERMARK).exists():
-        return None
-    if not AnalyticsWatermark.objects.filter(name=_PROGRESS_WATERMARK).exists():
         return None
 
     run_id = latest_erc20_balance_backfill_run_id()
@@ -3238,6 +3423,15 @@ def erc20_balance_backfill_looks_stalled() -> dict | None:
     run = load_erc20_balance_backfill_run(run_id)
     if run is None or run.get("state") != "running":
         return None
+
+    lock = get_redis().lock(
+        get_task_lock_name(compute_erc20_balance_rollup_task.name),
+        blocking=False,
+        timeout=LOCK_TIMEOUT,
+    )
+    if not lock.acquire(blocking=False):
+        return None  # a slice, or a concurrent --inline run, holds it -- provably alive
+    lock.release()
 
     reference = run.get("heartbeat_at") or run.get("started_at")
     if not reference:
@@ -3334,16 +3528,16 @@ def erc20_balance_backfill_watchdog_task(self) -> None:
     2026-09-25): Optimism's ~3,000 chunks mean the chain runs for hours,
     long enough to outlast at least one ordinary deploy.
 
-    `erc20_balance_backfill_looks_stalled` decides WHETHER to act; this
-    task adds the one check that belongs at the point of action rather
-    than in a read-only helper: the shared rollup lock must be free RIGHT
-    NOW. Held means genuine work (a slice, the nightly task, or a
-    concurrent `--inline` run) is in flight, not a stall — try again next
-    beat rather than race it. Never starts a second concurrent chain: it
-    dispatches by `run_id` from the existing manifest's own `phase`
-    (`_erc20_backfill_dispatch_phase`), the same re-entry point a normal
-    slice-to-slice hand-off uses, and that task will itself take the lock
-    before touching anything.
+    `erc20_balance_backfill_looks_stalled` decides WHETHER to act -- it
+    already probes the shared rollup lock itself, but this task re-checks
+    it right before redispatching too, since real time passes between the
+    two calls: held (here or there) means genuine work (a slice, the
+    nightly task, or a concurrent `--inline` run) is in flight, not a
+    stall -- try again next beat rather than race it. Never starts a
+    second concurrent chain: it dispatches by `run_id` from the existing
+    manifest's own `phase` (`_erc20_backfill_dispatch_phase`), the same
+    re-entry point a normal slice-to-slice hand-off uses, and that task
+    will itself take the lock before touching anything.
 
     Auto-start (adopting an orphaned run, or starting fresh on an empty
     instance) is NOT this task's job: that lives in

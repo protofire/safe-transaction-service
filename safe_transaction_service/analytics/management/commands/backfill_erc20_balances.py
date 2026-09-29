@@ -99,6 +99,15 @@ slice here takes the shared rollup lock for its own duration (native's
 chunk task never takes a lock at all), because a chunk-phase or
 whale-walk slice must never overlap the nightly task's delta step
 (spec edge case #10b).
+
+**Slice time budget.** A Celery slice (`run_chunk_slice` / `run_whale_slice`
+called with `budget_seconds` set) stops starting another chunk or whale
+range once it has been running for about a third of the task's hard time
+limit, so it hands off to its successor well before the hard limit could
+fire mid-chunk -- `--task-chunks` stays an upper bound on top of that, not
+a replacement for it. `--inline` passes no budget: it has no task hard
+limit to stay clear of. See `ERC20_BALANCE_BACKFILL_SLICE_BUDGET_SECONDS`
+in `tasks.py`.
 """
 
 import argparse
@@ -111,6 +120,7 @@ from django.db import OperationalError, connection, transaction
 from django.utils import timezone
 
 from hexbytes import HexBytes
+from redis.exceptions import LockError
 
 from safe_transaction_service.analytics.bootstrap.bookkeeping import reset_stage
 from safe_transaction_service.analytics.models import (
@@ -146,6 +156,11 @@ from safe_transaction_service.utils.redis import get_redis
 from safe_transaction_service.utils.tasks import LOCK_TIMEOUT, get_task_lock_name
 
 logger = logging.getLogger(__name__)
+
+# Named so tests can patch the slice time budget's clock without also
+# faking `time.time()`, which the per-chunk/per-range `elapsed` figures in
+# the progress callbacks (and --inline's own stdout output) still use.
+monotonic = time.monotonic
 
 # Own watermark names -- deliberately distinct from `ERC20_BALANCE_WATERMARK`
 # / `ERC20_BALANCE_SAFES_WATERMARK`, which are only ever written once, on
@@ -232,6 +247,18 @@ def _positive_int(raw: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {value}")
     return value
+
+
+class Erc20BalanceBackfillChunkTooHeavy(CommandError):
+    """Raised by `run_chunk_slice` when a chunk's seed times out a second
+    time, after run-time whale detection and a retry without the
+    offender(s) it found (see the `OperationalError` handling below).
+    A `CommandError` subclass on purpose: `--inline` keeps its current
+    behaviour and simply raises it (an operator is at the shell), while
+    the Celery chunk task (`tasks.py`) catches this specific class and
+    treats it as "too heavy" -- shrink `chunk_size` and retry instead of
+    failing the run outright.
+    """
 
 
 # ─────────────────── whale detection / summation SQL ───────────────────
@@ -525,6 +552,39 @@ def read_head() -> int:
     return AnalyticsWatermark.objects.get(name=_PROGRESS_WATERMARK).block_number
 
 
+def whale_progress_from_run(run: dict) -> dict:
+    """The whale-walk phase's visible progress: how far the walk has
+    applied ranges towards the manifest's fixed head, how many ranges are
+    left at the run's current `whale_block_range`, and how many Safes are
+    on the whale allow-list. Only meaningful once `run["phase"] ==
+    "whales"`, but harmless to call in any phase.
+
+    Sourced only from `_WHALE_PROGRESS_WATERMARK`, `Erc20BalanceWhale` and
+    the manifest itself -- never the transfer tables -- so this is cheap
+    enough for a status line or a read-only bootstrap report. Used by
+    both `Erc20Stage.progress()` and `--status`, so the two never
+    disagree on the numbers.
+    """
+    watermark = AnalyticsWatermark.objects.filter(
+        name=_WHALE_PROGRESS_WATERMARK
+    ).first()
+    block = watermark.block_number if watermark is not None else 0
+    head = run.get("head") or 0
+    whale_block_range = run["whale_block_range"]
+
+    fraction_done = round(block / head, 4) if head > 0 else 0.0
+    remaining_blocks = max(head - block, 0)
+    ranges_remaining = -(-remaining_blocks // whale_block_range)  # ceil div
+
+    return {
+        "whale_progress_block": block,
+        "whale_head": head,
+        "whale_fraction_done": fraction_done,
+        "whale_ranges_remaining": ranges_remaining,
+        "whale_count": Erc20BalanceWhale.objects.count(),
+    }
+
+
 def count_upto_boundary(boundary: tuple) -> int:
     """Progress-display estimate only -- not on any correctness path, so
     an approximate address tie at the boundary is harmless."""
@@ -538,11 +598,23 @@ def count_upto_boundary(boundary: tuple) -> int:
 
 
 def run_chunk_slice(
-    options: dict, lock, max_chunks: int | None = None, progress_cb=None
+    options: dict,
+    lock,
+    max_chunks: int | None = None,
+    budget_seconds: float | None = None,
+    progress_cb=None,
 ) -> dict:
     """Seed up to `max_chunks` Safe chunks (unbounded when `None` --
     `--inline` runs the whole seed phase in one such call; a Celery
     chunk-phase task passes `--task-chunks`).
+
+    `budget_seconds`, when given, stops the loop from starting another
+    chunk once `monotonic() - <call start>` reaches it -- `max_chunks`
+    stays an upper bound regardless. `--inline` passes `None` (unbounded,
+    since it has no task hard limit); a Celery chunk-phase task passes the
+    slice time budget so a hand-off looks exactly like one where
+    `max_chunks` was reached: `chunks_done` stops short, the caller bumps
+    `dispatch_seq` and redispatches the same phase.
 
     `lock` is threaded through rather than acquired here: the caller owns
     the lock's scope (the whole run for `--inline`; one slice for
@@ -593,8 +665,11 @@ def run_chunk_slice(
     pairs_inserted_total = 0
     skipped_whales_total = 0
     finished_seeding = False
+    slice_started = monotonic()
 
-    while max_chunks is None or chunks_done < max_chunks:
+    while (max_chunks is None or chunks_done < max_chunks) and (
+        budget_seconds is None or monotonic() - slice_started < budget_seconds
+    ):
         chunk_started = time.time()
         candidates = erc20_balance_seed_candidates(
             cursor, boundary, options["chunk_size"]
@@ -700,8 +775,13 @@ def run_chunk_slice(
                 # Never loop more than once: a second timeout after
                 # run-time whale detection means the chunk itself is too
                 # heavy for --statement-timeout-ms, not that another
-                # whale is hiding in it.
-                raise CommandError(
+                # whale is hiding in it. A dedicated exception, not a bare
+                # `CommandError`, so the Celery chunk task
+                # (`backfill_erc20_balance_chunk_task`, `tasks.py`) can
+                # tell "too heavy, shrink and retry" apart from every
+                # other failure -- `--inline` still just raises it (a
+                # `CommandError` subclass), unchanged.
+                raise Erc20BalanceBackfillChunkTooHeavy(
                     "Chunk at "
                     f"({last_created.isoformat()}, 0x{last_address.hex()}) "
                     "timed out again after run-time whale detection and a "
@@ -724,8 +804,29 @@ def run_chunk_slice(
         # of chunks under one lock -- true for the whole `--inline` run,
         # and possible within one Celery slice too when --task-chunks is
         # large -- so it must be renewed after every sub-chunk.
+        lock_lost = False
         if lock is not None:
-            lock.extend(LOCK_TIMEOUT, replace_ttl=True)
+            try:
+                lock.extend(LOCK_TIMEOUT, replace_ttl=True)
+            except LockError:
+                if budget_seconds is None:
+                    # `--inline` holds this lock for the whole run under
+                    # one `Command` invocation, not one bounded slice --
+                    # losing it mid-run is not a hand-off candidate the
+                    # way a budgeted Celery slice is, so this surfaces the
+                    # same way it always has (the operator is at the
+                    # shell). Only a budgeted call (a Celery slice) treats
+                    # a lost lock as a stop-and-hand-off point below.
+                    raise
+                logger.warning(
+                    "erc20_balance.backfill: lock lost while extending "
+                    "after chunk at (%s, 0x%s); this committed chunk "
+                    "stays, stopping the slice at this boundary and "
+                    "handing off",
+                    last_created.isoformat(),
+                    last_address.hex(),
+                )
+                lock_lost = True
 
         if progress_cb:
             progress_cb(
@@ -733,6 +834,11 @@ def run_chunk_slice(
                 {
                     "chunk_index": chunks_done,
                     "seen": seen,
+                    # This chunk's own Safe count, as opposed to `seen`'s
+                    # running total -- what a per-chunk manifest-progress
+                    # callback needs to fold into the run counters without
+                    # re-deriving a delta from the cumulative figure.
+                    "chunk_seen": len(addresses),
                     "seeded": seeded,
                     "whale_skipped": whale_count,
                     "inserted": inserted,
@@ -741,6 +847,14 @@ def run_chunk_slice(
                     "seed_timed_out": seed_timed_out,
                 },
             )
+
+        if lock_lost:
+            # Stop exactly like a budget-exhausted slice: `finished_seeding`
+            # stays `False` (unless the last chunk above happened to be
+            # the very last one), and the caller's normal hand-off
+            # (bump `dispatch_seq`, redispatch this phase) takes it from
+            # here -- no special-casing needed there.
+            break
 
     return {
         "resuming": resuming,
@@ -763,11 +877,17 @@ def run_whale_slice(
     options: dict,
     lock,
     max_ranges: int | None = None,
+    budget_seconds: float | None = None,
     progress_cb=None,
 ) -> dict:
     """Apply up to `max_ranges` whale block-ranges of `(0, head]`
     (unbounded when `None` -- `--inline` runs the whole walk in one such
     call; a Celery whale-phase task passes `--task-chunks`).
+
+    `budget_seconds` mirrors `run_chunk_slice`'s: the loop stops starting
+    another range once `monotonic()` since the call started reaches it,
+    `max_ranges` stays an upper bound, and a budget-driven hand-off looks
+    exactly like one where `max_ranges` was reached.
 
     Resumable via `_WHALE_PROGRESS_WATERMARK` (`block_number` = the last
     `range_to` already applied) exactly like the chunk phase is resumable
@@ -785,8 +905,13 @@ def run_whale_slice(
     range_from = progress.block_number if progress is not None else 0
     ranges_done = 0
     rows_touched = 0
+    slice_started = monotonic()
 
-    while (max_ranges is None or ranges_done < max_ranges) and range_from < head:
+    while (
+        (max_ranges is None or ranges_done < max_ranges)
+        and range_from < head
+        and (budget_seconds is None or monotonic() - slice_started < budget_seconds)
+    ):
         range_to = min(range_from + options["whale_block_range"], head)
         if range_to <= range_from:
             # Unreachable given --whale-block-range's >= 1 validation
@@ -807,15 +932,34 @@ def run_whale_slice(
                     "SET LOCAL statement_timeout = %s",
                     [options["statement_timeout_ms"]],
                 )
-            rows_touched += apply_whale_range(whale_addresses, range_from, range_to)
+            range_rows_touched = apply_whale_range(
+                whale_addresses, range_from, range_to
+            )
+            rows_touched += range_rows_touched
             AnalyticsWatermark.objects.update_or_create(
                 name=_WHALE_PROGRESS_WATERMARK,
                 defaults={"block_number": range_to, "computed_at": timezone.now()},
             )
         range_from = range_to
         ranges_done += 1
+        lock_lost = False
         if lock is not None:
-            lock.extend(LOCK_TIMEOUT, replace_ttl=True)
+            try:
+                lock.extend(LOCK_TIMEOUT, replace_ttl=True)
+            except LockError:
+                if budget_seconds is None:
+                    # Same reasoning as `run_chunk_slice`'s own `--inline`
+                    # carve-out: only a budgeted (Celery) slice treats a
+                    # lost lock as a stop-and-hand-off point.
+                    raise
+                logger.warning(
+                    "erc20_balance.backfill: lock lost while extending "
+                    "after whale range up to block %d; this committed "
+                    "range stays, stopping the slice at this boundary and "
+                    "handing off",
+                    range_to,
+                )
+                lock_lost = True
         if progress_cb:
             progress_cb(
                 "whale_range",
@@ -823,9 +967,18 @@ def run_whale_slice(
                     "range_from_now": range_from,
                     "head": head,
                     "whale_count": len(whale_addresses),
+                    # This range's own row count, as opposed to a
+                    # cumulative total -- what a per-range manifest-progress
+                    # callback needs without re-deriving a delta.
+                    "rows_touched": range_rows_touched,
                     "elapsed": time.time() - range_started,
                 },
             )
+        if lock_lost:
+            # Same reasoning as `run_chunk_slice`: stop exactly like a
+            # budget-exhausted slice and let the caller's normal hand-off
+            # take it from here.
+            break
 
     finished = range_from >= head
     deleted = delete_zero_whale_pairs(whale_addresses) if finished else None
@@ -1368,6 +1521,8 @@ class Command(BaseCommand):
         else:
             self.stdout.write("Most recent --celery run:")
             self._print_run(run)
+            if run.get("phase") == "whales":
+                self._print_whale_progress(run)
             if erc20_balance_backfill_looks_stalled() is not None:
                 self.stdout.write(
                     self.style.WARNING(
@@ -1380,6 +1535,17 @@ class Command(BaseCommand):
                         "it now (refused only while genuinely running)."
                     )
                 )
+
+    def _print_whale_progress(self, run: dict) -> None:
+        progress = whale_progress_from_run(run)
+        percent = round(progress["whale_fraction_done"] * 100, 1)
+        self.stdout.write(
+            f"  whales: block {progress['whale_progress_block']} / "
+            f"head {progress['whale_head']} ({percent}%), "
+            f"{progress['whale_ranges_remaining']} ranges left at "
+            f"{run['whale_block_range']} blocks, "
+            f"{progress['whale_count']} whales"
+        )
 
     def _print_run(self, run: dict) -> None:
         heartbeat_age = "-"
