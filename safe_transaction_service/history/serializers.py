@@ -1093,6 +1093,14 @@ class EthereumTxWithTransfersResponseSerializer(serializers.Serializer):
     def get_block_number(self, obj: EthereumTx) -> int | None:
         if obj.block_id:
             return obj.block_id
+        # Synthetic EthereumTx rows (Hedera native transfers indexed
+        # before their resolved block number has a corresponding
+        # EthereumBlock row) have no linked block. Fall back to the
+        # InternalTx leg's own block_number, which is always set directly
+        # from the real source of truth regardless of whether `block` is
+        # linked.
+        internal_tx = obj.internal_txs.first()
+        return internal_tx.block_number if internal_tx else None
 
 
 class AllTransactionsSchemaSerializer(serializers.Serializer):

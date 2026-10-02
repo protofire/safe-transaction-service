@@ -7,6 +7,7 @@ import random
 from django.conf import settings
 from django.utils import timezone
 
+import requests
 from celery import app
 from celery.utils.log import get_task_logger
 from eth_typing import ChecksumAddress
@@ -20,6 +21,7 @@ from ..utils.tasks import LOCK_TIMEOUT, only_one_running_task
 from .indexers import (
     Erc20EventsIndexerProvider,
     FindRelevantElementsException,
+    HederaNativeTransferIndexerProvider,
     InternalTxIndexerProvider,
     ProxyFactoryIndexerProvider,
     SafeEventsIndexerProvider,
@@ -196,6 +198,37 @@ def index_internal_txs_task(self) -> tuple[int, int] | None:
                 logger.info("Calling task to process decoded traces")
                 process_decoded_internal_txs_task.delay()
             return number_traces, number_of_blocks_processed
+
+
+@app.shared_task(
+    bind=True,
+    autoretry_for=(requests.RequestException,),
+    default_retry_delay=15,
+    retry_kwargs={"max_retries": 3},
+)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def index_hedera_native_transfers_task(self) -> tuple[int, int] | None:
+    """
+    Index native (non-EVM) HBAR transfers from the Hedera Mirror Node for
+    every tracked Safe. No-op if HEDERA_MIRROR_NODE_URL isn't configured.
+
+    :return: Tuple of (number of Safes processed, number of InternalTx rows
+        created), or None if the feature is disabled.
+    """
+    if not settings.HEDERA_MIRROR_NODE_URL:
+        return None
+    with contextlib.suppress(LockError):
+        with only_one_running_task(self):
+            logger.info("Start indexing of Hedera native transfers")
+            number_safes, number_internal_txs = (
+                HederaNativeTransferIndexerProvider().process_all_safes()
+            )
+            logger.info(
+                "Hedera native transfer indexing processed %d safes, created %d internal txs",
+                number_safes,
+                number_internal_txs,
+            )
+            return number_safes, number_internal_txs
 
 
 @app.shared_task(
