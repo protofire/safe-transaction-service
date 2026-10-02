@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 from django.test import TestCase
 
 from safe_transaction_service.history.clients.exceptions import (
+    HederaMirrorNodeClientException,
     HederaMirrorNodeNotFoundException,
     HederaMirrorNodeRateLimitException,
 )
@@ -115,6 +116,33 @@ class TestHederaMirrorNodeClient(TestCase):
         self.assertEqual([r["transaction_id"] for r in results], ["tx-1", "tx-2"])
         self.assertEqual(self.client.http_session.get.call_count, 2)
 
+    def test_pagination_preserves_a_url_embedded_api_key_prefix(self):
+        # Mirror Node's own `next` link is an absolute path (e.g.
+        # "/api/v1/transactions?..."), with no knowledge of a commercial
+        # provider's URL-embedded-key prefix (e.g. ValidationCloud's
+        # "https://mainnet.hedera.validationcloud.io/v1/<api-key>/"). A
+        # naive urljoin(base_url, next_link) would silently drop that
+        # prefix (and the key with it) on every page after the first.
+        client = HederaMirrorNodeClient(
+            base_url="https://mainnet.hedera.validationcloud.io/v1/secret-key-123/",
+            rate_limit_rps=0,
+        )
+        page_1 = self._mock_response(
+            200,
+            {
+                "transactions": [{"transaction_id": "tx-1"}],
+                "links": {"next": "/api/v1/transactions?page=2"},
+            },
+        )
+        page_2 = self._mock_response(
+            200, {"transactions": [{"transaction_id": "tx-2"}], "links": {"next": None}}
+        )
+        client.http_session.get = MagicMock(side_effect=[page_1, page_2])
+        results = list(client.get_crypto_transfers("0.0.10127045"))
+        self.assertEqual([r["transaction_id"] for r in results], ["tx-1", "tx-2"])
+        second_page_url = client.http_session.get.call_args_list[1][0][0]
+        self.assertIn("/v1/secret-key-123/api/v1/transactions?page=2", second_page_url)
+
     def test_resolve_block_number_returns_number(self):
         self.client.http_session.get = MagicMock(
             return_value=self._mock_response(200, {"blocks": [{"number": 12345}]})
@@ -150,3 +178,34 @@ class TestHederaMirrorNodeClient(TestCase):
         )
         with self.assertRaises(HederaMirrorNodeRateLimitException):
             self.client.resolve_account_id("0xabc")
+
+    def test_max_retries_is_configurable(self):
+        client = HederaMirrorNodeClient(
+            base_url="https://testnet.mirrornode.hedera.com/",
+            rate_limit_rps=0,
+            max_retries=2,
+        )
+        client.http_session.get = MagicMock(
+            return_value=self._mock_response(429, headers={"Retry-After": "0"})
+        )
+        with self.assertRaises(HederaMirrorNodeRateLimitException):
+            client.resolve_account_id("0xabc")
+        self.assertEqual(client.http_session.get.call_count, 2)
+
+    def test_errors_never_expose_a_url_embedded_api_key(self):
+        # Some Mirror Node providers embed their API key directly in the
+        # base URL rather than in a header. Error messages/log lines must
+        # never leak it. Using a 500 here (not 404) because
+        # resolve_account_id/get_account deliberately swallow 404s into
+        # `None` — a generic server error is what actually propagates as
+        # an exception through that call path.
+        client = HederaMirrorNodeClient(
+            base_url="https://mirror.example.com/v1/super-secret-key/",
+            rate_limit_rps=0,
+        )
+        client.http_session.get = MagicMock(return_value=self._mock_response(500))
+        with self.assertRaises(HederaMirrorNodeClientException) as cm:
+            client.resolve_account_id("0xabc")
+        self.assertNotIn("super-secret-key", str(cm.exception))
+        self.assertIn("<mirror-node>/", str(cm.exception))
+        self.assertIn("api/v1/accounts/0xabc", str(cm.exception))

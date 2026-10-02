@@ -8,7 +8,6 @@ from safe_eth.util.util import to_0x_hex_str
 
 from ..clients.hedera_mirror_node_client import HederaMirrorNodeClient
 from ..models import (
-    EthereumBlock,
     EthereumTx,
     EthereumTxCallType,
     InternalTx,
@@ -136,6 +135,7 @@ class HederaNativeTransferIndexerProvider:
                 api_key=settings.HEDERA_MIRROR_NODE_API_KEY,
                 rate_limit_rps=settings.HEDERA_MIRROR_NODE_RATE_LIMIT_RPS,
                 request_timeout=settings.HEDERA_MIRROR_NODE_REQUEST_TIMEOUT,
+                max_retries=settings.HEDERA_MIRROR_NODE_MAX_RETRIES,
             ),
             max_txs_per_safe_per_run=settings.HEDERA_NATIVE_TRANSFER_MAX_TXS_PER_SAFE_PER_RUN,
         )
@@ -182,22 +182,26 @@ class HederaNativeTransferIndexer:
             if not account_id:
                 return 0
             cursor.hedera_account_id = account_id
-            # Seed the cursor at the Safe's creation time so the first sync
-            # only looks forward from when the Safe started existing,
-            # instead of scanning that Hedera account's entire history.
+            # Seed the cursor at the Safe's REAL on-chain creation time —
+            # not `safe_contract.created` (a DateField with auto_now_add,
+            # which is when *our own EVM indexer* happened to notice the
+            # Safe, lagging the real creation by however long block
+            # confirmation takes). A HashPack/SDK deposit made in that gap
+            # would otherwise fall before the cursor's seed point and be
+            # silently, permanently skipped, since the cursor never looks
+            # backward. `ethereum_tx.execution_date` is the creation
+            # transaction's actual block timestamp; fall back to
+            # `safe_contract.created` defensively in case it's ever unset.
+            creation_timestamp = (
+                safe_contract.ethereum_tx.execution_date or safe_contract.created
+            )
             cursor.last_consensus_timestamp = datetime_to_consensus_timestamp(
-                safe_contract.created
+                creation_timestamp
             )
             cursor.save(update_fields=["hedera_account_id", "last_consensus_timestamp"])
 
         ethereum_txs: list[EthereumTx] = []
         internal_txs: list[InternalTx] = []
-        # (EthereumTx instance, resolved Hedera block number) pairs, so that
-        # after the loop we can look up which of those block numbers already
-        # have a real EthereumBlock row (created by the EVM indexer) and
-        # link the synthetic EthereumTx to it instead of leaving `block`
-        # unset.
-        ethereum_tx_block_numbers: list[tuple[EthereumTx, int]] = []
         block_number_cache: dict[str, int | None] = {}
         counterparty_address_cache: dict[str, str] = {}
         last_committed_timestamp = cursor.last_consensus_timestamp
@@ -236,6 +240,13 @@ class HederaNativeTransferIndexer:
                     )
                     ethereum_tx = EthereumTx(
                         tx_hash=tx_hash,
+                        # Deliberately never linked to a real EthereumBlock
+                        # (see execution_date/get_block_number's fallback to
+                        # the InternalTx leg's own always-set values): doing
+                        # so would make this row's survival depend on that
+                        # block never being reorg-cascade-deleted, which the
+                        # Hedera-specific sync cursor has no way to detect
+                        # or recover from.
                         block=None,
                         status=1,
                         gas=0,
@@ -249,7 +260,6 @@ class HederaNativeTransferIndexer:
                         value=0,
                     )
                     ethereum_txs.append(ethereum_tx)
-                    ethereum_tx_block_numbers.append((ethereum_tx, block_number))
 
                     for index, leg in enumerate(legs):
                         counterparty_account_id = leg["counterparty_account_id"]
@@ -295,24 +305,6 @@ class HederaNativeTransferIndexer:
                 cursor.last_consensus_timestamp = last_committed_timestamp
                 cursor.save(update_fields=["last_consensus_timestamp"])
             return 0
-
-        # If the Mirror-Node-resolved block number happens to already have a
-        # real EthereumBlock row (created by the existing EVM indexer), link
-        # the synthetic EthereumTx to it so the tx surfaces a real execution
-        # date/block number instead of null. One batched query for all the
-        # distinct block numbers resolved in this run, rather than one query
-        # per tx.
-        distinct_block_numbers = {
-            block_number for _, block_number in ethereum_tx_block_numbers
-        }
-        existing_block_numbers = set(
-            EthereumBlock.objects.filter(number__in=distinct_block_numbers).values_list(
-                "number", flat=True
-            )
-        )
-        for ethereum_tx, block_number in ethereum_tx_block_numbers:
-            if block_number in existing_block_numbers:
-                ethereum_tx.block_id = block_number
 
         safe_relevant_txs = [
             SafeRelevantTransaction(

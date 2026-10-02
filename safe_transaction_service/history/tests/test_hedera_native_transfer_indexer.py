@@ -17,7 +17,7 @@ from ..models import (
     SafeRelevantTransaction,
 )
 from ..services.transaction_service import TransactionServiceProvider
-from .factories import EthereumBlockFactory, SafeContractFactory
+from .factories import EthereumBlockFactory, EthereumTxFactory, SafeContractFactory
 
 SAFE_ACCOUNT_ID = "0.0.10127045"
 
@@ -239,7 +239,9 @@ class TestHederaNativeTransferIndexerProcessSafe(TestCase):
         self.client.get_crypto_transfers.return_value = iter([])
         self.indexer.process_safe(self.safe_contract)
 
-        expected_timestamp = datetime_to_consensus_timestamp(self.safe_contract.created)
+        expected_timestamp = datetime_to_consensus_timestamp(
+            self.safe_contract.ethereum_tx.execution_date
+        )
         self.client.get_crypto_transfers.assert_called_once_with(
             "0.0.10127045", after_timestamp=expected_timestamp
         )
@@ -248,6 +250,43 @@ class TestHederaNativeTransferIndexerProcessSafe(TestCase):
             self.safe_contract.hedera_transfer_cursor.last_consensus_timestamp,
             expected_timestamp,
         )
+
+    def test_catches_deposit_made_before_our_own_indexer_noticed_the_safe(self):
+        # `SafeContract.created` (auto_now_add) is when *our own EVM
+        # indexer* happened to notice the Safe — it lags the Safe's real
+        # on-chain creation by however long block confirmation takes. A
+        # HashPack/SDK deposit made in that gap must still be caught: the
+        # cursor seeds from the real creation timestamp
+        # (ethereum_tx.execution_date), not from `created`.
+        safe_contract = SafeContractFactory(
+            address="0xABCDEF0123456789012345678901234567890ABC",
+            ethereum_tx=EthereumTxFactory(
+                block=EthereumBlockFactory(
+                    timestamp=datetime.datetime(2026, 1, 1, tzinfo=datetime.UTC)
+                )
+            ),
+        )
+        self.assertGreater(
+            safe_contract.created, safe_contract.ethereum_tx.execution_date
+        )
+
+        deposit_before_db_insert = {
+            "transaction_id": "0.0.1111111-1767225700-000000001",
+            "consensus_timestamp": "1767225700.000000001",
+            "result": "SUCCESS",
+            "charged_tx_fee": 1_440_097,
+            "transfers": [
+                {"account": "0.0.1111111", "amount": -(500_000_000 + 1_440_097)},
+                {"account": "0.0.7", "amount": 500_000},
+                {"account": "0.0.98", "amount": 940_097},
+                {"account": "0.0.10127045", "amount": 500_000_000},
+            ],
+        }
+        self.client.get_crypto_transfers.return_value = iter([deposit_before_db_insert])
+        created_count = self.indexer.process_safe(safe_contract)
+
+        self.assertEqual(created_count, 1)
+        self.assertTrue(InternalTx.objects.filter(to=safe_contract.address).exists())
 
     def test_creates_internal_tx_and_ethereum_tx_for_incoming_transfer(self):
         self.client.get_crypto_transfers.return_value = iter([INCOMING_TX])
@@ -271,20 +310,16 @@ class TestHederaNativeTransferIndexerProcessSafe(TestCase):
         self.assertEqual(internal_tx.ethereum_tx._from, internal_tx._from)
         self.assertEqual(internal_tx.ethereum_tx.to, internal_tx.to)
 
-    def test_links_synthetic_ethereum_tx_to_existing_ethereum_block(self):
-        # The Mirror-Node-resolved block number (12345, per setUp) already
-        # has a real EthereumBlock row, created by the existing EVM indexer.
-        # The synthetic EthereumTx should be linked to it.
+    def test_never_links_ethereum_tx_to_a_real_ethereum_block(self):
+        # Deliberately never linked, even when a real EthereumBlock row for
+        # the resolved block number (12345, per setUp) already exists —
+        # linking would make this row's survival depend on that block never
+        # being reorg-cascade-deleted later, which the Hedera-specific sync
+        # cursor has no way to detect or recover from. execution_date/
+        # get_block_number fall back to the InternalTx leg's own
+        # always-set timestamp/block_number instead, so nothing downstream
+        # needs the link.
         EthereumBlockFactory(number=12345)
-        self.client.get_crypto_transfers.return_value = iter([INCOMING_TX])
-        self.indexer.process_safe(self.safe_contract)
-
-        internal_tx = InternalTx.objects.get()
-        self.assertEqual(internal_tx.ethereum_tx.block_id, 12345)
-
-    def test_leaves_ethereum_tx_block_none_when_no_matching_block_exists(self):
-        # No EthereumBlock row exists for the resolved block number (12345) —
-        # unchanged default behavior: block stays None.
         self.client.get_crypto_transfers.return_value = iter([INCOMING_TX])
         self.indexer.process_safe(self.safe_contract)
 
@@ -369,7 +404,9 @@ class TestHederaNativeTransferIndexerProcessSafe(TestCase):
         # number could not be resolved and was never actually committed.
         self.assertEqual(
             self.safe_contract.hedera_transfer_cursor.last_consensus_timestamp,
-            datetime_to_consensus_timestamp(self.safe_contract.created),
+            datetime_to_consensus_timestamp(
+                self.safe_contract.ethereum_tx.execution_date
+            ),
         )
 
     def test_account_not_found_returns_zero_without_creating_cursor_account_id(self):
