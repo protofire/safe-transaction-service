@@ -33,6 +33,7 @@ from ..models import (
     SafeLastStatus,
     SafeStatus,
 )
+from ..services import SafeServiceProvider
 from .factories import EthereumBlockFactory, EthereumTxFactory, SafeMasterCopyFactory
 from .mocks.mocks_safe_events_indexer import (
     proxy_creation_event_mock,
@@ -682,6 +683,76 @@ class SafeEventsIndexerBaseAbstractTestBase(SafeTestCaseMixin, TestCase, ABC):
         self.assertEqual(
             InternalTxDecoded.objects.count(), expected_internal_txs_decoded
         )
+
+    def test_safe_address_only_reindex_loses_proxy_creation(self):
+        """
+        Querying logs only by the Safe address (like `reindex_master_copies --addresses`)
+        misses the `ProxyCreation` event, as it's emitted by the ProxyFactory. The Safe
+        is set up with `master_copy=NULL_ADDRESS` and has no creation info
+        """
+        owners = [self.ethereum_test_account.address]
+        threshold = 1
+        initializer = HexBytes(
+            self.safe_contract.functions.setup(
+                owners,
+                threshold,
+                NULL_ADDRESS,
+                b"",
+                NULL_ADDRESS,
+                NULL_ADDRESS,
+                0,
+                NULL_ADDRESS,
+            ).build_transaction({"gas": 1, "gasPrice": 1})["data"]
+        )
+        initial_block_number = self.ethereum_client.current_block_number + 1
+        SafeMasterCopyFactory(
+            address=self.safe_contract.address,
+            initial_block_number=initial_block_number,
+            tx_block_number=initial_block_number,
+            version=self.safe_contract_version,
+            l2=True,
+        )
+        ethereum_tx_sent = self.proxy_factory.deploy_proxy_contract_with_nonce(
+            self.ethereum_test_account,
+            self.safe_contract.address,
+            initializer=initializer,
+        )
+        safe_address = ethereum_tx_sent.contract_address
+        block_number = self.w3.eth.wait_for_transaction_receipt(
+            ethereum_tx_sent.tx_hash
+        )["blockNumber"]
+
+        self.safe_events_indexer.IGNORE_ADDRESSES_ON_LOG_FILTER = False
+        log_receipts = self.safe_events_indexer.find_relevant_elements(
+            {safe_address}, block_number, block_number
+        )
+        decoded_events = self.safe_events_indexer.decode_elements(log_receipts)
+        self.assertIn("SafeSetup", [event["event"] for event in decoded_events])
+        self.assertNotIn("ProxyCreation", [event["event"] for event in decoded_events])
+        self.safe_events_indexer.process_elements(log_receipts)
+        self.safe_tx_processor.process_decoded_transactions(
+            list(InternalTxDecoded.objects.pending_for_safes())
+        )
+
+        # The Safe setup was indexed and processed
+        self.assertEqual(
+            InternalTxDecoded.objects.filter(
+                safe_address=safe_address, function_name="setup"
+            ).count(),
+            1,
+        )
+        safe_last_status = SafeLastStatus.objects.get(address=safe_address)
+        self.assertEqual(safe_last_status.owners, owners)
+        self.assertEqual(safe_last_status.threshold, threshold)
+
+        # But the creation is lost
+        self.assertFalse(
+            InternalTx.objects.filter(
+                contract_address=safe_address, tx_type=InternalTxType.CREATE.value
+            ).exists()
+        )
+        self.assertEqual(safe_last_status.master_copy, NULL_ADDRESS)
+        self.assertIsNone(SafeServiceProvider().get_safe_creation_info(safe_address))
 
     def test_safe_events_indexer_zksync(self):
         owner_account_1 = self.ethereum_test_account
