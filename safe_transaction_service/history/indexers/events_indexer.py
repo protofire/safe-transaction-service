@@ -1,6 +1,6 @@
 from abc import abstractmethod
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from functools import cached_property
 from logging import getLogger
 from typing import Any
@@ -94,6 +94,37 @@ class EventsIndexer(EthereumIndexer):
         :param to_block_number:
         :return:
         """
+        if not self.IGNORE_ADDRESSES_ON_LOG_FILTER:
+            # Search logs only for the provided addresses, otherwise all the events will be
+            # retrieved and then filtering will happen here
+            return self._get_logs_for_addresses(
+                addresses, from_block_number, to_block_number
+            )
+        else:
+            filter_topics = list(self.events_to_listen.keys())
+            parameters: FilterParams = {
+                "fromBlock": from_block_number,
+                "toBlock": to_block_number,
+                "topics": [filter_topics],
+            }
+            with self.auto_adjust_block_limit(from_block_number, to_block_number):
+                return self.ethereum_client.slow_w3.eth.get_logs(parameters)
+
+    def _get_logs_for_addresses(
+        self,
+        addresses: Collection[ChecksumAddress],
+        from_block_number: int,
+        to_block_number: int,
+    ) -> list[LogReceipt]:
+        """
+        Query logs for the `events_to_listen` topics emitted by `addresses`. Addresses are split
+        in chunks of `query_chunk_size` (`0` == all together) queried concurrently
+
+        :param addresses:
+        :param from_block_number:
+        :param to_block_number:
+        :return: LogReceipts of every chunk
+        """
         filter_topics = list(self.events_to_listen.keys())
         parameters: FilterParams = {
             "fromBlock": from_block_number,
@@ -101,35 +132,29 @@ class EventsIndexer(EthereumIndexer):
             "topics": [filter_topics],
         }
 
-        if not self.IGNORE_ADDRESSES_ON_LOG_FILTER:
-            # Search logs only for the provided addresses, otherwise all the events will be
-            # retrieved and then filtering will happen here
-            if self.query_chunk_size:
-                addresses_chunks = chunks(list(addresses), self.query_chunk_size)
-            else:
-                addresses_chunks = [addresses]
-
-            multiple_parameters = [
-                {**parameters, "address": addresses_chunk}
-                for addresses_chunk in addresses_chunks
-            ]
-
-            gevent_pool = pool.Pool(self.get_logs_concurrency)
-            jobs = [
-                gevent_pool.spawn(
-                    self.ethereum_client.slow_w3.eth.get_logs, single_parameters
-                )
-                for single_parameters in multiple_parameters
-            ]
-
-            with self.auto_adjust_block_limit(from_block_number, to_block_number):
-                # Check how long all the jobs take
-                gevent.joinall(jobs, raise_error=True)
-
-            return [log_receipt for job in jobs for log_receipt in job.get()]
+        if self.query_chunk_size:
+            addresses_chunks = chunks(list(addresses), self.query_chunk_size)
         else:
-            with self.auto_adjust_block_limit(from_block_number, to_block_number):
-                return self.ethereum_client.slow_w3.eth.get_logs(parameters)
+            addresses_chunks = [addresses]
+
+        multiple_parameters = [
+            {**parameters, "address": addresses_chunk}
+            for addresses_chunk in addresses_chunks
+        ]
+
+        gevent_pool = pool.Pool(self.get_logs_concurrency)
+        jobs = [
+            gevent_pool.spawn(
+                self.ethereum_client.slow_w3.eth.get_logs, single_parameters
+            )
+            for single_parameters in multiple_parameters
+        ]
+
+        with self.auto_adjust_block_limit(from_block_number, to_block_number):
+            # Check how long all the jobs take
+            gevent.joinall(jobs, raise_error=True)
+
+        return [log_receipt for job in jobs for log_receipt in job.get()]
 
     def _find_elements_using_topics(
         self,
