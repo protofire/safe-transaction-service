@@ -1842,7 +1842,7 @@ class ModuleTransaction(TimeStampedModel):
         if self.value:
             return f"{self.safe} - {self.to} - {self.value}"
         else:
-            return f"{self.safe} - {self.to} - {to_0x_hex_str(bytes(self.data))[:6]}"
+            return f"{self.safe} - {self.to} - {to_0x_hex_str(bytes(self.data or b''))[:6]}"
 
     @property
     def unique_id(self):

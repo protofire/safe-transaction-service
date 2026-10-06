@@ -45,6 +45,7 @@ from .factories import (
     IndexingStatusFactory,
     InternalTxDecodedFactory,
     InternalTxFactory,
+    ModuleTransactionFactory,
     MultisigConfirmationFactory,
     MultisigTransactionFactory,
     SafeContractDelegateFactory,
@@ -1782,4 +1783,24 @@ class TestMultisigTransactions(TestCase):
         self.assertEqual(
             MultisigTransaction.objects.last_valid_transaction(safe_address),
             multisig_transaction_2,
+        )
+
+
+class TestModuleTransaction(TestCase):
+    def test_str(self):
+        module_transaction = ModuleTransactionFactory(value=0, data=b"\x12\x34")
+        self.assertEqual(
+            str(module_transaction),
+            f"{module_transaction.safe} - {module_transaction.to} - 0x1234",
+        )
+        # Module tx without value or data
+        module_transaction = ModuleTransactionFactory(value=0, data=None)
+        self.assertEqual(
+            str(module_transaction),
+            f"{module_transaction.safe} - {module_transaction.to} - 0x",
+        )
+        module_transaction = ModuleTransactionFactory(value=5, data=None)
+        self.assertEqual(
+            str(module_transaction),
+            f"{module_transaction.safe} - {module_transaction.to} - 5",
         )
