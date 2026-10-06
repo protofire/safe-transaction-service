@@ -36,7 +36,12 @@ from ..models import (
     SafeStatus,
 )
 from ..services import SafeServiceProvider
-from .factories import EthereumBlockFactory, EthereumTxFactory, SafeMasterCopyFactory
+from .factories import (
+    EthereumBlockFactory,
+    EthereumTxFactory,
+    ProxyFactoryFactory,
+    SafeMasterCopyFactory,
+)
 from .mocks.mocks_safe_events_indexer import (
     proxy_creation_event_mock,
     safe_events_mock,
@@ -926,6 +931,8 @@ class SafeEventsIndexerBaseAbstractTestBase(SafeTestCaseMixin, TestCase, ABC):
             version=self.safe_contract_version,
             l2=True,
         )
+        # Needed for `ProxyCreation` events (only whitelisted Safes and ProxyFactories are queried)
+        ProxyFactoryFactory(address=self.proxy_factory.address)
 
         # Mine both deployments in the same block (Ganache)
         response = self.w3.provider.make_request(RPCEndpoint("miner_stop"), [])
@@ -975,6 +982,131 @@ class SafeEventsIndexerBaseAbstractTestBase(SafeTestCaseMixin, TestCase, ABC):
             InternalTxDecoded.objects.filter(safe_address=other_safe).exists()
         )
         self.assertFalse(SafeContract.objects.filter(address=other_safe).exists())
+
+    def _get_logs_parameters(self, get_logs_mock: mock.MagicMock) -> list[dict]:
+        return [call.args[0] for call in get_logs_mock.call_args_list]
+
+    def test_whitelist_get_logs_query(self):
+        proxy_factory = ProxyFactoryFactory()
+        whitelisted_safes = {Account.create().address for _ in range(3)}
+
+        for whitelist, query_chunk_size, expected_calls in (
+            (set(), 1_000, 1),
+            (whitelisted_safes, 1_000, 1),
+            (whitelisted_safes, 2, 2),
+        ):
+            with (
+                self.subTest(whitelist=whitelist, query_chunk_size=query_chunk_size),
+                mock.patch.object(
+                    self.ethereum_client.slow_w3.eth, "get_logs", return_value=[]
+                ) as get_logs_mock,
+            ):
+                indexer = self._build_whitelisted_indexer(
+                    whitelist, query_chunk_size=query_chunk_size
+                )
+                indexer.find_relevant_elements({self.safe_contract.address}, 10, 20)
+                parameters = self._get_logs_parameters(get_logs_mock)
+                self.assertEqual(len(parameters), expected_calls)
+                if not whitelist:
+                    # Stock: every address
+                    self.assertNotIn("address", parameters[0])
+                else:
+                    self.assertCountEqual(
+                        [address for p in parameters for address in p["address"]],
+                        whitelist | {proxy_factory.address},
+                    )
+
+    def test_whitelist_get_logs_query_explicit_addresses(self):
+        ProxyFactoryFactory()
+        addresses = {Account.create().address}
+        indexer = self._build_whitelisted_indexer({Account.create().address})
+        indexer.IGNORE_ADDRESSES_ON_LOG_FILTER = False  # Like `reindex --addresses`
+        with mock.patch.object(
+            self.ethereum_client.slow_w3.eth, "get_logs", return_value=[]
+        ) as get_logs_mock:
+            indexer.find_relevant_elements(addresses, 10, 20)
+        parameters = self._get_logs_parameters(get_logs_mock)
+        self.assertEqual(len(parameters), 1)
+        self.assertCountEqual(parameters[0]["address"], addresses)
+
+    def test_whitelist_get_logs_query_without_proxy_factories(self):
+        whitelisted_safes = {Account.create().address}
+        indexer = self._build_whitelisted_indexer(whitelisted_safes)
+        with (
+            mock.patch.object(
+                self.ethereum_client.slow_w3.eth, "get_logs", return_value=[]
+            ) as get_logs_mock,
+            self.assertLogs(
+                "safe_transaction_service.history.indexers.safe_events_indexer",
+                level="WARNING",
+            ) as logs,
+        ):
+            indexer.find_relevant_elements(set(), 10, 20)
+        self.assertIn("No ProxyFactory configured", logs.output[0])
+        parameters = self._get_logs_parameters(get_logs_mock)
+        self.assertEqual(len(parameters), 1)
+        self.assertCountEqual(parameters[0]["address"], whitelisted_safes)
+
+    def test_whitelist_indexes_safe_creation(self):
+        """
+        Same scenario as `test_safe_address_only_reindex_loses_proxy_creation`, but
+        querying the whitelisted Safe and the ProxyFactory: the creation is indexed
+        """
+        initializer = HexBytes(
+            self.safe_contract.functions.setup(
+                [self.ethereum_test_account.address],
+                1,
+                NULL_ADDRESS,
+                b"",
+                NULL_ADDRESS,
+                NULL_ADDRESS,
+                0,
+                NULL_ADDRESS,
+            ).build_transaction({"gas": 1, "gasPrice": 1})["data"]
+        )
+        initial_block_number = self.ethereum_client.current_block_number + 1
+        SafeMasterCopyFactory(
+            address=self.safe_contract.address,
+            initial_block_number=initial_block_number,
+            tx_block_number=initial_block_number,
+            version=self.safe_contract_version,
+            l2=True,
+        )
+        ProxyFactoryFactory(address=self.proxy_factory.address)
+        ethereum_tx_sent = self.proxy_factory.deploy_proxy_contract_with_nonce(
+            self.ethereum_test_account,
+            self.safe_contract.address,
+            initializer=initializer,
+        )
+        self.w3.eth.wait_for_transaction_receipt(ethereum_tx_sent.tx_hash)
+        safe_address = ethereum_tx_sent.contract_address
+
+        indexer = self._build_whitelisted_indexer({safe_address})
+        with mock.patch.object(
+            indexer,
+            "_get_logs_for_addresses",
+            wraps=indexer._get_logs_for_addresses,
+        ) as get_logs_for_addresses_mock:
+            indexer.start()
+        get_logs_for_addresses_mock.assert_called()
+        for call in get_logs_for_addresses_mock.call_args_list:
+            self.assertEqual(
+                set(call.args[0]), {safe_address, self.proxy_factory.address}
+            )
+        self.safe_tx_processor.process_decoded_transactions(
+            list(InternalTxDecoded.objects.pending_for_safes())
+        )
+
+        self.assertTrue(
+            InternalTx.objects.filter(
+                contract_address=safe_address, tx_type=InternalTxType.CREATE.value
+            ).exists()
+        )
+        self.assertEqual(
+            SafeLastStatus.objects.get(address=safe_address).master_copy,
+            self.safe_contract.address,
+        )
+        self.assertIsNotNone(SafeServiceProvider().get_safe_creation_info(safe_address))
 
     def test_safe_events_indexer_zksync(self):
         owner_account_1 = self.ethereum_test_account

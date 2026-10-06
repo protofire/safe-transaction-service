@@ -1,7 +1,7 @@
 from unittest import mock
 from unittest.mock import PropertyMock
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from eth_account import Account
 from requests.exceptions import ConnectionError as RequestsConnectionError
@@ -25,6 +25,7 @@ from .factories import (
     EthereumTxFactory,
     InternalTxDecodedFactory,
     MultisigTransactionFactory,
+    ProxyFactoryFactory,
     SafeMasterCopyFactory,
     SafeStatusFactory,
 )
@@ -252,3 +253,27 @@ class TestIndexService(EthereumTestCaseMixin, TestCase):
         self.assertEqual(SafeStatus.objects.count(), 3)
         self.assertEqual(SafeLastStatus.objects.count(), 0)
         self.assertEqual(MultisigTransaction.objects.count(), 4)
+
+    def test_reindex_master_copies_whitelist(self):
+        # TODO Refactor EthereumIndexer to fix circular imports
+        from ..indexers import SafeEventsIndexer
+
+        SafeMasterCopyFactory(l2=True)
+        proxy_factory = ProxyFactoryFactory()
+        whitelisted_safe = Account.create().address
+        current_block_number = self.ethereum_client.current_block_number
+        with (
+            override_settings(WHITELISTED_SAFES=frozenset({whitelisted_safe})),
+            mock.patch.object(self.index_service, "eth_l2_network", True),
+            mock.patch.object(
+                SafeEventsIndexer, "_get_logs_for_addresses", return_value=[]
+            ) as get_logs_for_addresses_mock,
+        ):
+            self.index_service.reindex_master_copies(
+                current_block_number - 1, to_block_number=current_block_number
+            )
+        get_logs_for_addresses_mock.assert_called_once_with(
+            {whitelisted_safe, proxy_factory.address},
+            current_block_number - 1,
+            current_block_number,
+        )

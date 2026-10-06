@@ -31,6 +31,7 @@ from ..models import (
     InternalTx,
     InternalTxDecoded,
     InternalTxType,
+    ProxyFactory,
     SafeContract,
     SafeMasterCopy,
     SafeRelevantTransaction,
@@ -102,6 +103,39 @@ class SafeEventsIndexer(EventsIndexer):
             return super().process_elements(log_receipts)
 
         return self._process_elements_with_conditional_indexing(log_receipts)
+
+    def _get_proxy_factory_addresses(self) -> set[ChecksumAddress]:
+        """
+        :return: ProxyFactory addresses. Not cached, so factories added later are used
+        """
+        return set(ProxyFactory.objects.values_list("address", flat=True))
+
+    def _do_node_query(
+        self,
+        addresses: set[ChecksumAddress],
+        from_block_number: int,
+        to_block_number: int,
+    ) -> list[LogReceipt]:
+        """
+        With a whitelist, instead of querying the events of every address, query only
+        the whitelisted Safes and the ProxyFactories (for `ProxyCreation`). Explicitly
+        provided addresses (`IGNORE_ADDRESSES_ON_LOG_FILTER=False`) are not modified
+        """
+        if not (self.whitelisted_safes and self.IGNORE_ADDRESSES_ON_LOG_FILTER):
+            return super()._do_node_query(addresses, from_block_number, to_block_number)
+
+        proxy_factory_addresses = self._get_proxy_factory_addresses()
+        if not proxy_factory_addresses:
+            logger.warning(
+                "%s: No ProxyFactory configured, ProxyCreation events of whitelisted Safes "
+                "will not be indexed",
+                self.__class__.__name__,
+            )
+        return self._get_logs_for_addresses(
+            self.whitelisted_safes | proxy_factory_addresses,
+            from_block_number,
+            to_block_number,
+        )
 
     @cached_property
     def _proxy_creation_topics(self) -> set[str]:
