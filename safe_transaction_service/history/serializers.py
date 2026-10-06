@@ -951,6 +951,11 @@ class TransferResponseSerializer(serializers.Serializer):
         "Token transfers are calculated as `transferId = e+tx_hash+log_index` \n"
         "Ether transfers are calculated as `transferId = i+tx_hash+trace_address`"
     )
+    # Only set for synthetic Hedera-native-transfer rows: `transaction_hash`
+    # for those is a service-generated placeholder (no real EVM transaction
+    # exists to look up on a block explorer). Carries the real,
+    # explorer-resolvable Hedera transaction id instead. `None` otherwise.
+    hedera_transaction_id = serializers.CharField(allow_null=True)
 
     def get_fields(self):
         result = super().get_fields()
@@ -1079,6 +1084,12 @@ class EthereumTxWithTransfersResponseSerializer(serializers.Serializer):
     block_number = serializers.SerializerMethodField()
     transfers = TransferWithTokenInfoResponseSerializer(many=True)
     tx_type = serializers.SerializerMethodField()
+    # Only set for synthetic Hedera-native-transfer rows: `tx_hash` for
+    # those is a service-generated placeholder (no real EVM transaction
+    # exists to look up on a block explorer). This carries the real,
+    # explorer-resolvable Hedera transaction id instead. `None` for
+    # ordinary EVM transactions.
+    hedera_transaction_id = serializers.CharField(allow_null=True)
 
     def get_tx_type(self, obj) -> str:
         return TxType.ETHEREUM_TRANSACTION.name

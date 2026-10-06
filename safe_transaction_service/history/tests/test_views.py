@@ -2981,6 +2981,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
             [
                 {
                     "type": TransferType.ERC20_TRANSFER.name,
+                    "hederaTransactionId": None,
                     "executionDate": datetime_to_str(
                         ethereum_erc_20_event.ethereum_tx.block.timestamp
                     ),
@@ -3004,6 +3005,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
                 },
                 {
                     "type": TransferType.ETHER_TRANSFER.name,
+                    "hederaTransactionId": None,
                     "executionDate": datetime_to_str(
                         internal_tx.ethereum_tx.block.timestamp
                     ),
@@ -3042,6 +3044,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
             [
                 {
                     "type": TransferType.ERC721_TRANSFER.name,
+                    "hederaTransactionId": None,
                     "executionDate": datetime_to_str(
                         ethereum_erc_721_event.ethereum_tx.block.timestamp
                     ),
@@ -3057,6 +3060,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
                 },
                 {
                     "type": TransferType.ERC20_TRANSFER.name,
+                    "hederaTransactionId": None,
                     "executionDate": datetime_to_str(
                         ethereum_erc_20_event.ethereum_tx.block.timestamp
                     ),
@@ -3080,6 +3084,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
                 },
                 {
                     "type": TransferType.ETHER_TRANSFER.name,
+                    "hederaTransactionId": None,
                     "executionDate": datetime_to_str(
                         internal_tx.ethereum_tx.block.timestamp
                     ),
@@ -3222,6 +3227,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
         expected_results = [
             {
                 "type": TransferType.ERC20_TRANSFER.name,
+                "hederaTransactionId": None,
                 "executionDate": datetime_to_str(
                     ethereum_erc_20_event_2.ethereum_tx.block.timestamp
                 ),
@@ -3237,6 +3243,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
             },
             {
                 "type": TransferType.ERC20_TRANSFER.name,
+                "hederaTransactionId": None,
                 "executionDate": datetime_to_str(
                     ethereum_erc_20_event.ethereum_tx.block.timestamp
                 ),
@@ -3260,6 +3267,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
             },
             {
                 "type": TransferType.ETHER_TRANSFER.name,
+                "hederaTransactionId": None,
                 "executionDate": datetime_to_str(
                     internal_tx_2.ethereum_tx.block.timestamp
                 ),
@@ -3275,6 +3283,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
             },
             {
                 "type": TransferType.ETHER_TRANSFER.name,
+                "hederaTransactionId": None,
                 "executionDate": datetime_to_str(
                     internal_tx.ethereum_tx.block.timestamp
                 ),
@@ -3320,6 +3329,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
         expected_results = [
             {
                 "type": TransferType.ERC721_TRANSFER.name,
+                "hederaTransactionId": None,
                 "executionDate": datetime_to_str(
                     ethereum_erc_721_event_2.ethereum_tx.block.timestamp
                 ),
@@ -3335,6 +3345,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
             },
             {
                 "type": TransferType.ERC721_TRANSFER.name,
+                "hederaTransactionId": None,
                 "executionDate": datetime_to_str(
                     ethereum_erc_721_event.ethereum_tx.block.timestamp
                 ),
@@ -3493,6 +3504,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_result = {
             "type": TransferType.ETHER_TRANSFER.name,
+            "hederaTransactionId": None,
             "executionDate": datetime_to_str(internal_tx.ethereum_tx.block.timestamp),
             "blockNumber": internal_tx.ethereum_tx.block_id,
             "transferId": transfer_id,
@@ -3524,6 +3536,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_result = {
             "type": TransferType.ETHER_TRANSFER.name,
+            "hederaTransactionId": None,
             "executionDate": datetime_to_str(
                 internal_tx_empty_trace_address.ethereum_tx.block.timestamp
             ),
@@ -3558,6 +3571,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_result = {
             "type": TransferType.ERC20_TRANSFER.name,
+            "hederaTransactionId": None,
             "executionDate": datetime_to_str(
                 ethereum_erc_20_event.ethereum_tx.block.timestamp
             ),
@@ -3600,6 +3614,7 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         expected_result = {
             "type": TransferType.ERC721_TRANSFER.name,
+            "hederaTransactionId": None,
             "executionDate": datetime_to_str(
                 ethereum_erc_721_event.ethereum_tx.block.timestamp
             ),

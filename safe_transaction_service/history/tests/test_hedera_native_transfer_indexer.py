@@ -1,7 +1,7 @@
 import datetime
 from unittest.mock import MagicMock
 
-from django.test import SimpleTestCase, TestCase
+from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 
 from ..indexers.hedera_native_transfer_indexer import (
@@ -16,8 +16,14 @@ from ..models import (
     InternalTx,
     SafeRelevantTransaction,
 )
+from ...utils.redis import get_redis
 from ..services.transaction_service import TransactionServiceProvider
-from .factories import EthereumBlockFactory, EthereumTxFactory, SafeContractFactory
+from .factories import (
+    EthereumBlockFactory,
+    EthereumTxFactory,
+    InternalTxFactory,
+    SafeContractFactory,
+)
 
 SAFE_ACCOUNT_ID = "0.0.10127045"
 
@@ -478,7 +484,12 @@ class TestHederaNativeTransferIndexerProcessAllSafes(TestCase):
 
 
 class TestHederaNativeTransferVisibleThroughExistingConsumers(TestCase):
+    def setUp(self):
+        # All-transactions responses are cached in Redis, keyed by tx hash
+        get_redis().flushall()
+
     def tearDown(self):
+        get_redis().flushall()
         TransactionServiceProvider.del_singleton()
 
     def test_incoming_native_transfer_appears_in_transaction_service_feed(self):
@@ -505,6 +516,10 @@ class TestHederaNativeTransferVisibleThroughExistingConsumers(TestCase):
         )
         self.assertEqual(len(ether_transfers), 1)
         self.assertEqual(ether_transfers[0]._value, 500_000_000 * 10**10)
+        self.assertEqual(
+            ether_transfers[0].ethereum_tx.hedera_transaction_id,
+            INCOMING_TX["transaction_id"],
+        )
 
     def test_all_transactions_api_never_returns_null_block_number_or_execution_date(
         self,
@@ -543,3 +558,74 @@ class TestHederaNativeTransferVisibleThroughExistingConsumers(TestCase):
         self.assertIsNotNone(results[0]["blockNumber"])
         self.assertEqual(results[0]["blockNumber"], internal_tx.block_number)
         self.assertIsNotNone(results[0]["executionDate"])
+        self.assertEqual(
+            results[0]["hederaTransactionId"],
+            INCOMING_TX["transaction_id"],
+        )
+
+    def _index_incoming_transfer(self):
+        client = MagicMock()
+        client.resolve_account_id.return_value = "0.0.10127045"
+        client.resolve_block_number.return_value = 12345
+        client.resolve_evm_address.return_value = (
+            "0xaaaa00000000000000000000000000000000aaaa"
+        )
+        client.get_crypto_transfers.return_value = iter([INCOMING_TX])
+
+        safe_contract = SafeContractFactory(
+            address="0x1234567890123456789012345678901234567890"
+        )
+        HederaNativeTransferIndexer(client=client).process_safe(safe_contract)
+        return safe_contract
+
+    @override_settings(HEDERA_MIRROR_NODE_URL="https://mirror.example")
+    def test_transfers_expose_hedera_transaction_id(self):
+        safe_contract = self._index_incoming_transfer()
+        evm_internal_tx = InternalTxFactory(to=safe_contract.address, value=7)
+
+        for url_name in ("v1:history:transfers", "v1:history:incoming-transfers"):
+            with self.subTest(url_name=url_name):
+                response = self.client.get(
+                    reverse(url_name, args=(safe_contract.address,))
+                )
+                self.assertEqual(response.status_code, 200)
+                hedera_transaction_ids = {
+                    result["transactionHash"]: result["hederaTransactionId"]
+                    for result in response.json()["results"]
+                }
+                self.assertEqual(len(hedera_transaction_ids), 2)
+                self.assertIsNone(
+                    hedera_transaction_ids[evm_internal_tx.ethereum_tx_id]
+                )
+                synthetic_tx_hash = EthereumTx.objects.get(
+                    hedera_transaction_id__isnull=False
+                ).tx_hash
+                self.assertEqual(
+                    hedera_transaction_ids[synthetic_tx_hash],
+                    INCOMING_TX["transaction_id"],
+                )
+
+        response = self.client.get(
+            reverse("v2:history:all-transactions", args=(safe_contract.address,))
+        )
+        self.assertEqual(response.status_code, 200)
+        synthetic_tx = next(
+            result
+            for result in response.json()["results"]
+            if result["hederaTransactionId"]
+        )
+        self.assertEqual(
+            synthetic_tx["transfers"][0]["hederaTransactionId"],
+            INCOMING_TX["transaction_id"],
+        )
+
+    @override_settings(HEDERA_MIRROR_NODE_URL=None)
+    def test_transfers_do_not_join_ethereum_tx_when_hedera_indexing_disabled(self):
+        safe_address = "0x1234567890123456789012345678901234567890"
+        queryset = InternalTx.objects.ether_and_token_txs(safe_address)
+        self.assertNotIn("history_ethereumtx", str(queryset.query))
+
+        InternalTxFactory(to=safe_address, value=7)
+        transfers = list(queryset)
+        self.assertEqual(len(transfers), 1)
+        self.assertIsNone(transfers[0]["hedera_transaction_id"])

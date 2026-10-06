@@ -258,6 +258,7 @@ class HederaNativeTransferIndexer:
                         _from=None,
                         to=safe_contract.address,
                         value=0,
+                        hedera_transaction_id=mirror_tx["transaction_id"],
                     )
                     ethereum_txs.append(ethereum_tx)
 
