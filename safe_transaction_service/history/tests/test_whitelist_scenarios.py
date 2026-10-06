@@ -15,14 +15,18 @@ from unittest import mock, skipUnless
 from django.conf import settings
 from django.test import TestCase, override_settings
 
+from celery.exceptions import SoftTimeLimitExceeded
 from hexbytes import HexBytes
+from requests import Timeout
 from safe_eth.eth import EthereumClient
 from safe_eth.eth.constants import NULL_ADDRESS
 from safe_eth.safe import Safe
 from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
 from safe_eth.util.util import to_0x_hex_str
+from web3.exceptions import Web3RPCError
 
 from ..indexers import SafeEventsIndexer
+from ..indexers.ethereum_indexer import FindRelevantElementsException
 from ..indexers.tx_processor import SafeTxProcessor
 from ..models import (
     EthereumTx,
@@ -36,6 +40,16 @@ from ..services import IndexServiceProvider, SafeServiceProvider
 from .factories import ProxyFactoryFactory, SafeMasterCopyFactory
 
 SAFES_PER_VERSION = 3
+MAX_INDEXER_RUNS = 200
+# Errors `EthereumIndexer.process_addresses` handles (block process limit set to 1).
+# The periodic indexing task runs again after them, so the scenario does the same
+INDEXER_RETRYABLE_ERRORS = (
+    FindRelevantElementsException,
+    SoftTimeLimitExceeded,
+    Timeout,
+    ValueError,
+    Web3RPCError,
+)
 
 
 @skipUnless(
@@ -79,6 +93,38 @@ class TestWhitelistScenarios(SafeTestCaseMixin, TestCase):
         tx_hash, _ = multisig_tx.execute(self.ethereum_test_account.key)
         self.w3.eth.wait_for_transaction_receipt(tx_hash)
         return HexBytes(tx_hash)
+
+    def run_indexer(self, indexer: SafeEventsIndexer, target_block_number: int) -> None:
+        """
+        Run `indexer.start()` like the periodic task until every monitored address is
+        past `target_block_number`, retrying after provider errors. Prints the block
+        process limit used on every run and the errors
+        """
+        block_process_limits: list[int] = []
+        errors: list[str] = []
+        try:
+            for _ in range(MAX_INDEXER_RUNS):
+                if (
+                    min(
+                        indexer.database_queryset.values_list(
+                            "tx_block_number", flat=True
+                        )
+                    )
+                    > target_block_number
+                ):
+                    return
+                block_process_limits.append(indexer.block_process_limit)
+                try:
+                    indexer.start()
+                except INDEXER_RETRYABLE_ERRORS as e:
+                    errors.append(f"{e.__class__.__name__}: {str(e)[:120]}")
+            self.fail(
+                f"Indexer did not reach the target block in {MAX_INDEXER_RUNS} runs"
+            )
+        finally:
+            print(f"\nIndexer runs: {len(block_process_limits)}")
+            print(f"Block process limit per run: {block_process_limits}")
+            print(f"Provider errors ({len(errors)}): {errors[:5]}")
 
     def test_checkpoint_a_l2_live_indexing(self):
         singletons = {
@@ -127,19 +173,7 @@ class TestWhitelistScenarios(SafeTestCaseMixin, TestCase):
                 "txs_create_or_update_from_tx_hashes",
                 wraps=indexer.index_service.txs_create_or_update_from_tx_hashes,
             ) as fetch_txs_mock:
-                for _ in range(100):
-                    indexer.start()
-                    if (
-                        min(
-                            indexer.database_queryset.values_list(
-                                "tx_block_number", flat=True
-                            )
-                        )
-                        > target_block_number
-                    ):
-                        break
-                else:
-                    self.fail("Indexer did not reach the target block")
+                self.run_indexer(indexer, target_block_number)
             SafeTxProcessor(
                 self.ethereum_client, None, None
             ).process_decoded_transactions(
