@@ -1,17 +1,19 @@
 """
 Parsing and validation of the `WHITELISTED_SAFES` setting.
 
-Imported from the settings module, so it must not import Django or models.
+Imported from the settings module, so it must not import Django or models, nor anything
+loading the HTTP stack (`safe_eth.eth`, `web3`, `requests`): settings can be imported
+before gevent monkey patching, and an early `urllib3` import breaks `ssl` in the workers.
 """
 
 import re
 from collections.abc import Iterable
 
 from eth_typing import ChecksumAddress
-from safe_eth.eth.constants import NULL_ADDRESS
-from safe_eth.eth.utils import fast_is_checksum_address, fast_to_checksum_address
+from eth_utils import is_checksum_address, to_checksum_address
 
 ADDRESS_REGEX = re.compile(r"^0x[0-9a-fA-F]{40}$")
+NULL_ADDRESS = "0x" + "0" * 40
 
 
 def parse_whitelisted_safes(values: Iterable[str]) -> frozenset[ChecksumAddress]:
@@ -33,10 +35,10 @@ def parse_whitelisted_safes(values: Iterable[str]) -> frozenset[ChecksumAddress]
         if (
             hex_part != hex_part.lower()
             and hex_part != hex_part.upper()
-            and not fast_is_checksum_address(value)
+            and not is_checksum_address(value)
         ):
             raise ValueError(f"WHITELISTED_SAFES: {value} has an invalid checksum")
-        address = fast_to_checksum_address(value)
+        address = to_checksum_address(value)
         if address == NULL_ADDRESS:
             raise ValueError("WHITELISTED_SAFES: zero address is not allowed")
         addresses.add(address)

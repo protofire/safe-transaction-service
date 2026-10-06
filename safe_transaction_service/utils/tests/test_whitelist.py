@@ -1,4 +1,6 @@
 import os
+import subprocess
+import sys
 from unittest import TestCase
 
 from django.conf import settings
@@ -91,3 +93,25 @@ class TestValidateWhitelistConfig(TestCase):
 class TestWhitelistSetting(TestCase):
     def test_default_empty(self):
         self.assertEqual(settings.WHITELISTED_SAFES, frozenset())
+
+
+class TestSettingsImports(TestCase):
+    def test_settings_do_not_load_http_stack(self):
+        """
+        Settings can be imported before gevent monkey patching (e.g. by the gunicorn
+        master). Loading `ssl` users like `urllib3` that early makes `SSLContext` recurse
+        forever in the gevent workers (`RecursionError` creating boto3 clients)
+        """
+        code = (
+            "import sys; import config.settings.base; "
+            "print(','.join(m for m in ('urllib3', 'requests', 'web3') if m in sys.modules))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "")
