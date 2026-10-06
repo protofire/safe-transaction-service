@@ -46,6 +46,22 @@ def datetime_to_consensus_timestamp(dt: datetime.datetime) -> str:
     return f"{seconds}.{nanos:09d}"
 
 
+def build_synthetic_tx_hash(mirror_tx: dict, safe_address: str) -> str:
+    """
+    Build the placeholder ``EthereumTx.tx_hash`` for a native Hedera transfer.
+
+    :param mirror_tx: One entry from Mirror Node's ``/api/v1/transactions``.
+    :param safe_address: Checksummed address of the Safe being indexed.
+    :return: ``0x``-prefixed keccak hash, stable across re-runs.
+    """
+    return to_0x_hex_str(
+        fast_keccak_text(
+            f"hedera-native:{mirror_tx['transaction_id']}:"
+            f"{mirror_tx.get('nonce', 0)}:{safe_address}"
+        )
+    )
+
+
 def extract_transfer_legs(mirror_tx: dict, safe_account_id: str) -> list[dict]:
     """
     Turn a Mirror Node ``CRYPTOTRANSFER`` transaction into the list of HBAR
@@ -235,9 +251,7 @@ class HederaNativeTransferIndexer:
                         break
 
                     timestamp = consensus_timestamp_to_datetime(consensus_timestamp)
-                    tx_hash = to_0x_hex_str(
-                        fast_keccak_text(f"hedera-native:{mirror_tx['transaction_id']}")
-                    )
+                    tx_hash = build_synthetic_tx_hash(mirror_tx, safe_contract.address)
                     ethereum_tx = EthereumTx(
                         tx_hash=tx_hash,
                         # Deliberately never linked to a real EthereumBlock

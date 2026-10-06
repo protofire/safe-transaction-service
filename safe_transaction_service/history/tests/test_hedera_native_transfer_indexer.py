@@ -4,8 +4,10 @@ from unittest.mock import MagicMock
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 
+from ...utils.redis import get_redis
 from ..indexers.hedera_native_transfer_indexer import (
     HederaNativeTransferIndexer,
+    build_synthetic_tx_hash,
     consensus_timestamp_to_datetime,
     datetime_to_consensus_timestamp,
     extract_transfer_legs,
@@ -16,7 +18,6 @@ from ..models import (
     InternalTx,
     SafeRelevantTransaction,
 )
-from ...utils.redis import get_redis
 from ..services.transaction_service import TransactionServiceProvider
 from .factories import (
     EthereumBlockFactory,
@@ -176,6 +177,38 @@ class TestExtractTransferLegsSimple(SimpleTestCase):
         self.assertEqual(
             legs,
             [{"counterparty_account_id": "0.0.1111111", "amount_tinybar": 500_000_000}],
+        )
+
+
+class TestBuildSyntheticTxHash(SimpleTestCase):
+    SAFE_A = "0x1111111111111111111111111111111111111111"
+    SAFE_B = "0x2222222222222222222222222222222222222222"
+    MIRROR_TX = {"transaction_id": "0.0.4000000-1791300071-257082119", "nonce": 0}
+
+    def test_is_stable_across_runs(self):
+        self.assertEqual(
+            build_synthetic_tx_hash(self.MIRROR_TX, self.SAFE_A),
+            build_synthetic_tx_hash(dict(self.MIRROR_TX), self.SAFE_A),
+        )
+
+    def test_differs_per_safe_for_the_same_hedera_transaction(self):
+        self.assertNotEqual(
+            build_synthetic_tx_hash(self.MIRROR_TX, self.SAFE_A),
+            build_synthetic_tx_hash(self.MIRROR_TX, self.SAFE_B),
+        )
+
+    def test_differs_per_child_record_nonce(self):
+        self.assertNotEqual(
+            build_synthetic_tx_hash({**self.MIRROR_TX, "nonce": 1}, self.SAFE_A),
+            build_synthetic_tx_hash({**self.MIRROR_TX, "nonce": 2}, self.SAFE_A),
+        )
+
+    def test_missing_nonce_is_treated_as_top_level_record(self):
+        self.assertEqual(
+            build_synthetic_tx_hash(
+                {"transaction_id": self.MIRROR_TX["transaction_id"]}, self.SAFE_A
+            ),
+            build_synthetic_tx_hash(self.MIRROR_TX, self.SAFE_A),
         )
 
 
@@ -376,6 +409,78 @@ class TestHederaNativeTransferIndexerProcessSafe(TestCase):
         ethereum_tx = first_internal_tx.ethereum_tx
         self.assertEqual(ethereum_tx._from, first_internal_tx._from)
         self.assertEqual(ethereum_tx.to, first_internal_tx.to)
+
+    def test_one_hedera_transaction_paying_two_safes_indexes_each_safe(self):
+        # A single CRYPTOTRANSFER can credit several accounts at once (e.g. a
+        # SentX NFT purchase pays seller, royalties and the marketplace).
+        other_safe_contract = SafeContractFactory(
+            address="0x2222222222222222222222222222222222222222"
+        )
+        other_safe_account_id = "0.0.10127046"
+        shared_tx = {
+            "transaction_id": "0.0.1111111-1700000300-000000004",
+            "consensus_timestamp": "1700000300.000000004",
+            "result": "SUCCESS",
+            "charged_tx_fee": 1_000_000,
+            "transfers": [
+                {"account": "0.0.1111111", "amount": -(700_000_000 + 1_000_000)},
+                {"account": "0.0.7", "amount": 100_000},
+                {"account": "0.0.98", "amount": 900_000},
+                {"account": "0.0.10127045", "amount": 600_000_000},
+                {"account": other_safe_account_id, "amount": 100_000_000},
+            ],
+        }
+
+        self.client.get_crypto_transfers.return_value = iter([shared_tx])
+        self.assertEqual(self.indexer.process_safe(self.safe_contract), 1)
+        self.client.resolve_account_id.return_value = other_safe_account_id
+        self.client.get_crypto_transfers.return_value = iter([shared_tx])
+        self.assertEqual(self.indexer.process_safe(other_safe_contract), 1)
+
+        for safe_contract, value_tinybar in (
+            (self.safe_contract, 600_000_000),
+            (other_safe_contract, 100_000_000),
+        ):
+            with self.subTest(safe=safe_contract.address):
+                internal_tx = InternalTx.objects.get(to=safe_contract.address)
+                self.assertEqual(internal_tx.value, value_tinybar * 10**10)
+                self.assertEqual(internal_tx.ethereum_tx.to, safe_contract.address)
+                self.assertEqual(
+                    internal_tx.ethereum_tx.hedera_transaction_id,
+                    shared_tx["transaction_id"],
+                )
+                self.assertTrue(
+                    SafeRelevantTransaction.objects.filter(
+                        ethereum_tx=internal_tx.ethereum_tx,
+                        safe=safe_contract.address,
+                    ).exists()
+                )
+        self.assertNotEqual(
+            InternalTx.objects.get(to=self.safe_contract.address).ethereum_tx_id,
+            InternalTx.objects.get(to=other_safe_contract.address).ethereum_tx_id,
+        )
+
+    def test_child_records_sharing_a_transaction_id_are_indexed_separately(self):
+        # Child records created by a contract call reuse the parent's
+        # transaction_id and differ only by nonce.
+        child_records = [
+            {
+                **INCOMING_TX,
+                "nonce": nonce,
+                "consensus_timestamp": f"1700000000.00000000{nonce + 1}",
+            }
+            for nonce in (1, 2)
+        ]
+        self.client.get_crypto_transfers.return_value = iter(child_records)
+
+        created_count = self.indexer.process_safe(self.safe_contract)
+
+        self.assertEqual(created_count, 2)
+        internal_txs = InternalTx.objects.filter(to=self.safe_contract.address)
+        self.assertEqual(internal_txs.count(), 2)
+        self.assertEqual(
+            len({internal_tx.ethereum_tx_id for internal_tx in internal_txs}), 2
+        )
 
     def test_advances_cursor_and_is_idempotent_on_rerun(self):
         self.client.get_crypto_transfers.return_value = iter([INCOMING_TX])
