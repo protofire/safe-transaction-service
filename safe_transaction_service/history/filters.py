@@ -7,7 +7,7 @@ from safe_eth.eth.django.filters import EthereumAddressFilter, Keccak256Filter
 
 from safe_transaction_service.utils.filters import filter_overrides
 
-from .models import ModuleTransaction, MultisigTransaction
+from .models import DelayModuleTransaction, ModuleTransaction, MultisigTransaction
 
 
 class DelegateListFilter(filters.FilterSet):
@@ -150,5 +150,13 @@ class ModuleTransactionFilter(filters.FilterSet):
             "operation": ["exact"],
             "failed": ["exact"],
         }
+
+        filter_overrides = filter_overrides
+
+
+class DelayModuleTransactionFilter(filters.FilterSet):
+    class Meta:
+        model = DelayModuleTransaction
+        fields = {"queue_nonce": ["exact", "gte", "lt"]}
 
         filter_overrides = filter_overrides

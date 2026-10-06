@@ -117,6 +117,12 @@ TASKS = [
         period=IntervalSchedule.SECONDS,
     ),
     CeleryTaskConfiguration(
+        name="safe_transaction_service.history.tasks.index_delay_module_events_task",
+        description="Index Delay Modifier events (every 14 seconds)",
+        interval=14,
+        period=IntervalSchedule.SECONDS,
+    ),
+    CeleryTaskConfiguration(
         name="safe_transaction_service.history.tasks.reindex_mastercopies_last_hours_task",
         description="Reindex master copies for the last hours (every 2 hours at minute 0)",
         cron=CronDefinition(
@@ -298,6 +304,7 @@ class Command(BaseCommand):
             self._setup_safe_singleton_addresses_from_chain(ethereum_client)
 
         self._setup_erc20_indexing()
+        self._setup_delay_module_indexing()
 
         if ethereum_network in PROXY_FACTORIES:
             self.stdout.write(
@@ -370,6 +377,38 @@ class Command(BaseCommand):
                 indexing_type=IndexingStatusType.ERC20_721_EVENTS.value, block_number=0
             )
 
+        block_number = self._get_min_master_copies_block_number()
+
+        if indexing_status.block_number < block_number:
+            indexing_status.block_number = block_number
+            indexing_status.save(update_fields=["block_number"])
+            return True
+        return False
+
+    def _setup_delay_module_indexing(self) -> bool:
+        """
+        Update Delay Modifier events indexing status if `indexing block number` is less than `Master copies`
+        block deployments or `ETH_DELAY_MODULE_INDEXING_START_BLOCK`
+
+        :return: `True` if updated, `False` otherwise
+        """
+        block_number = max(
+            self._get_min_master_copies_block_number(),
+            settings.ETH_DELAY_MODULE_INDEXING_START_BLOCK or 0,
+        )
+        indexing_status, created = IndexingStatus.objects.get_or_create(
+            indexing_type=IndexingStatusType.DELAY_MODULE_EVENTS.value,
+            defaults={"block_number": block_number},
+        )
+
+        if not created and indexing_status.block_number < block_number:
+            indexing_status.block_number = block_number
+            indexing_status.save(update_fields=["block_number"])
+            return True
+        return created
+
+    @staticmethod
+    def _get_min_master_copies_block_number() -> int:
         queryset = (
             SafeMasterCopy.objects.filter(l2=True)
             if settings.ETH_L2_NETWORK
@@ -378,15 +417,7 @@ class Command(BaseCommand):
         min_master_copies_block_number = queryset.aggregate(
             min_master_copies_block_number=Min("initial_block_number")
         )["min_master_copies_block_number"]
-        block_number = (
-            min_master_copies_block_number if min_master_copies_block_number else 0
-        )
-
-        if indexing_status.block_number < block_number:
-            indexing_status.block_number = block_number
-            indexing_status.save(update_fields=["block_number"])
-            return True
-        return False
+        return min_master_copies_block_number if min_master_copies_block_number else 0
 
     @staticmethod
     def _setup_safe_singleton_addresses_from_chain(ethereum_client: EthereumClient):

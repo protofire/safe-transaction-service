@@ -44,6 +44,7 @@ from .cache import CacheSafeTxsView, cache_txs_view_for_address
 from .exceptions import CannotGetSafeInfoFromBlockchain
 from .helpers import add_tokens_to_transfers, is_valid_unique_transfer_id
 from .models import (
+    DelayModuleTransaction,
     ERC20Transfer,
     ERC721Transfer,
     InternalTx,
@@ -500,6 +501,41 @@ class SafeModuleTransactionListView(ListAPIView):
     def get(self, request, address, format=None):
         """
         Returns all the transactions executed from modules given a Safe address
+        """
+        if not fast_is_checksum_address(address):
+            return Response(
+                status=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                data={
+                    "code": 1,
+                    "message": "Checksum address validation failed",
+                    "arguments": [address],
+                },
+            )
+
+        return super().get(request, address)
+
+
+class DelayModuleTransactionListView(ListAPIView):
+    filter_backends = (django_filters.rest_framework.DjangoFilterBackend,)
+    filterset_class = filters.DelayModuleTransactionFilter
+    pagination_class = pagination.DefaultPagination
+    serializer_class = serializers.DelayModuleTransactionResponseSerializer
+
+    def get_queryset(self):
+        # Just for swagger doc
+        if getattr(self, "swagger_fake_view", False):
+            return DelayModuleTransaction.objects.none()
+
+        return (
+            DelayModuleTransaction.objects.filter(module=self.kwargs["address"])
+            .select_related("ethereum_tx")
+            .order_by("queue_nonce", "block_number", "log_index")
+        )
+
+    def get(self, request, address, format=None):
+        """
+        Returns the transactions queued in a Zodiac Delay Modifier (`TransactionAdded` events),
+        e.g. Account Recovery proposals, sorted by queue nonce
         """
         if not fast_is_checksum_address(address):
             return Response(

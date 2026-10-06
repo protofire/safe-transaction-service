@@ -652,6 +652,25 @@ class SafeDelegateResponseSerializer(serializers.Serializer):
     expiry_date = serializers.DateTimeField()
 
 
+class DelayModuleTransactionResponseSerializer(serializers.Serializer):
+    queue_nonce = serializers.CharField()
+    tx_hash = serializers.CharField(
+        source="module_tx_hash",
+        help_text="Hash of the queued transaction, as stored by the Delay Modifier",
+    )
+    to = EthereumAddressField()
+    value = serializers.CharField()
+    data = HexadecimalField(allow_null=True, allow_blank=True)
+    operation = serializers.IntegerField()
+    transaction_hash = serializers.CharField(source="ethereum_tx_id")
+    block_number = serializers.IntegerField()
+    execution_date = serializers.DateTimeField(source="timestamp")
+    proposer = EthereumAddressField(
+        source="ethereum_tx._from",
+        help_text="Sender of the transaction that queued it",
+    )
+
+
 class SafeModuleTransactionResponseSerializer(GnosisBaseModelSerializer):
     execution_date = serializers.DateTimeField()
     data = HexadecimalField(allow_null=True, allow_blank=True)

@@ -16,6 +16,7 @@ from safe_eth.safe.safe_signature import SafeSignatureType
 from safe_eth.util.util import to_0x_hex_str
 
 from ..models import (
+    DelayModuleTransaction,
     ERC20Transfer,
     ERC721Transfer,
     EthereumBlock,
@@ -439,3 +440,22 @@ class SafeLastStatusFactory(DjangoModelFactory):
 class SafeStatusFactory(SafeLastStatusFactory):
     class Meta:
         model = SafeStatus
+
+
+class DelayModuleTransactionFactory(DjangoModelFactory):
+    class Meta:
+        model = DelayModuleTransaction
+
+    ethereum_tx = factory.SubFactory(EthereumTxFactory)
+    log_index = factory.Sequence(lambda n: n)
+    block_number = factory.SelfAttribute("ethereum_tx.block.number")
+    timestamp = factory.SelfAttribute("ethereum_tx.block.timestamp")
+    module = factory.LazyFunction(lambda: Account.create().address)
+    queue_nonce = factory.Sequence(lambda n: n)
+    module_tx_hash = factory.Sequence(
+        lambda n: to_0x_hex_str(fast_keccak_text(f"module-tx-hash-{n}"))
+    )
+    to = factory.LazyFunction(lambda: Account.create().address)
+    value = factory.fuzzy.FuzzyInteger(0, 1000)
+    data = b""
+    operation = 0

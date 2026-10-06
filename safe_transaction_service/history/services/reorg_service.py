@@ -9,6 +9,7 @@ from safe_eth.eth import EthereumClient, get_auto_ethereum_client
 from safe_eth.util.util import to_0x_hex_str
 
 from ..indexers import (
+    DelayModuleEventsIndexerProvider,
     Erc20EventsIndexerProvider,
     InternalTxIndexerProvider,
     ProxyFactoryIndexerProvider,
@@ -75,10 +76,16 @@ class ReorgService:
                     block_number, from_block_number=block_number
                 )
             ),
+            lambda block_number: int(
+                IndexingStatus.objects.set_delay_module_indexing_status(
+                    block_number, from_block_number=block_number
+                )
+            ),
         ]
 
         # Indexers to reset
         self.indexer_providers = [
+            DelayModuleEventsIndexerProvider,
             Erc20EventsIndexerProvider,
             InternalTxIndexerProvider,
             ProxyFactoryIndexerProvider,

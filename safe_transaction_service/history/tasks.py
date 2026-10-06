@@ -18,6 +18,7 @@ from ..events.services.queue_service import get_queue_service
 from ..utils.celery import task_timeout
 from ..utils.tasks import LOCK_TIMEOUT, only_one_running_task
 from .indexers import (
+    DelayModuleEventsIndexerProvider,
     Erc20EventsIndexerProvider,
     FindRelevantElementsException,
     InternalTxIndexerProvider,
@@ -108,6 +109,33 @@ def index_erc20_events_task(self) -> tuple[int, int] | None:
             ) = Erc20EventsIndexerProvider().start()
             logger.debug(
                 "Indexing of erc20/721 events task processed %d events", number_events
+            )
+            return number_events, number_of_blocks_processed
+
+
+@app.shared_task(
+    bind=True,
+    autoretry_for=(IndexingException, IOError),
+    default_retry_delay=15,
+    retry_kwargs={"max_retries": 3},
+)
+@task_timeout(timeout_seconds=LOCK_TIMEOUT)
+def index_delay_module_events_task(self) -> tuple[int, int] | None:
+    """
+    Find and process Zodiac Delay Modifier `TransactionAdded` events (e.g. Account Recovery proposals)
+
+    :return: Tuple Number of events processed, number of blocks processed
+    """
+    with contextlib.suppress(LockError):
+        with only_one_running_task(self):
+            logger.info("Start indexing of delay module events")
+            (
+                number_events,
+                number_of_blocks_processed,
+            ) = DelayModuleEventsIndexerProvider().start()
+            logger.debug(
+                "Indexing of delay module events task processed %d events",
+                number_events,
             )
             return number_events, number_of_blocks_processed
 

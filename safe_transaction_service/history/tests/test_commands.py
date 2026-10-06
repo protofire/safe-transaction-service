@@ -432,6 +432,41 @@ class TestCommands(SafeTestCaseMixin, TestCase):
             first_safe_block_deployed + 20,
         )
 
+    @mock.patch.object(
+        EthereumClient, "get_network", return_value=EthereumNetwork.MAINNET
+    )
+    def test_setup_service_mainnet_delay_module_indexing_setup(
+        self, ethereum_client_get_network_mock: MagicMock
+    ):
+        first_safe_block_deployed = (
+            6569433  # 0.0.2 deployment block, first Safe contract
+        )
+        call_command("setup_service", stdout=StringIO())
+        self.assertEqual(
+            IndexingStatus.objects.get_delay_module_indexing_status().block_number,
+            first_safe_block_deployed,
+        )
+
+        # Not modified if higher than the oldest master copy
+        IndexingStatus.objects.set_delay_module_indexing_status(
+            first_safe_block_deployed + 20
+        )
+        call_command("setup_service", stdout=StringIO())
+        self.assertEqual(
+            IndexingStatus.objects.get_delay_module_indexing_status().block_number,
+            first_safe_block_deployed + 20,
+        )
+
+        # Moved forward to the configured start block
+        with self.settings(
+            ETH_DELAY_MODULE_INDEXING_START_BLOCK=first_safe_block_deployed + 1_000
+        ):
+            call_command("setup_service", stdout=StringIO())
+        self.assertEqual(
+            IndexingStatus.objects.get_delay_module_indexing_status().block_number,
+            first_safe_block_deployed + 1_000,
+        )
+
     def test_setup_service_sepolia(self):
         self._test_setup_service(EthereumNetwork.SEPOLIA)
 

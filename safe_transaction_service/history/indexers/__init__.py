@@ -1,4 +1,8 @@
 # flake8: noqa F401
+from .delay_module_events_indexer import (
+    DelayModuleEventsIndexer,
+    DelayModuleEventsIndexerProvider,
+)
 from .erc20_events_indexer import Erc20EventsIndexer, Erc20EventsIndexerProvider
 from .ethereum_indexer import EthereumIndexer, FindRelevantElementsException
 from .internal_tx_indexer import InternalTxIndexer, InternalTxIndexerProvider

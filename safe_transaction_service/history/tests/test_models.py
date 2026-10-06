@@ -4,7 +4,7 @@ from datetime import timedelta
 from unittest import mock
 
 from django.core.exceptions import ValidationError
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.db.models import QuerySet
 from django.test import TestCase
 from django.utils import timezone
@@ -147,12 +147,38 @@ class TestModelMixins(TestCase):
 
 class TestIndexingStatus(TestCase):
     def test_indexing_status(self):
-        indexing_status = IndexingStatus.objects.get()
-        self.assertEqual(str(indexing_status), "ERC20_721_EVENTS - 0")
+        self.assertEqual(
+            [
+                str(indexing_status)
+                for indexing_status in IndexingStatus.objects.order_by("indexing_type")
+            ],
+            ["ERC20_721_EVENTS - 0", "DELAY_MODULE_EVENTS - 0"],
+        )
 
-        with self.assertRaises(IntegrityError):
-            # IndexingStatus should be inserted with a migration and `indexing_type` is unique
-            IndexingStatusFactory(indexing_type=0)
+        for indexing_type in (0, 1):
+            with self.assertRaises(IntegrityError):
+                # IndexingStatus should be inserted with a migration and `indexing_type` is unique
+                with transaction.atomic():
+                    IndexingStatusFactory(indexing_type=indexing_type)
+
+    def test_set_delay_module_indexing_status(self):
+        self.assertTrue(IndexingStatus.objects.set_delay_module_indexing_status(5))
+        self.assertEqual(
+            IndexingStatus.objects.get_delay_module_indexing_status().block_number, 5
+        )
+
+        self.assertFalse(
+            IndexingStatus.objects.set_delay_module_indexing_status(
+                20, from_block_number=6
+            )
+        )
+        self.assertEqual(
+            IndexingStatus.objects.get_delay_module_indexing_status().block_number, 5
+        )
+        # Not affected
+        self.assertEqual(
+            IndexingStatus.objects.get_erc20_721_indexing_status().block_number, 0
+        )
 
     def test_set_erc20_721_indexing_status(self):
         self.assertTrue(IndexingStatus.objects.set_erc20_721_indexing_status(5))

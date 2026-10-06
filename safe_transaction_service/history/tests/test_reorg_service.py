@@ -87,6 +87,23 @@ class TestReorgService(TestCase):
             reorg_block_number,
         )
 
+    def test_reset_all_to_block_delay_module_indexing_status(self):
+        reorg_block_number = 5
+        IndexingStatus.objects.set_delay_module_indexing_status(reorg_block_number - 1)
+        self.reorg_service.reset_all_to_block(reorg_block_number)
+        # Not reset as block is lower than reorg block
+        self.assertEqual(
+            IndexingStatus.objects.get_delay_module_indexing_status().block_number,
+            reorg_block_number - 1,
+        )
+
+        IndexingStatus.objects.set_delay_module_indexing_status(reorg_block_number + 2)
+        self.reorg_service.reset_all_to_block(reorg_block_number)
+        self.assertEqual(
+            IndexingStatus.objects.get_delay_module_indexing_status().block_number,
+            reorg_block_number,
+        )
+
     def test_recover_from_reorg(self):
         reorg_block = 2_000  # Test a reorg in block 2000
         ethereum_blocks = [

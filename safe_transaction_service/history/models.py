@@ -130,6 +130,7 @@ class InternalTxType(Enum):
 
 class IndexingStatusType(Enum):
     ERC20_721_EVENTS = 0
+    DELAY_MODULE_EVENTS = 1
 
 
 class TransferDict(TypedDict):
@@ -200,7 +201,33 @@ class IndexingStatusManager(models.Manager):
                                   from reorgs
         :return:
         """
-        queryset = self.filter(indexing_type=IndexingStatusType.ERC20_721_EVENTS.value)
+        return self._set_indexing_status(
+            IndexingStatusType.ERC20_721_EVENTS, block_number, from_block_number
+        )
+
+    def get_delay_module_indexing_status(self) -> "IndexingStatus":
+        return self.get(indexing_type=IndexingStatusType.DELAY_MODULE_EVENTS.value)
+
+    def set_delay_module_indexing_status(
+        self, block_number: int, from_block_number: int | None = None
+    ) -> bool:
+        """
+        :param block_number:
+        :param from_block_number: If provided, only update the field if bigger than `from_block_number`, to protect
+                                  from reorgs
+        :return:
+        """
+        return self._set_indexing_status(
+            IndexingStatusType.DELAY_MODULE_EVENTS, block_number, from_block_number
+        )
+
+    def _set_indexing_status(
+        self,
+        indexing_type: IndexingStatusType,
+        block_number: int,
+        from_block_number: int | None,
+    ) -> bool:
+        queryset = self.filter(indexing_type=indexing_type.value)
         if from_block_number is not None:
             queryset = queryset.filter(block_number__gte=from_block_number)
         return bool(queryset.update(block_number=block_number))
@@ -1835,6 +1862,39 @@ class ModuleTransaction(TimeStampedModel):
     @property
     def execution_date(self) -> datetime.datetime:
         return self.internal_tx.timestamp
+
+
+class DelayModuleTransaction(models.Model):
+    """
+    Zodiac Delay Modifier `TransactionAdded` event: a transaction queued in a Delay Modifier,
+    e.g. a recovery proposal. Indexed for every emitter, filtered by `module` when queried
+    """
+
+    ethereum_tx = models.ForeignKey(EthereumTx, on_delete=models.CASCADE)
+    log_index = models.PositiveIntegerField()
+    block_number = models.PositiveIntegerField()
+    timestamp = models.DateTimeField()
+    module = EthereumAddressBinaryField()
+    queue_nonce = Uint256Field()
+    module_tx_hash = Keccak256Field()
+    to = EthereumAddressBinaryField()
+    value = Uint256Field()
+    data = models.BinaryField(null=True)
+    operation = models.PositiveSmallIntegerField(
+        choices=[(tag.value, tag.name) for tag in SafeOperationEnum]
+    )
+
+    class Meta:
+        indexes = [Index(fields=["module", "queue_nonce"])]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["ethereum_tx", "log_index"],
+                name="unique_delay_module_transaction_index",
+            )
+        ]
+
+    def __str__(self):
+        return f"Delay module={self.module} queue-nonce={self.queue_nonce} to={self.to}"
 
 
 class MultisigConfirmationManager(models.Manager):

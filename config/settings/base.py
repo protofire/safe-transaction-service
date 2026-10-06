@@ -395,6 +395,9 @@ ERC20_721_INDEXER_LOG_LEVEL = (
 PROXY_FACTORY_INDEXER_LOG_LEVEL = (
     env("PROXY_FACTORY_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
 )
+DELAY_MODULE_INDEXER_LOG_LEVEL = (
+    env("DELAY_MODULE_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
+)
 SAFE_EVENTS_INDEXER_LOG_LEVEL = (
     env("SAFE_EVENTS_INDEXER_LOG_LEVEL", default="INFO") if not DEBUG else "DEBUG"
 )
@@ -552,6 +555,13 @@ LOGGING = {
         "safe_transaction_service.history.tasks.index_erc20_events_task": {
             "level": ERC20_721_INDEXER_LOG_LEVEL,
         },
+        # DELAY_MODULE_INDEXER_LOG_LEVEL
+        "safe_transaction_service.history.indexers.delay_module_events_indexer": {
+            "level": DELAY_MODULE_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.tasks.index_delay_module_events_task": {
+            "level": DELAY_MODULE_INDEXER_LOG_LEVEL,
+        },
         # PROXY_FACTORY_INDEXER_LOG_LEVEL
         "safe_transaction_service.history.indexers.proxy_factory_indexer": {
             "level": PROXY_FACTORY_INDEXER_LOG_LEVEL,
@@ -660,6 +670,9 @@ ETH_REORG_BLOCKS = env.int(
 ETH_ERC20_LOAD_ADDRESSES_CHUNK_SIZE = env.int(
     "ETH_ERC20_LOAD_ADDRESSES_CHUNK_SIZE", default=500_000
 )  # Load Safe addresses for the ERC20 indexer with a database iterator with the defined `chunk_size`
+ETH_DELAY_MODULE_INDEXING_START_BLOCK = env.int(
+    "ETH_DELAY_MODULE_INDEXING_START_BLOCK", default=None
+)  # Minimum block to index Delay Modifier events from, e.g. if the node does not keep older logs
 ETH_EVENTS_IGNORED_INITIATORS: set[ChecksumAddress] = {
     ChecksumAddress(HexAddress(HexStr(address)))
     for address in env.list("ETH_EVENTS_IGNORED_INITIATORS", default=[])

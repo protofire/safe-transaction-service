@@ -95,6 +95,11 @@ urlpatterns = [
         name="multisig-transaction-confirmations",
     ),
     path("modules/<str:address>/safes/", views.ModulesView.as_view(), name="modules"),
+    path(
+        "delay-modules/<str:address>/transactions/",
+        views.DelayModuleTransactionListView.as_view(),
+        name="delay-module-transactions",
+    ),
     path("owners/<str:address>/safes/", views.OwnersView.as_view(), name="owners"),
     path(
         "delegates/", views.DelegateListView.as_view(), name="delegates"
