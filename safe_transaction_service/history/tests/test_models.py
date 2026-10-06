@@ -852,6 +852,30 @@ class TestInternalTxDecoded(TestCase):
         )
         self.assertTrue(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
 
+        # Add a newer processed tx; an unprocessed tx between older and newer processed txs remains out of order
+        newer_processed = InternalTxDecodedFactory(
+            internal_tx___from=random_safe,
+            internal_tx__block_number=20,
+            processed=True,
+            internal_tx__timestamp=i.internal_tx.timestamp
+            + datetime.timedelta(seconds=10),
+        )
+        self.assertTrue(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        # Once all unprocessed transactions are marked processed, safe is not out of order
+        InternalTxDecoded.objects.for_safe(random_safe).update(processed=True)
+        self.assertFalse(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
+        # Adding an unprocessed tx older than newer_processed is detected as out of order
+        InternalTxDecodedFactory(
+            internal_tx___from=random_safe,
+            internal_tx__block_number=15,
+            processed=False,
+            internal_tx__timestamp=newer_processed.internal_tx.timestamp
+            - datetime.timedelta(seconds=1),
+        )
+        self.assertTrue(InternalTxDecoded.objects.out_of_order_for_safe(random_safe))
+
 
 class TestLastSafeStatus(TestCase):
     def test_insert(self):

@@ -1306,17 +1306,16 @@ class InternalTxDecodedManager(BulkCreateSignalMixin, models.Manager):
         :return: `True` if there are internal txs out of order (processed newer
             than no processed, e.g. due to a reindex), `False` otherwise
         """
+        latest_processed_internal_tx = (
+            InternalTx.objects.for_safe(safe_address)
+            .filter(decoded_tx__processed=True)
+            .order_by("-timestamp")
+            .values("timestamp")[:1]
+        )
         return (
             self.for_safe(safe_address)
             .not_processed()
-            .filter(
-                internal_tx__timestamp__lt=InternalTx.objects.for_safe(safe_address)
-                .filter(decoded_tx__processed=True)
-                .annotate(dummy_group_by=Value(1))
-                .values("dummy_group_by")
-                .annotate(max_timestamp=Max("timestamp"))
-                .values("max_timestamp")
-            )
+            .filter(internal_tx__timestamp__lt=latest_processed_internal_tx)
             .exists()
         )
 
