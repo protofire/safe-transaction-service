@@ -35,6 +35,7 @@ from ..models import (
     SafeMasterCopy,
     SafeRelevantTransaction,
 )
+from ..whitelist import get_whitelisted_safes
 from .events_indexer import EventsIndexer
 
 logger = getLogger(__name__)
@@ -71,10 +72,15 @@ class SafeEventsIndexer(EventsIndexer):
         )
         kwargs.setdefault("ignored_initiators", settings.ETH_EVENTS_IGNORED_INITIATORS)
         kwargs.setdefault("ignored_to", settings.ETH_EVENTS_IGNORED_TO)
+        kwargs.setdefault("whitelisted_safes", get_whitelisted_safes())
 
         self.eth_zksync_compatible_network = kwargs["eth_zksync_compatible_network"]
         self.ignored_initiators = kwargs["ignored_initiators"]
         self.ignored_to = kwargs["ignored_to"]
+        # Empty == index every Safe
+        self.whitelisted_safes: frozenset[ChecksumAddress] = frozenset(
+            kwargs["whitelisted_safes"]
+        )
         self.conditional_indexing_enabled = bool(
             self.ignored_initiators or self.ignored_to
         )
@@ -87,6 +93,7 @@ class SafeEventsIndexer(EventsIndexer):
         Override to filter events by tx._from and tx.to when conditional indexing is enabled.
         This avoids storing EthereumTx in database for blocklisted addresses.
         """
+        log_receipts = self._filter_whitelisted_log_receipts(log_receipts)
         if not log_receipts:
             return []
 
@@ -95,6 +102,53 @@ class SafeEventsIndexer(EventsIndexer):
             return super().process_elements(log_receipts)
 
         return self._process_elements_with_conditional_indexing(log_receipts)
+
+    @cached_property
+    def _proxy_creation_topics(self) -> set[str]:
+        return {
+            topic
+            for topic, events in self.events_to_listen.items()
+            if any(event.event_name == "ProxyCreation" for event in events)
+        }
+
+    def _filter_whitelisted_log_receipts(
+        self, log_receipts: Sequence[LogReceipt]
+    ) -> Sequence[LogReceipt]:
+        """
+        Keep only events for whitelisted Safes, before any transaction is fetched.
+        Safe events are emitted by the Safe itself, `ProxyCreation` by the ProxyFactory
+        with the Safe address as `proxy`
+
+        :param log_receipts:
+        :return: `log_receipts` unchanged if the whitelist is disabled, otherwise the
+            ones related to whitelisted Safes
+        """
+        if not self.whitelisted_safes:
+            return log_receipts
+
+        whitelisted_log_receipts: list[LogReceipt] = []
+        for log_receipt in log_receipts:
+            if not log_receipt["topics"]:
+                continue
+            topic = to_0x_hex_str(log_receipt["topics"][0])
+            if topic not in self.events_to_listen:
+                continue
+            if log_receipt["address"] in self.whitelisted_safes:
+                whitelisted_log_receipts.append(log_receipt)
+            elif topic in self._proxy_creation_topics:
+                decoded_element = self.decode_element(log_receipt)
+                if (
+                    decoded_element
+                    and decoded_element["args"].get("proxy") in self.whitelisted_safes
+                ):
+                    whitelisted_log_receipts.append(log_receipt)
+
+        logger.debug(
+            "Whitelist: kept %d of %d events",
+            len(whitelisted_log_receipts),
+            len(log_receipts),
+        )
+        return whitelisted_log_receipts
 
     def _process_elements_with_conditional_indexing(
         self, log_receipts: Sequence[LogReceipt]

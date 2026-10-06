@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from unittest import mock
 
 from django.test import TestCase
 
@@ -17,7 +18,7 @@ from safe_eth.util.util import to_0x_hex_str
 from web3 import Web3
 from web3.auto import w3
 from web3.datastructures import AttributeDict
-from web3.types import LogReceipt
+from web3.types import LogReceipt, RPCEndpoint
 
 from ..indexers import SafeEventsIndexer, SafeEventsIndexerProvider
 from ..indexers.tx_processor import SafeTxProcessor
@@ -31,6 +32,7 @@ from ..models import (
     MultisigTransaction,
     SafeContract,
     SafeLastStatus,
+    SafeRelevantTransaction,
     SafeStatus,
 )
 from ..services import SafeServiceProvider
@@ -753,6 +755,226 @@ class SafeEventsIndexerBaseAbstractTestBase(SafeTestCaseMixin, TestCase, ABC):
         )
         self.assertEqual(safe_last_status.master_copy, NULL_ADDRESS)
         self.assertIsNone(SafeServiceProvider().get_safe_creation_info(safe_address))
+
+    # Safe created in `safe_events_mock`, by `MOCK_SAFE_CREATOR` using a ProxyFactory
+    MOCK_SAFE_ADDRESS = "0x0059c65c3d2325D77E9288E022D24d3972b1799D"
+    MOCK_SAFE_CREATOR = "0xA21E2615ED32CE9DdFc53A1B0ccFE689e9152f25"
+
+    def _create_mock_ethereum_txs(self, _from: ChecksumAddress | None = None):
+        for safe_event in safe_events_mock:
+            tx_hash = safe_event["transactionHash"]
+            if not EthereumTx.objects.filter(tx_hash=tx_hash).exists():
+                kwargs = {"_from": _from} if _from else {}
+                EthereumTxFactory(
+                    tx_hash=tx_hash, block__block_hash=safe_event["blockHash"], **kwargs
+                )
+
+    def _build_whitelisted_indexer(self, whitelisted_safes, **kwargs):
+        return SafeEventsIndexer(
+            self.ethereum_client,
+            confirmations=0,
+            blocks_to_reindex_again=0,
+            whitelisted_safes=frozenset(whitelisted_safes),
+            **kwargs,
+        )
+
+    def _get_indexed_rows(self) -> dict[str, set]:
+        return {
+            "internal_txs": set(
+                InternalTx.objects.values_list(
+                    "ethereum_tx_id", "trace_address", "tx_type", "contract_address"
+                )
+            ),
+            "internal_txs_decoded": set(
+                InternalTxDecoded.objects.values_list(
+                    "internal_tx__ethereum_tx_id",
+                    "internal_tx__trace_address",
+                    "function_name",
+                    "safe_address",
+                )
+            ),
+            "safe_contracts": set(
+                SafeContract.objects.values_list("address", flat=True)
+            ),
+            "safe_relevant_txs": set(
+                SafeRelevantTransaction.objects.values_list("ethereum_tx_id", "safe")
+            ),
+            "ethereum_txs": set(EthereumTx.objects.values_list("tx_hash", flat=True)),
+        }
+
+    def test_filter_whitelisted_log_receipts(self):
+        self.assertEqual(
+            self.safe_events_indexer._filter_whitelisted_log_receipts(safe_events_mock),
+            safe_events_mock,
+        )
+
+        indexer = self._build_whitelisted_indexer({self.MOCK_SAFE_ADDRESS})
+        whitelisted_log_receipts = indexer._filter_whitelisted_log_receipts(
+            safe_events_mock
+        )
+        # Safe events and the ProxyFactory `ProxyCreation` event
+        self.assertEqual(whitelisted_log_receipts, safe_events_mock)
+        self.assertIn(
+            "ProxyCreation",
+            [
+                event["event"]
+                for event in indexer.decode_elements(whitelisted_log_receipts)
+                if event["address"] != self.MOCK_SAFE_ADDRESS
+            ],
+        )
+
+        # Unknown topics are dropped
+        unknown_topic_log_receipt = AttributeDict(
+            {**safe_events_mock[0], "topics": [HexBytes("0x" + "12" * 32)]}
+        )
+        self.assertEqual(
+            indexer._filter_whitelisted_log_receipts([unknown_topic_log_receipt]), []
+        )
+
+        indexer = self._build_whitelisted_indexer({Account.create().address})
+        self.assertEqual(indexer._filter_whitelisted_log_receipts(safe_events_mock), [])
+
+    def test_whitelisted_safe_indexed_like_stock(self):
+        self._create_mock_ethereum_txs()
+        self.safe_events_indexer.process_elements(safe_events_mock)
+        stock_rows = self._get_indexed_rows()
+        self.assertIn(self.MOCK_SAFE_ADDRESS, stock_rows["safe_contracts"])
+        self.assertGreater(len(stock_rows["internal_txs_decoded"]), 0)
+
+        InternalTx.objects.all().delete()
+        SafeContract.objects.all().delete()
+        SafeRelevantTransaction.objects.all().delete()
+        indexer = self._build_whitelisted_indexer({self.MOCK_SAFE_ADDRESS})
+        indexer.process_elements(safe_events_mock)
+        self.assertEqual(self._get_indexed_rows(), stock_rows)
+
+    def test_not_whitelisted_safe_not_indexed(self):
+        self._create_mock_ethereum_txs(_from=self.MOCK_SAFE_CREATOR)
+        ethereum_txs = set(EthereumTx.objects.values_list("tx_hash", flat=True))
+
+        for kwargs in (
+            {},
+            # Conditional indexing path
+            {"ignored_initiators": {Account.create().address}},
+        ):
+            with self.subTest(**kwargs):
+                indexer = self._build_whitelisted_indexer(
+                    {Account.create().address}, **kwargs
+                )
+                with (
+                    mock.patch.object(
+                        indexer, "_prefetch_ethereum_txs"
+                    ) as prefetch_mock,
+                    mock.patch.object(indexer, "_fetch_txs") as fetch_txs_mock,
+                ):
+                    self.assertEqual(indexer.process_elements(safe_events_mock), [])
+                prefetch_mock.assert_not_called()
+                fetch_txs_mock.assert_not_called()
+                self.assertEqual(InternalTx.objects.count(), 0)
+                self.assertEqual(InternalTxDecoded.objects.count(), 0)
+                self.assertEqual(SafeContract.objects.count(), 0)
+                self.assertEqual(
+                    set(EthereumTx.objects.values_list("tx_hash", flat=True)),
+                    ethereum_txs,
+                )
+
+    def test_whitelist_with_ignored_initiators(self):
+        self._create_mock_ethereum_txs(_from=self.MOCK_SAFE_CREATOR)
+
+        # Whitelisted Safe created by an ignored initiator is not indexed
+        indexer = self._build_whitelisted_indexer(
+            {self.MOCK_SAFE_ADDRESS}, ignored_initiators={self.MOCK_SAFE_CREATOR}
+        )
+        indexer.process_elements(safe_events_mock)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+        self.assertFalse(
+            SafeContract.objects.filter(address=self.MOCK_SAFE_ADDRESS).exists()
+        )
+
+        # Whitelisted Safe with a different ignored initiator is indexed
+        indexer = self._build_whitelisted_indexer(
+            {self.MOCK_SAFE_ADDRESS}, ignored_initiators={Account.create().address}
+        )
+        indexer.process_elements(safe_events_mock)
+        self.assertTrue(
+            InternalTxDecoded.objects.filter(
+                safe_address=self.MOCK_SAFE_ADDRESS, function_name="setup"
+            ).exists()
+        )
+        self.assertTrue(
+            SafeContract.objects.filter(address=self.MOCK_SAFE_ADDRESS).exists()
+        )
+
+    def test_whitelist_two_safes_same_block(self):
+        initializer = HexBytes(
+            self.safe_contract.functions.setup(
+                [self.ethereum_test_account.address],
+                1,
+                NULL_ADDRESS,
+                b"",
+                NULL_ADDRESS,
+                NULL_ADDRESS,
+                0,
+                NULL_ADDRESS,
+            ).build_transaction({"gas": 1, "gasPrice": 1})["data"]
+        )
+        initial_block_number = self.ethereum_client.current_block_number + 1
+        SafeMasterCopyFactory(
+            address=self.safe_contract.address,
+            initial_block_number=initial_block_number,
+            tx_block_number=initial_block_number,
+            version=self.safe_contract_version,
+            l2=True,
+        )
+
+        # Mine both deployments in the same block (Ganache)
+        response = self.w3.provider.make_request(RPCEndpoint("miner_stop"), [])
+        self.assertNotIn("error", response)
+        self.addCleanup(self.w3.provider.make_request, RPCEndpoint("miner_start"), [])
+        nonce = self.ethereum_client.get_nonce_for_account(
+            self.ethereum_test_account.address
+        )
+        ethereum_txs_sent = [
+            self.proxy_factory.deploy_proxy_contract_with_nonce(
+                self.ethereum_test_account,
+                self.safe_contract.address,
+                initializer=initializer,
+                nonce=nonce + i,
+            )
+            for i in range(2)
+        ]
+        response = self.w3.provider.make_request(RPCEndpoint("evm_mine"), [])
+        self.assertNotIn("error", response)
+        receipts = [
+            self.w3.eth.wait_for_transaction_receipt(ethereum_tx_sent.tx_hash)
+            for ethereum_tx_sent in ethereum_txs_sent
+        ]
+        self.assertEqual(receipts[0]["blockNumber"], receipts[1]["blockNumber"])
+        whitelisted_safe, other_safe = (
+            ethereum_tx_sent.contract_address for ethereum_tx_sent in ethereum_txs_sent
+        )
+
+        indexer = self._build_whitelisted_indexer({whitelisted_safe})
+        indexer.start()
+
+        self.assertTrue(
+            InternalTx.objects.filter(
+                contract_address=whitelisted_safe, tx_type=InternalTxType.CREATE.value
+            ).exists()
+        )
+        self.assertTrue(
+            InternalTxDecoded.objects.filter(
+                safe_address=whitelisted_safe, function_name="setup"
+            ).exists()
+        )
+        self.assertTrue(SafeContract.objects.filter(address=whitelisted_safe).exists())
+        self.assertFalse(
+            InternalTx.objects.filter(contract_address=other_safe).exists()
+        )
+        self.assertFalse(
+            InternalTxDecoded.objects.filter(safe_address=other_safe).exists()
+        )
+        self.assertFalse(SafeContract.objects.filter(address=other_safe).exists())
 
     def test_safe_events_indexer_zksync(self):
         owner_account_1 = self.ethereum_test_account
