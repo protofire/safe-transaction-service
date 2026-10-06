@@ -8,14 +8,19 @@ contracts are deployed directly against `ETHEREUM_NODE_URL`:
         pytest safe_transaction_service/history/tests/test_whitelist_scenarios.py \\
         -k checkpoint_a -s
 
-`-k checkpoint_b` runs the ERC20 scenario.
+`-k checkpoint_b` runs the ERC20 scenario. `-k checkpoint_c` runs the backfill command
+through the RPC URL, with `--block-process-limit` from
+`WHITELIST_SCENARIO_BLOCK_PROCESS_LIMIT`.
 """
 
+import logging
 import os
 from collections.abc import Callable
+from io import StringIO
 from unittest import mock, skipUnless
 
 from django.conf import settings
+from django.core.management import call_command
 from django.test import TestCase, override_settings
 
 from celery.exceptions import SoftTimeLimitExceeded
@@ -27,6 +32,7 @@ from safe_eth.safe import Safe
 from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
 from safe_eth.util.util import to_0x_hex_str
 from web3.exceptions import Web3RPCError
+from web3.types import RPCEndpoint
 
 from ..indexers import Erc20EventsIndexer, SafeEventsIndexer
 from ..indexers.ethereum_indexer import EthereumIndexer, FindRelevantElementsException
@@ -38,8 +44,11 @@ from ..models import (
     InternalTx,
     InternalTxDecoded,
     InternalTxType,
+    MultisigTransaction,
+    ProxyFactory,
     SafeContract,
     SafeLastStatus,
+    SafeMasterCopy,
 )
 from ..services import IndexServiceProvider, SafeServiceProvider
 from .factories import (
@@ -344,3 +353,147 @@ class TestWhitelistScenarios(SafeTestCaseMixin, TestCase):
             self.assertTrue(ERC20Transfer.objects.filter(to=safe_address).exists())
         # 3 funding transfers + whitelisted -> whitelisted + whitelisted -> other
         self.assertEqual(len(erc20_transfers), 5)
+
+    def test_checkpoint_c_backfill(self):
+        """
+        "Old" Safes: their history is in blocks the live indexers never see
+        """
+        singletons = {
+            "1.3.0": self.safe_contract_V1_3_0,
+            "1.4.1": self.safe_contract_V1_4_1,
+            "1.5.0": self.safe_contract_V1_5_0,
+        }
+        initial_block_number = self.ethereum_client.current_block_number + 1
+        for version, singleton in singletons.items():
+            SafeMasterCopyFactory(
+                address=singleton.address,
+                initial_block_number=initial_block_number,
+                tx_block_number=initial_block_number,
+                version=version,
+                l2=True,
+            )
+        ProxyFactoryFactory(
+            address=self.proxy_factory.address,
+            initial_block_number=initial_block_number,
+            tx_block_number=initial_block_number,
+        )
+        erc20_contract = self.deploy_example_erc20(
+            1_000, self.ethereum_test_account.address
+        )
+
+        safe_creation_tx_hashes: dict[str, HexBytes] = {}
+        safe_singleton: dict[str, str] = {}
+        for singleton in singletons.values():
+            safe_address, creation_tx_hash = self.deploy_safe(singleton)
+            safe_creation_tx_hashes[safe_address] = creation_tx_hash
+            safe_singleton[safe_address] = singleton.address
+            for _ in range(2):
+                self.execute_safe_tx(safe_address)
+            self.w3.eth.wait_for_transaction_receipt(
+                self.ethereum_client.erc20.send_tokens(
+                    safe_address,
+                    10,
+                    erc20_contract.address,
+                    self.ethereum_test_account.key,
+                )
+            )
+
+        blocks_to_mine = 2_000
+        response = self.w3.provider.make_request(
+            RPCEndpoint("evm_mine"), [{"blocks": blocks_to_mine}]
+        )
+        self.assertNotIn("error", response)
+        # Live indexers are already at the tip
+        next_block_number = self.ethereum_client.current_block_number + 1
+        SafeMasterCopy.objects.update(tx_block_number=next_block_number)
+        ProxyFactory.objects.update(tx_block_number=next_block_number)
+        IndexingStatus.objects.set_erc20_721_indexing_status(next_block_number)
+
+        block_process_limit = os.environ.get(
+            "WHITELIST_SCENARIO_BLOCK_PROCESS_LIMIT", "5000"
+        )
+        provider_errors = []
+
+        class ProviderErrorsHandler(logging.Handler):
+            def emit(self, record):
+                if record.levelno >= logging.WARNING:
+                    provider_errors.append(record.getMessage())
+
+        backfill_logger = logging.getLogger(
+            "safe_transaction_service.history.indexers.backfill"
+        )
+        handler = ProviderErrorsHandler()
+        backfill_logger.addHandler(handler)
+        self.addCleanup(backfill_logger.removeHandler, handler)
+
+        def backfill_all() -> dict[str, int]:
+            for safe_address, creation_tx_hash in safe_creation_tx_hashes.items():
+                stdout, stderr = StringIO(), StringIO()
+                call_command(
+                    "backfill_whitelisted_safe",
+                    f"--address={safe_address}",
+                    f"--creation-tx-hash={to_0x_hex_str(creation_tx_hash)}",
+                    f"--block-process-limit={block_process_limit}",
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+                print(stdout.getvalue().strip().splitlines()[-1], stderr.getvalue())
+            return {
+                model.__name__: model.objects.count()
+                for model in (
+                    SafeContract,
+                    InternalTx,
+                    InternalTxDecoded,
+                    MultisigTransaction,
+                    ERC20Transfer,
+                    SafeLastStatus,
+                )
+            }
+
+        with override_settings(
+            WHITELISTED_SAFES=frozenset(safe_creation_tx_hashes),
+            ETH_L2_NETWORK=True,
+            ETHEREUM_NODE_URL=self.scenario_rpc_url,
+        ):
+            IndexServiceProvider.del_singleton()
+            self.addCleanup(IndexServiceProvider.del_singleton)
+            print(
+                f"\nBackfilling {len(safe_creation_tx_hashes)} Safes, "
+                f"{blocks_to_mine} empty blocks, block-process-limit={block_process_limit}"
+            )
+            row_counts = backfill_all()
+            first_run_provider_errors = len(provider_errors)
+            print(f"Row counts: {row_counts}")
+            print(f"Provider errors (first run): {first_run_provider_errors}")
+            # A second run changes nothing
+            self.assertEqual(backfill_all(), row_counts)
+
+        for safe_address in safe_creation_tx_hashes:
+            with self.subTest(safe_address=safe_address):
+                safe = Safe(safe_address, self.ethereum_client)
+                self.assertTrue(
+                    InternalTx.objects.filter(
+                        contract_address=safe_address,
+                        tx_type=InternalTxType.CREATE.value,
+                    ).exists()
+                )
+                safe_last_status = SafeLastStatus.objects.get(address=safe_address)
+                self.assertEqual(
+                    safe_last_status.master_copy, safe_singleton[safe_address]
+                )
+                self.assertEqual(safe_last_status.nonce, safe.retrieve_nonce())
+                self.assertEqual(safe_last_status.owners, safe.retrieve_owners())
+                self.assertEqual(safe_last_status.threshold, safe.retrieve_threshold())
+                self.assertEqual(
+                    MultisigTransaction.objects.filter(safe=safe_address).count(), 2
+                )
+                self.assertEqual(
+                    ERC20Transfer.objects.to_or_from(safe_address).count(), 1
+                )
+                self.assertIsNotNone(
+                    SafeServiceProvider().get_safe_creation_info(safe_address)
+                )
+        self.assertEqual(
+            set(SafeContract.objects.values_list("address", flat=True)),
+            set(safe_creation_tx_hashes),
+        )

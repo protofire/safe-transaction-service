@@ -10,6 +10,7 @@ from django.test import TestCase, override_settings
 from django_celery_beat.models import PeriodicTask
 from eth_account import Account
 from safe_eth.eth.account_abstraction import BundlerClient
+from safe_eth.eth.constants import NULL_ADDRESS
 from safe_eth.eth.ethereum_client import EthereumClient, EthereumNetwork
 from safe_eth.safe import Safe
 from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
@@ -17,9 +18,14 @@ from safe_eth.util.util import to_0x_hex_str
 
 from ..indexers import Erc20EventsIndexer, InternalTxIndexer, SafeEventsIndexer
 from ..models import (
+    ERC20Transfer,
     IndexingStatus,
+    InternalTx,
     InternalTxDecoded,
+    InternalTxType,
+    MultisigTransaction,
     ProxyFactory,
+    SafeContract,
     SafeLastStatus,
     SafeMasterCopy,
 )
@@ -28,6 +34,7 @@ from ..tasks import logger as task_logger
 from .factories import (
     MultisigConfirmationFactory,
     MultisigTransactionFactory,
+    ProxyFactoryFactory,
     SafeContractFactory,
     SafeLastStatusFactory,
     SafeMasterCopyFactory,
@@ -768,3 +775,153 @@ class TestCommands(SafeTestCaseMixin, TestCase):
         )
         self.assertNotIn("is not matching", text)
         self.assertNotIn("is not valid for multisig transaction", text)
+
+    def _deploy_l2_safe_with_history(self) -> tuple[Safe, str, str]:
+        """
+        Deploy a Safe, execute a Safe tx and send it an ERC20, with the live indexer
+        markers moved past those blocks (as if the Safe was whitelisted later)
+
+        :return: Safe, creation tx hash and ERC20 transfer tx hash
+        """
+        singleton = self.safe_contract_V1_4_1
+        initial_block_number = self.ethereum_client.current_block_number + 1
+        SafeMasterCopyFactory(
+            address=singleton.address,
+            initial_block_number=initial_block_number,
+            tx_block_number=initial_block_number,
+            version="1.4.1",
+            l2=True,
+        )
+        ProxyFactoryFactory(
+            address=self.proxy_factory.address,
+            initial_block_number=initial_block_number,
+            tx_block_number=initial_block_number,
+        )
+        owner = self.ethereum_test_account
+        initializer = singleton.functions.setup(
+            [owner.address],
+            1,
+            NULL_ADDRESS,
+            b"",
+            NULL_ADDRESS,
+            NULL_ADDRESS,
+            0,
+            NULL_ADDRESS,
+        ).build_transaction({"gas": 1, "gasPrice": 1})["data"]
+        ethereum_tx_sent = self.proxy_factory.deploy_proxy_contract_with_nonce(
+            owner, singleton.address, initializer=initializer
+        )
+        self.w3.eth.wait_for_transaction_receipt(ethereum_tx_sent.tx_hash)
+        safe = Safe(ethereum_tx_sent.contract_address, self.ethereum_client)
+        multisig_tx = safe.build_multisig_tx(safe.address, 0, b"")
+        multisig_tx.sign(owner.key)
+        tx_hash, _ = multisig_tx.execute(owner.key)
+        self.w3.eth.wait_for_transaction_receipt(tx_hash)
+        erc20_contract = self.deploy_example_erc20(100, owner.address)
+        erc20_tx_hash = self.ethereum_client.erc20.send_tokens(
+            safe.address, 10, erc20_contract.address, owner.key
+        )
+        self.w3.eth.wait_for_transaction_receipt(erc20_tx_hash)
+
+        next_block_number = self.ethereum_client.current_block_number + 1
+        SafeMasterCopy.objects.update(tx_block_number=next_block_number)
+        ProxyFactory.objects.update(tx_block_number=next_block_number)
+        IndexingStatus.objects.set_erc20_721_indexing_status(next_block_number)
+        return (
+            safe,
+            to_0x_hex_str(ethereum_tx_sent.tx_hash),
+            to_0x_hex_str(erc20_tx_hash),
+        )
+
+    def _get_backfill_row_counts(self) -> dict[str, int]:
+        return {
+            model.__name__: model.objects.count()
+            for model in (
+                SafeContract,
+                InternalTx,
+                InternalTxDecoded,
+                MultisigTransaction,
+                ERC20Transfer,
+                SafeLastStatus,
+            )
+        }
+
+    def test_backfill_whitelisted_safe(self):
+        safe, creation_tx_hash, _ = self._deploy_l2_safe_with_history()
+        command_args = [
+            "backfill_whitelisted_safe",
+            f"--address={safe.address}",
+            f"--creation-tx-hash={creation_tx_hash}",
+        ]
+        with override_settings(
+            WHITELISTED_SAFES=frozenset({safe.address}), ETH_L2_NETWORK=True
+        ):
+            IndexServiceProvider.del_singleton()
+            buf = StringIO()
+            call_command(*command_args, stdout=buf, stderr=StringIO())
+            self.assertIn(f"Backfilled {safe.address}", buf.getvalue())
+            row_counts = self._get_backfill_row_counts()
+            # Running it again doesn't change anything
+            call_command(*command_args, stdout=StringIO(), stderr=StringIO())
+            self.assertEqual(self._get_backfill_row_counts(), row_counts)
+        IndexServiceProvider.del_singleton()
+
+        self.assertTrue(SafeContract.objects.filter(address=safe.address).exists())
+        self.assertTrue(
+            InternalTx.objects.filter(
+                contract_address=safe.address, tx_type=InternalTxType.CREATE.value
+            ).exists()
+        )
+        safe_last_status = SafeLastStatus.objects.get(address=safe.address)
+        self.assertEqual(
+            safe_last_status.master_copy, self.safe_contract_V1_4_1.address
+        )
+        self.assertEqual(safe_last_status.nonce, safe.retrieve_nonce())
+        self.assertEqual(safe_last_status.owners, safe.retrieve_owners())
+        self.assertEqual(
+            MultisigTransaction.objects.filter(safe=safe.address).count(), 1
+        )
+        self.assertEqual(ERC20Transfer.objects.to_or_from(safe.address).count(), 1)
+
+    def test_backfill_whitelisted_safe_errors(self):
+        safe, creation_tx_hash, erc20_tx_hash = self._deploy_l2_safe_with_history()
+        command = "backfill_whitelisted_safe"
+        with (
+            override_settings(
+                WHITELISTED_SAFES=frozenset({safe.address}), ETH_L2_NETWORK=False
+            ),
+            self.assertRaisesMessage(CommandError, "ETH_L2_NETWORK"),
+        ):
+            call_command(
+                command,
+                f"--address={safe.address}",
+                f"--creation-tx-hash={creation_tx_hash}",
+            )
+        with (
+            override_settings(
+                WHITELISTED_SAFES=frozenset({Account.create().address}),
+                ETH_L2_NETWORK=True,
+            ),
+            self.assertRaisesMessage(CommandError, "not in WHITELISTED_SAFES"),
+        ):
+            call_command(
+                command,
+                f"--address={safe.address}",
+                f"--creation-tx-hash={creation_tx_hash}",
+            )
+        with override_settings(
+            WHITELISTED_SAFES=frozenset({safe.address}), ETH_L2_NETWORK=True
+        ):
+            with self.assertRaisesMessage(CommandError, "has no SafeSetup event"):
+                call_command(
+                    command,
+                    f"--address={safe.address}",
+                    f"--creation-tx-hash={erc20_tx_hash}",
+                )
+            with self.assertRaisesMessage(CommandError, "not found or failed"):
+                call_command(
+                    command,
+                    f"--address={safe.address}",
+                    f"--creation-tx-hash=0x{'12' * 32}",
+                )
+        self.assertFalse(SafeContract.objects.filter(address=safe.address).exists())
