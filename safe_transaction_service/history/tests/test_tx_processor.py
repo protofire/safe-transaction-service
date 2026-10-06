@@ -1,7 +1,7 @@
 import logging
 from unittest import mock
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from eth_account import Account
 from eth_utils import keccak
@@ -398,6 +398,58 @@ class TestSafeTxProcessor(SafeTestCaseMixin, TestCase):
             multisig_confirmation.signature_type,
             SafeSignatureType.APPROVED_HASH.value,
         )
+
+    def test_tx_processor_setup_not_whitelisted(self):
+        safe_address = Account.create().address
+        whitelisted_safe_address = Account.create().address
+        owner = Account.create().address
+        with override_settings(WHITELISTED_SAFES=frozenset({whitelisted_safe_address})):
+            self.assertFalse(
+                self.tx_processor.process_decoded_transaction(
+                    InternalTxDecodedFactory(
+                        function_name="setup",
+                        owner=owner,
+                        internal_tx___from=safe_address,
+                        internal_tx__value=0,
+                    )
+                )
+            )
+            self.assertFalse(SafeContract.objects.filter(address=safe_address).exists())
+            self.assertFalse(
+                SafeLastStatus.objects.filter(address=safe_address).exists()
+            )
+            # Next txs for the Safe are not processed either
+            self.assertFalse(
+                self.tx_processor.process_decoded_transaction(
+                    InternalTxDecodedFactory(
+                        function_name="addOwnerWithThreshold",
+                        owner=Account.create().address,
+                        threshold=1,
+                        internal_tx___from=safe_address,
+                        internal_tx__value=0,
+                    )
+                )
+            )
+            self.assertFalse(SafeStatus.objects.filter(address=safe_address).exists())
+
+            # Whitelisted Safe is processed as usual
+            self.assertTrue(
+                self.tx_processor.process_decoded_transaction(
+                    InternalTxDecodedFactory(
+                        function_name="setup",
+                        owner=owner,
+                        internal_tx___from=whitelisted_safe_address,
+                        internal_tx__value=0,
+                    )
+                )
+            )
+            self.assertTrue(
+                SafeContract.objects.filter(address=whitelisted_safe_address).exists()
+            )
+            self.assertEqual(
+                SafeLastStatus.objects.get(address=whitelisted_safe_address).owners,
+                [owner],
+            )
 
     def test_tx_processor_is_failed(self):
         tx_processor = self.tx_processor

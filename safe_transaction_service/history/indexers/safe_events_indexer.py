@@ -104,6 +104,12 @@ class SafeEventsIndexer(EventsIndexer):
 
         return self._process_elements_with_conditional_indexing(log_receipts)
 
+    def _is_whitelisted(self, address: ChecksumAddress) -> bool:
+        """
+        :return: `True` if the whitelist of this indexer is disabled or contains `address`
+        """
+        return not self.whitelisted_safes or address in self.whitelisted_safes
+
     def _get_proxy_factory_addresses(self) -> set[ChecksumAddress]:
         """
         :return: ProxyFactory addresses. Not cached, so factories added later are used
@@ -977,6 +983,7 @@ class SafeEventsIndexer(EventsIndexer):
                 [
                     SafeContract(address=safe_address, ethereum_tx_id=tx_hash)
                     for safe_address, tx_hash in created_safe_address_with_tx_hash.items()
+                    if self._is_whitelisted(safe_address)
                 ],
                 ignore_conflicts=True,  # Safe may already exist from previous indexing
             )

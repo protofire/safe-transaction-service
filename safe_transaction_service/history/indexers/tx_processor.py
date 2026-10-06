@@ -46,6 +46,7 @@ from ..models import (
     SafeRelevantTransaction,
     SafeStatus,
 )
+from ..whitelist import is_whitelisted
 
 logger = logging.getLogger(__name__)
 
@@ -482,6 +483,12 @@ class SafeTxProcessor(TxProcessor):
         processed_successfully = True
 
         if function_name == "setup" and contract_address != NULL_ADDRESS:
+            if not is_whitelisted(contract_address):
+                logger.info(
+                    "[%s] Ignoring setup for Safe not in WHITELISTED_SAFES",
+                    contract_address,
+                )
+                return False
             # Index new Safes
             logger.debug("[%s] Processing Safe setup", contract_address)
             owners = arguments["_owners"]

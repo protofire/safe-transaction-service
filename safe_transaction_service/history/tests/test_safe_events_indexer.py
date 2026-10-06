@@ -1108,6 +1108,32 @@ class SafeEventsIndexerBaseAbstractTestBase(SafeTestCaseMixin, TestCase, ABC):
         )
         self.assertIsNotNone(SafeServiceProvider().get_safe_creation_info(safe_address))
 
+    def test_process_safe_creation_events_not_whitelisted(self):
+        self._create_mock_ethereum_txs()
+        creation_events = self.safe_events_indexer._get_safe_creation_events(
+            self.safe_events_indexer.decode_elements(safe_events_mock)
+        )
+        self.assertIn(self.MOCK_SAFE_ADDRESS, creation_events)
+
+        indexer = self._build_whitelisted_indexer({Account.create().address})
+        indexer._process_safe_creation_events(creation_events)
+        # Creation is stored, but the Safe is not tracked
+        self.assertTrue(
+            InternalTxDecoded.objects.filter(
+                safe_address=self.MOCK_SAFE_ADDRESS, function_name="setup"
+            ).exists()
+        )
+        self.assertFalse(
+            SafeContract.objects.filter(address=self.MOCK_SAFE_ADDRESS).exists()
+        )
+
+        InternalTx.objects.all().delete()
+        indexer = self._build_whitelisted_indexer({self.MOCK_SAFE_ADDRESS})
+        indexer._process_safe_creation_events(creation_events)
+        self.assertTrue(
+            SafeContract.objects.filter(address=self.MOCK_SAFE_ADDRESS).exists()
+        )
+
     def test_safe_events_indexer_zksync(self):
         owner_account_1 = self.ethereum_test_account
         owners = [owner_account_1.address]

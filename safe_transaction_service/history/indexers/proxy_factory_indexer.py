@@ -14,6 +14,7 @@ from web3.contract.contract import ContractEvent
 from web3.types import EventData, LogReceipt
 
 from ..models import ProxyFactory, SafeContract
+from ..whitelist import is_whitelisted
 from .events_indexer import EventsIndexer
 
 logger = getLogger(__name__)
@@ -94,7 +95,11 @@ class ProxyFactoryIndexer(EventsIndexer):
         :param log_receipts: Iterable of Events fetched using `web3.eth.getLogs`
         :return: List of `SafeContract` already stored in database
         """
-        safe_contracts = super().process_elements(log_receipts)
+        safe_contracts = [
+            safe_contract
+            for safe_contract in super().process_elements(log_receipts)
+            if is_whitelisted(safe_contract.address)
+        ]
         if safe_contracts:
             SafeContract.objects.bulk_create(safe_contracts, ignore_conflicts=True)
         return safe_contracts

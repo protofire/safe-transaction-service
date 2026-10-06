@@ -1,11 +1,12 @@
 from django.conf import settings
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
 
-from ..indexers import ProxyFactoryIndexerProvider
+from ..indexers import ProxyFactoryIndexer, ProxyFactoryIndexerProvider
 from ..models import SafeContract
-from .factories import ProxyFactoryFactory
+from .factories import EthereumTxFactory, ProxyFactoryFactory
+from .mocks.mocks_safe_events_indexer import proxy_creation_event_mock
 
 
 class TestProxyFactoryIndexer(SafeTestCaseMixin, TestCase):
@@ -32,3 +33,25 @@ class TestProxyFactoryIndexer(SafeTestCaseMixin, TestCase):
         # Test if only 1 Safe was created
         self.assertEqual(SafeContract.objects.count(), 1 + safe_contracts_count)
         self.assertTrue(SafeContract.objects.get(address=safe_contract_address))
+
+    def test_proxy_factory_indexer_whitelist(self):
+        indexer = ProxyFactoryIndexer(self.ethereum_client)
+        for log_receipt in proxy_creation_event_mock:
+            EthereumTxFactory(
+                tx_hash=log_receipt["transactionHash"],
+                block__block_hash=log_receipt["blockHash"],
+            )
+        proxies = [
+            decoded_element["args"]["proxy"]
+            for decoded_element in indexer.decode_elements(proxy_creation_event_mock)
+        ]
+        self.assertGreater(len(proxies), 0)
+
+        with override_settings(WHITELISTED_SAFES=frozenset({proxies[0]})):
+            safe_contracts = indexer.process_elements(proxy_creation_event_mock)
+        self.assertEqual(
+            [safe_contract.address for safe_contract in safe_contracts], [proxies[0]]
+        )
+        self.assertEqual(
+            set(SafeContract.objects.values_list("address", flat=True)), {proxies[0]}
+        )
