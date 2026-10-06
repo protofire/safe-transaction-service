@@ -5,7 +5,7 @@ from unittest import mock
 from unittest.mock import MagicMock, PropertyMock
 
 from django.core.management import CommandError, call_command
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from django_celery_beat.models import PeriodicTask
 from eth_account import Account
@@ -372,6 +372,33 @@ class TestCommands(SafeTestCaseMixin, TestCase):
                 )
                 self.assertEqual(find_relevant_elements_mock.call_count, 2)
         IndexServiceProvider.del_singleton()
+
+    @mock.patch.object(
+        EthereumClient, "current_block_number", new_callable=PropertyMock
+    )
+    def test_reindex_erc20_events_whitelist(
+        self, current_block_number_mock: PropertyMock
+    ):
+        current_block_number_mock.return_value = 1000
+        whitelisted_safe = SafeContractFactory()
+        SafeContractFactory()
+        with (
+            override_settings(WHITELISTED_SAFES=frozenset({whitelisted_safe.address})),
+            mock.patch.object(
+                Erc20EventsIndexer, "find_relevant_elements", return_value=[]
+            ) as find_relevant_elements_mock,
+        ):
+            IndexServiceProvider.del_singleton()
+            call_command(
+                "reindex_erc20",
+                "--block-process-limit=1000",
+                "--from-block-number=100",
+                stdout=StringIO(),
+            )
+        IndexServiceProvider.del_singleton()
+        find_relevant_elements_mock.assert_called_once_with(
+            {whitelisted_safe.address}, 100, 1000
+        )
 
     def test_setup_service_mainnet(self):
         self.assertEqual(

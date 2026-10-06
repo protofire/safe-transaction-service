@@ -7,9 +7,12 @@ contracts are deployed directly against `ETHEREUM_NODE_URL`:
     WHITELIST_SCENARIOS=1 WHITELIST_SCENARIO_RPC_URL=http://127.0.0.1:8546 \\
         pytest safe_transaction_service/history/tests/test_whitelist_scenarios.py \\
         -k checkpoint_a -s
+
+`-k checkpoint_b` runs the ERC20 scenario.
 """
 
 import os
+from collections.abc import Callable
 from unittest import mock, skipUnless
 
 from django.conf import settings
@@ -25,11 +28,13 @@ from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
 from safe_eth.util.util import to_0x_hex_str
 from web3.exceptions import Web3RPCError
 
-from ..indexers import SafeEventsIndexer
-from ..indexers.ethereum_indexer import FindRelevantElementsException
+from ..indexers import Erc20EventsIndexer, SafeEventsIndexer
+from ..indexers.ethereum_indexer import EthereumIndexer, FindRelevantElementsException
 from ..indexers.tx_processor import SafeTxProcessor
 from ..models import (
+    ERC20Transfer,
     EthereumTx,
+    IndexingStatus,
     InternalTx,
     InternalTxDecoded,
     InternalTxType,
@@ -37,7 +42,11 @@ from ..models import (
     SafeLastStatus,
 )
 from ..services import IndexServiceProvider, SafeServiceProvider
-from .factories import ProxyFactoryFactory, SafeMasterCopyFactory
+from .factories import (
+    ProxyFactoryFactory,
+    SafeContractFactory,
+    SafeMasterCopyFactory,
+)
 
 SAFES_PER_VERSION = 3
 MAX_INDEXER_RUNS = 200
@@ -85,33 +94,33 @@ class TestWhitelistScenarios(SafeTestCaseMixin, TestCase):
         self.w3.eth.wait_for_transaction_receipt(ethereum_tx_sent.tx_hash)
         return ethereum_tx_sent.contract_address, HexBytes(ethereum_tx_sent.tx_hash)
 
-    def execute_safe_tx(self, safe_address: str) -> HexBytes:
+    def execute_safe_tx(
+        self, safe_address: str, to: str | None = None, data: bytes = b""
+    ) -> HexBytes:
         multisig_tx = Safe(safe_address, self.ethereum_client).build_multisig_tx(
-            safe_address, 0, b""
+            to or safe_address, 0, data
         )
         multisig_tx.sign(self.ethereum_test_account.key)
         tx_hash, _ = multisig_tx.execute(self.ethereum_test_account.key)
         self.w3.eth.wait_for_transaction_receipt(tx_hash)
         return HexBytes(tx_hash)
 
-    def run_indexer(self, indexer: SafeEventsIndexer, target_block_number: int) -> None:
+    def run_indexer(
+        self,
+        indexer: EthereumIndexer,
+        target_block_number: int,
+        get_next_block_number: Callable[[], int],
+    ) -> None:
         """
-        Run `indexer.start()` like the periodic task until every monitored address is
-        past `target_block_number`, retrying after provider errors. Prints the block
-        process limit used on every run and the errors
+        Run `indexer.start()` like the periodic task until `get_next_block_number()`
+        (next block to index) is past `target_block_number`, retrying after provider
+        errors. Prints the block process limit used on every run and the errors
         """
         block_process_limits: list[int] = []
         errors: list[str] = []
         try:
             for _ in range(MAX_INDEXER_RUNS):
-                if (
-                    min(
-                        indexer.database_queryset.values_list(
-                            "tx_block_number", flat=True
-                        )
-                    )
-                    > target_block_number
-                ):
+                if get_next_block_number() > target_block_number:
                     return
                 block_process_limits.append(indexer.block_process_limit)
                 try:
@@ -173,7 +182,15 @@ class TestWhitelistScenarios(SafeTestCaseMixin, TestCase):
                 "txs_create_or_update_from_tx_hashes",
                 wraps=indexer.index_service.txs_create_or_update_from_tx_hashes,
             ) as fetch_txs_mock:
-                self.run_indexer(indexer, target_block_number)
+                self.run_indexer(
+                    indexer,
+                    target_block_number,
+                    lambda: min(
+                        indexer.database_queryset.values_list(
+                            "tx_block_number", flat=True
+                        )
+                    ),
+                )
             SafeTxProcessor(
                 self.ethereum_client, None, None
             ).process_decoded_transactions(
@@ -221,3 +238,109 @@ class TestWhitelistScenarios(SafeTestCaseMixin, TestCase):
         self.assertFalse(
             InternalTx.objects.filter(ethereum_tx_id__in=other_tx_hashes).exists()
         )
+
+    def test_checkpoint_b_erc20(self):
+        account = self.ethereum_test_account
+        erc20_contract = self.deploy_example_erc20(1_000, account.address)
+        safes = [self.deploy_safe(self.safe_contract_V1_4_1)[0] for _ in range(4)]
+        whitelisted_safes = set(safes[:3])
+        other_safe = safes[3]
+        # Like an existing database: every Safe has a SafeContract
+        for safe_address in safes:
+            SafeContractFactory(address=safe_address)
+        IndexingStatus.objects.set_erc20_721_indexing_status(
+            self.ethereum_client.current_block_number + 1
+        )
+
+        def transfer_data(to: str, amount: int) -> bytes:
+            return HexBytes(
+                erc20_contract.functions.transfer(to, amount).build_transaction(
+                    {"gas": 1, "gasPrice": 1}
+                )["data"]
+            )
+
+        def send_tokens(to: str, amount: int) -> HexBytes:
+            tx_hash = self.ethereum_client.erc20.send_tokens(
+                to, amount, erc20_contract.address, account.key
+            )
+            self.w3.eth.wait_for_transaction_receipt(tx_hash)
+            return HexBytes(tx_hash)
+
+        for safe_address in safes:
+            send_tokens(safe_address, 100)
+        whitelisted_1, whitelisted_2 = safes[0], safes[1]
+        # Between whitelisted Safes, possibly in different chunks
+        whitelisted_to_whitelisted_tx_hash = self.execute_safe_tx(
+            whitelisted_1, erc20_contract.address, transfer_data(whitelisted_2, 10)
+        )
+        # From a whitelisted Safe to the other Safe
+        self.execute_safe_tx(
+            whitelisted_2, erc20_contract.address, transfer_data(other_safe, 10)
+        )
+        # Only touching the other Safe
+        other_tx_hashes = {
+            self.execute_safe_tx(
+                other_safe, erc20_contract.address, transfer_data(account.address, 5)
+            )
+        }
+        target_block_number = self.ethereum_client.current_block_number
+
+        with override_settings(WHITELISTED_SAFES=frozenset(whitelisted_safes)):
+            indexer = Erc20EventsIndexer(
+                EthereumClient(self.scenario_rpc_url), confirmations=0
+            )
+        erc20_manager = indexer.ethereum_client.erc20
+        with mock.patch.object(
+            erc20_manager,
+            "get_total_transfer_history",
+            wraps=erc20_manager.get_total_transfer_history,
+        ) as get_transfer_history_mock:
+            self.run_indexer(
+                indexer,
+                target_block_number,
+                lambda: (
+                    IndexingStatus.objects.get_erc20_721_indexing_status().block_number
+                ),
+            )
+
+        erc20_transfers = list(
+            ERC20Transfer.objects.values_list(
+                "ethereum_tx_id", "log_index", "_from", "to"
+            )
+        )
+        address_chunks = [
+            call.args[0] for call in get_transfer_history_mock.call_args_list
+        ]
+        print(f"Token: {erc20_contract.address}")
+        print(f"Whitelisted Safes: {sorted(whitelisted_safes)}")
+        print(f"Other Safe: {other_safe}")
+        print(f"ERC20Transfer rows: {len(erc20_transfers)}")
+        print(
+            f"get_total_transfer_history calls: {len(address_chunks)}, "
+            f"chunk sizes: {sorted({len(chunk) for chunk in address_chunks})}"
+        )
+
+        # Every query is filtered by whitelisted Safes
+        self.assertTrue(address_chunks)
+        for chunk in address_chunks:
+            self.assertTrue(chunk)
+            self.assertTrue(set(chunk) <= whitelisted_safes)
+        # Only transfers touching whitelisted Safes, no duplicates
+        for _, _, _from, to in erc20_transfers:
+            self.assertTrue(_from in whitelisted_safes or to in whitelisted_safes)
+        self.assertEqual(
+            len(erc20_transfers), len({transfer[:2] for transfer in erc20_transfers})
+        )
+        self.assertEqual(
+            ERC20Transfer.objects.filter(
+                ethereum_tx_id=whitelisted_to_whitelisted_tx_hash
+            ).count(),
+            1,
+        )
+        self.assertFalse(
+            ERC20Transfer.objects.filter(ethereum_tx_id__in=other_tx_hashes).exists()
+        )
+        for safe_address in whitelisted_safes:
+            self.assertTrue(ERC20Transfer.objects.filter(to=safe_address).exists())
+        # 3 funding transfers + whitelisted -> whitelisted + whitelisted -> other
+        self.assertEqual(len(erc20_transfers), 5)

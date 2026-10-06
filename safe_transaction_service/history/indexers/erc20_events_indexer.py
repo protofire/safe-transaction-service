@@ -12,7 +12,7 @@ from safe_eth.eth import EthereumClient
 from web3.contract.contract import ContractEvent
 from web3.types import EventData, LogReceipt
 
-from ...utils.utils import FixedSizeDict
+from ...utils.utils import FixedSizeDict, chunks
 from ..models import (
     ERC20Transfer,
     ERC721Transfer,
@@ -21,6 +21,7 @@ from ..models import (
     SafeRelevantTransaction,
     TokenTransfer,
 )
+from ..whitelist import get_whitelisted_safes
 from .events_indexer import EventsIndexer
 
 logger = getLogger(__name__)
@@ -72,6 +73,10 @@ class Erc20EventsIndexer(EventsIndexer):
         self.eth_erc20_load_addresses_chunk_size = kwargs.get(
             "eth_erc20_load_addresses_chunk_size", 500_000
         )
+        # Empty == index every Safe
+        self.whitelisted_safes: frozenset[ChecksumAddress] = frozenset(
+            kwargs.get("whitelisted_safes", get_whitelisted_safes())
+        )
 
     @property
     def contract_events(self) -> list[ContractEvent]:
@@ -86,6 +91,8 @@ class Erc20EventsIndexer(EventsIndexer):
 
     @property
     def database_queryset(self) -> QuerySet:
+        if self.whitelisted_safes:
+            return SafeContract.objects.filter(address__in=self.whitelisted_safes)
         return SafeContract.objects.all()
 
     def _do_node_query(
@@ -102,6 +109,10 @@ class Erc20EventsIndexer(EventsIndexer):
         :param to_block_number:
         :return:
         """
+        if self.whitelisted_safes:
+            return self._do_node_query_whitelisted(
+                addresses, from_block_number, to_block_number
+            )
 
         # If not too many addresses are provided it's alright to do the filtering in the RPC server
         # Otherwise, get all the ERC20/721 events and filter them here
@@ -134,6 +145,47 @@ class Erc20EventsIndexer(EventsIndexer):
                 transfer_event["args"]["to"] in addresses
                 or transfer_event["args"]["from"] in addresses
             )
+        ]
+
+    def _do_node_query_whitelisted(
+        self,
+        addresses: set[ChecksumAddress],
+        from_block_number: int,
+        to_block_number: int,
+    ) -> list[LogReceipt]:
+        """
+        Never query every `Transfer` event: filter by `addresses` in chunks of
+        `query_chunk_size` (`0` == all together), 2 `eth_getLogs` per chunk
+
+        :param addresses:
+        :param from_block_number:
+        :param to_block_number:
+        :return:
+        """
+        if not addresses:
+            return []
+
+        if self.query_chunk_size:
+            addresses_chunks = chunks(list(addresses), self.query_chunk_size)
+        else:
+            addresses_chunks = [list(addresses)]
+
+        transfer_events = []
+        with self.auto_adjust_block_limit(from_block_number, to_block_number):
+            for addresses_chunk in addresses_chunks:
+                transfer_events.extend(
+                    self.ethereum_client.erc20.get_total_transfer_history(
+                        addresses_chunk,
+                        from_block=from_block_number,
+                        to_block=to_block_number,
+                    )
+                )
+
+        return [
+            transfer_event
+            for transfer_event in transfer_events
+            if transfer_event["blockHash"]
+            != transfer_event["transactionHash"]  # CELO ERC20 rewards
         ]
 
     def _process_decoded_element(self, decoded_element: EventData) -> None:
@@ -235,6 +287,10 @@ class Erc20EventsIndexer(EventsIndexer):
         """
 
         logger.debug("%s: Retrieving monitored addresses", self.__class__.__name__)
+
+        if self.whitelisted_safes:
+            # Few addresses, no need for caching
+            return set(self.database_queryset.values_list("address", flat=True))
 
         last_checked: datetime.datetime | None
         if self.addresses_cache:
