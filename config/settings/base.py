@@ -4,12 +4,18 @@ Base settings to build other settings files upon.
 
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+
 import environ
 from corsheaders.defaults import default_headers as default_cors_headers
 from eth_typing import ChecksumAddress, HexAddress, HexStr
 
 from safe_transaction_service import __version__
 from safe_transaction_service.loggers.custom_logger import SafeJsonFormatter
+from safe_transaction_service.utils.whitelist import (
+    parse_whitelisted_safes,
+    validate_whitelist_config,
+)
 
 from ..gunicorn import (
     gunicorn_request_timeout,
@@ -628,6 +634,13 @@ ETH_EVENTS_IGNORED_TO: set[ChecksumAddress] = {
     ChecksumAddress(HexAddress(HexStr(address)))
     for address in env.list("ETH_EVENTS_IGNORED_TO", default=[])
 }  # Transaction 'to' addresses to ignore during L2 indexing
+try:
+    WHITELISTED_SAFES = parse_whitelisted_safes(
+        env.list("WHITELISTED_SAFES", default=[])
+    )  # Only index these Safes. Empty == index every Safe
+    validate_whitelist_config(WHITELISTED_SAFES, ETH_L2_NETWORK)
+except ValueError as e:
+    raise ImproperlyConfigured(str(e)) from e
 
 
 # ENABLE/DISABLE COLLECTIBLES DOWNLOAD METADATA, enable=True, disabled by default
