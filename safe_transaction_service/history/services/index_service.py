@@ -3,14 +3,17 @@ from collections import OrderedDict
 from collections.abc import Collection
 from dataclasses import dataclass
 
+from django.core.cache import cache as django_cache
 from django.db import transaction
 from django.db.models import Min, Q
 
 from eth_typing import ChecksumAddress, Hash32
 from hexbytes import HexBytes
 from safe_eth.eth import EthereumClient, get_auto_ethereum_client
+from safe_eth.eth.ethereum_client import BlockData
 from safe_eth.util.util import to_0x_hex_str
 
+from ..exceptions import NodeConnectionException
 from ..models import (
     EthereumBlock,
     EthereumTx,
@@ -85,6 +88,9 @@ class IndexServiceProvider:
 
 
 class IndexService:
+    _CURRENT_BLOCK_CACHE_KEY = "index-service:current-block"
+    _CURRENT_BLOCK_CACHE_TIMEOUT = 60 * 10  # 10 minutes
+
     def __init__(
         self,
         ethereum_client: EthereumClient,
@@ -149,8 +155,36 @@ class IndexService:
             current_block_number, master_copies_block_number, master_copies_synced
         )
 
+    def _get_current_block(self) -> BlockData:
+        """
+        :return: Current block from the node. If the node is unreachable/rate limiting us,
+            falls back to the last block successfully fetched (cached for
+            ``_CURRENT_BLOCK_CACHE_TIMEOUT`` seconds), as indexing status does not require
+            an up-to-the-second block.
+        :raises NodeConnectionException: if the node cannot be reached and there's no
+            cached block to fall back to
+        """
+        try:
+            current_block = self.ethereum_client.get_block("latest")
+        except (OSError, ValueError) as exc:
+            current_block = django_cache.get(self._CURRENT_BLOCK_CACHE_KEY)
+            if current_block is None:
+                raise NodeConnectionException from exc
+            logger.warning(
+                "Cannot connect to the node to get the latest block, using last known block %d",
+                current_block["number"],
+            )
+            return current_block
+
+        django_cache.set(
+            self._CURRENT_BLOCK_CACHE_KEY,
+            current_block,
+            self._CURRENT_BLOCK_CACHE_TIMEOUT,
+        )
+        return current_block
+
     def get_indexing_status(self) -> AllIndexingStatus:
-        current_block = self.ethereum_client.get_block("latest")
+        current_block = self._get_current_block()
         current_block_number = current_block["number"]
 
         erc20_indexing_status = self.get_erc20_indexing_status(current_block_number)
@@ -165,12 +199,15 @@ class IndexService:
         ):
             erc20_block, master_copies_block = [current_block, current_block]
         else:
-            erc20_block, master_copies_block = self.ethereum_client.get_blocks(
-                [
-                    erc20_indexing_status.block_number,
-                    master_copies_indexing_status.block_number,
-                ]
-            )
+            try:
+                erc20_block, master_copies_block = self.ethereum_client.get_blocks(
+                    [
+                        erc20_indexing_status.block_number,
+                        master_copies_indexing_status.block_number,
+                    ]
+                )
+            except (OSError, ValueError) as exc:
+                raise NodeConnectionException from exc
         current_block_timestamp = current_block["timestamp"]
         erc20_block_timestamp = erc20_block["timestamp"]
         master_copies_block_timestamp = master_copies_block["timestamp"]
