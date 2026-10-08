@@ -951,6 +951,11 @@ class TransferResponseSerializer(serializers.Serializer):
         "Token transfers are calculated as `transferId = e+tx_hash+log_index` \n"
         "Ether transfers are calculated as `transferId = i+tx_hash+trace_address`"
     )
+    # Only set for synthetic Hedera-native-transfer rows: `transaction_hash`
+    # for those is a service-generated placeholder (no real EVM transaction
+    # exists to look up on a block explorer). Carries the real,
+    # explorer-resolvable Hedera transaction id instead. `None` otherwise.
+    hedera_transaction_id = serializers.CharField(allow_null=True)
 
     def get_fields(self):
         result = super().get_fields()
@@ -1079,6 +1084,12 @@ class EthereumTxWithTransfersResponseSerializer(serializers.Serializer):
     block_number = serializers.SerializerMethodField()
     transfers = TransferWithTokenInfoResponseSerializer(many=True)
     tx_type = serializers.SerializerMethodField()
+    # Only set for synthetic Hedera-native-transfer rows: `tx_hash` for
+    # those is a service-generated placeholder (no real EVM transaction
+    # exists to look up on a block explorer). This carries the real,
+    # explorer-resolvable Hedera transaction id instead. `None` for
+    # ordinary EVM transactions.
+    hedera_transaction_id = serializers.CharField(allow_null=True)
 
     def get_tx_type(self, obj) -> str:
         return TxType.ETHEREUM_TRANSACTION.name
@@ -1093,6 +1104,14 @@ class EthereumTxWithTransfersResponseSerializer(serializers.Serializer):
     def get_block_number(self, obj: EthereumTx) -> int | None:
         if obj.block_id:
             return obj.block_id
+        # Synthetic EthereumTx rows (Hedera native transfers indexed
+        # before their resolved block number has a corresponding
+        # EthereumBlock row) have no linked block. Fall back to the
+        # InternalTx leg's own block_number, which is always set directly
+        # from the real source of truth regardless of whether `block` is
+        # linked.
+        internal_tx = obj.internal_txs.first()
+        return internal_tx.block_number if internal_tx else None
 
 
 class AllTransactionsSchemaSerializer(serializers.Serializer):
