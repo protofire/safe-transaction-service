@@ -667,6 +667,53 @@ class TestInternalTxIndexer(TestCase):
             )
         )
 
+    def test_trace_block_whitelist(self):
+        """
+        With a whitelist, `trace_block` keeps the txs of the whitelisted Safes instead of
+        the txs of every Safe using the provided master copies
+        """
+        m = mocks_mainnet_traces
+        block_traces = (
+            m.exec_trace_transaction_result + m.incoming_ether_trace_transaction_result
+        )
+        exec_tx_hash = HexBytes(m.exec_tx_hash)
+        incoming_ether_tx_hash = HexBytes(m.incoming_ether_tx_hash)
+        master_copies = {"0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552"}
+
+        InternalTxIndexerProvider.del_singleton()
+        with self.settings(ETH_INTERNAL_NO_FILTER=True):
+            trace_block_indexer = InternalTxIndexerProvider()
+        self.assertIsInstance(trace_block_indexer, InternalTxIndexerWithTraceBlock)
+
+        for internal_tx_indexer, ignore_addresses, expected_tx_hashes in (
+            (self.internal_tx_indexer, True, [exec_tx_hash]),
+            (trace_block_indexer, True, [exec_tx_hash]),
+            # Explicitly provided addresses (`reindex --addresses`): stock
+            (
+                self.internal_tx_indexer,
+                False,
+                [exec_tx_hash, incoming_ether_tx_hash],
+            ),
+        ):
+            with (
+                self.subTest(
+                    indexer=internal_tx_indexer.__class__.__name__,
+                    ignore_addresses=ignore_addresses,
+                ),
+                mock.patch.object(
+                    TracingManager,
+                    "trace_blocks",
+                    autospec=True,
+                    return_value=[block_traces],
+                ),
+            ):
+                internal_tx_indexer.whitelisted_safes = frozenset({m.exec_safe_address})
+                internal_tx_indexer.IGNORE_ADDRESSES_ON_LOG_FILTER = ignore_addresses
+                elements = internal_tx_indexer.find_relevant_elements(
+                    master_copies, 1, 1, current_block_number=1
+                )
+                self.assertEqual(list(elements.keys()), expected_tx_hashes)
+
     def test_tx_processor_using_internal_tx_indexer(self):
         self._test_internal_tx_indexer()
         tx_processor = SafeTxProcessorProvider()

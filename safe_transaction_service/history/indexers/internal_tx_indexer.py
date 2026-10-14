@@ -144,7 +144,11 @@ class InternalTxIndexer(EthereumIndexer):
         from_block_number: int,
         to_block_number: int,
     ) -> OrderedDict[bytes, list[BlockTrace]]:
-        addresses_set = set(addresses)  # More optimal to use with `in`
+        if self.whitelisted_safes and self.IGNORE_ADDRESSES_ON_LOG_FILTER:
+            # Keep the txs with traces `from` or `to` the whitelisted Safes instead
+            addresses_set = self.whitelisted_safes
+        else:
+            addresses_set = set(addresses)  # More optimal to use with `in`
         logger.debug(
             "Using trace_block from-block=%d to-block=%d",
             from_block_number,
