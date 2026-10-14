@@ -1,4 +1,5 @@
 import itertools
+import os
 from collections import OrderedDict
 from unittest import mock
 from unittest.mock import MagicMock, PropertyMock
@@ -9,6 +10,7 @@ from eth_typing import HexStr
 from hexbytes import HexBytes
 from safe_eth.eth import EthereumClient
 from safe_eth.eth.ethereum_client import TracingManager
+from safe_eth.eth.utils import fast_to_checksum_address
 from safe_eth.util.util import to_0x_hex_str
 
 from ..indexers import InternalTxIndexer, InternalTxIndexerProvider
@@ -27,6 +29,7 @@ from ..models import (
     SafeRelevantTransaction,
     SafeStatus,
 )
+from ..services import IndexServiceProvider
 from .factories import EthereumTxFactory, SafeMasterCopyFactory
 from .mocks import mocks_mainnet_traces
 from .mocks.mocks_internal_tx_indexer import (
@@ -424,6 +427,124 @@ class TestInternalTxIndexer(TestCase):
         trace_block_mock.assert_called_once_with(
             internal_tx_indexer.ethereum_client.tracing, []
         )
+
+    @mock.patch.object(TracingManager, "trace_blocks", autospec=True, return_value=[])
+    @mock.patch.object(TracingManager, "trace_filter", autospec=True, return_value=[])
+    @mock.patch.object(
+        EthereumClient,
+        "current_block_number",
+        new_callable=PropertyMock,
+        return_value=2000,
+    )
+    def test_trace_filter_whitelist_chunks(
+        self,
+        current_block_number_mock: MagicMock,
+        trace_filter_mock: MagicMock,
+        trace_block_mock: MagicMock,
+    ):
+        """
+        With a whitelist, `trace_filter` searches the traces `from` the whitelisted
+        Safes in chunks of `query_chunk_size`, instead of `to` every master copy
+        """
+        SafeMasterCopyFactory(tx_block_number=0)
+        whitelisted_safes = frozenset(
+            fast_to_checksum_address(os.urandom(20)) for _ in range(5)
+        )
+        internal_tx_indexer = self.internal_tx_indexer
+        internal_tx_indexer.whitelisted_safes = whitelisted_safes
+
+        for query_chunk_size, expected_calls in ((2, 3), (0, 1)):
+            with self.subTest(query_chunk_size=query_chunk_size):
+                internal_tx_indexer.query_chunk_size = query_chunk_size
+                SafeMasterCopy.objects.update(tx_block_number=0)
+                trace_filter_mock.reset_mock()
+                internal_tx_indexer.start()
+
+                self.assertEqual(trace_filter_mock.call_count, expected_calls)
+                queried_addresses = []
+                for call in trace_filter_mock.call_args_list:
+                    self.assertNotIn("to_address", call.kwargs)
+                    queried_addresses.extend(call.kwargs["from_address"])
+                    if query_chunk_size:
+                        self.assertLessEqual(
+                            len(call.kwargs["from_address"]), query_chunk_size
+                        )
+                self.assertCountEqual(queried_addresses, whitelisted_safes)
+
+    def test_trace_filter_whitelist_chunks_merged(self):
+        """
+        Chunk results are merged in block order, without duplicated transactions
+        """
+
+        def trace(block_number: int, transaction_position: int, tx_hash: str):
+            return {
+                "blockNumber": block_number,
+                "transactionPosition": transaction_position,
+                "transactionHash": HexBytes(tx_hash),
+            }
+
+        internal_tx_indexer = self.internal_tx_indexer
+        internal_tx_indexer.whitelisted_safes = frozenset(
+            fast_to_checksum_address(os.urandom(20)) for _ in range(2)
+        )
+        internal_tx_indexer.query_chunk_size = 1
+        with mock.patch.object(
+            TracingManager,
+            "trace_filter",
+            autospec=True,
+            side_effect=[
+                [trace(10, 3, "0x03"), trace(12, 0, "0x04")],
+                # `0x03` involves both Safes
+                [trace(9, 0, "0x01"), trace(10, 1, "0x02"), trace(10, 3, "0x03")],
+            ],
+        ) as trace_filter_mock:
+            elements = internal_tx_indexer._find_relevant_elements_using_trace_filter(
+                {"0x5aC255889882aCd3da2aA939679E3f3d4cea221e"}, 1, 100
+            )
+        self.assertEqual(trace_filter_mock.call_count, 2)
+        self.assertEqual(
+            list(elements.items()),
+            [(HexBytes(tx_hash), None) for tx_hash in ("0x01", "0x02", "0x03", "0x04")],
+        )
+
+    @mock.patch.object(TracingManager, "trace_filter", autospec=True, return_value=[])
+    @mock.patch.object(
+        EthereumClient,
+        "current_block_number",
+        new_callable=PropertyMock,
+        return_value=2000,
+    )
+    def test_reindex_master_copies_whitelist(
+        self,
+        current_block_number_mock: MagicMock,
+        trace_filter_mock: MagicMock,
+    ):
+        """
+        L1 reindex: the default path searches the whitelisted Safes, explicitly
+        provided addresses are queried as in stock
+        """
+        master_copy = SafeMasterCopyFactory()
+        whitelisted_safe = fast_to_checksum_address(os.urandom(20))
+        index_service = IndexServiceProvider()
+        with (
+            self.settings(WHITELISTED_SAFES=frozenset({whitelisted_safe})),
+            mock.patch.object(index_service, "eth_l2_network", False),
+        ):
+            index_service.reindex_master_copies(0, 10, block_process_limit=100)
+            trace_filter_mock.assert_called_once_with(
+                mock.ANY, from_block=0, to_block=10, from_address=[whitelisted_safe]
+            )
+            trace_filter_mock.reset_mock()
+
+            for addresses in ([master_copy.address], [whitelisted_safe]):
+                with self.subTest(addresses=addresses):
+                    index_service.reindex_master_copies(
+                        0, 10, block_process_limit=100, addresses=addresses
+                    )
+                    trace_filter_mock.assert_called_once_with(
+                        mock.ANY, from_block=0, to_block=10, to_address=addresses
+                    )
+                    trace_filter_mock.reset_mock()
 
     def test_tx_processor_using_internal_tx_indexer(self):
         self._test_internal_tx_indexer()

@@ -26,6 +26,7 @@ from ..models import (
     SafeMasterCopy,
     SafeRelevantTransaction,
 )
+from ..whitelist import get_whitelisted_safes
 from .ethereum_indexer import EthereumIndexer, FindRelevantElementsException
 
 logger = getLogger(__name__)
@@ -57,6 +58,11 @@ class InternalTxIndexerProvider:
 
 
 class InternalTxIndexer(EthereumIndexer):
+    # With a whitelist, `trace_filter` ignores the provided master copies and searches
+    # the traces from the whitelisted Safes instead. `IndexService._reindex` sets it to
+    # `False` when addresses are explicitly provided, so they are queried as in stock
+    IGNORE_ADDRESSES_ON_LOG_FILTER = True
+
     def __init__(self, *args, **kwargs):
         kwargs.setdefault(
             "block_process_limit", settings.ETH_INTERNAL_TXS_BLOCK_PROCESS_LIMIT
@@ -66,6 +72,13 @@ class InternalTxIndexer(EthereumIndexer):
         )
         kwargs.setdefault(
             "blocks_to_reindex_again", settings.ETH_INTERNAL_TXS_BLOCKS_TO_REINDEX_AGAIN
+        )
+        # Number of whitelisted Safes queried in the same `trace_filter` request
+        kwargs.setdefault("query_chunk_size", settings.ETH_EVENTS_QUERY_CHUNK_SIZE)
+        kwargs.setdefault("whitelisted_safes", get_whitelisted_safes())
+        # Empty == index every Safe
+        self.whitelisted_safes: frozenset[ChecksumAddress] = frozenset(
+            kwargs["whitelisted_safes"]
         )
         super().__init__(*args, **kwargs)
 
@@ -194,13 +207,40 @@ class InternalTxIndexer(EthereumIndexer):
             to_block_number,
         )
 
+        if self.whitelisted_safes and self.IGNORE_ADDRESSES_ON_LOG_FILTER:
+            # Every Safe action, including receiving ether (proxy fallback), is a
+            # delegatecall `from` the Safe to its singleton
+            addresses = self.whitelisted_safes
+            if self.query_chunk_size:
+                addresses_chunks = chunks(list(addresses), self.query_chunk_size)
+            else:
+                addresses_chunks = [list(addresses)]
+            queries = [
+                {"from_address": addresses_chunk}
+                for addresses_chunk in addresses_chunks
+            ]
+        else:
+            queries = [{"to_address": list(addresses)}]
+
         try:
             # We only need to search for traces `to` the provided addresses
             with self.auto_adjust_block_limit(from_block_number, to_block_number):
-                to_traces = self.ethereum_client.tracing.trace_filter(
-                    from_block=from_block_number,
-                    to_block=to_block_number,
-                    to_address=list(addresses),
+                to_traces = [
+                    trace
+                    for query in queries
+                    for trace in self.ethereum_client.tracing.trace_filter(
+                        from_block=from_block_number,
+                        to_block=to_block_number,
+                        **query,
+                    )
+                ]
+            if len(queries) > 1:
+                # Keep the block order of a single request
+                to_traces.sort(
+                    key=lambda trace: (
+                        trace["blockNumber"],
+                        trace.get("transactionPosition") or 0,
+                    )
                 )
         except OSError as e:
             raise FindRelevantElementsException(
