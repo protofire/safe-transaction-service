@@ -546,6 +546,127 @@ class TestInternalTxIndexer(TestCase):
                     )
                     trace_filter_mock.reset_mock()
 
+    def test_process_elements_whitelist_mainnet_txs(self):
+        """
+        Real Mainnet txs with traces of other contracts: only the traces of the
+        whitelisted Safe are stored
+        """
+        for case in ("incoming_ether", "module"):
+            safe_address = getattr(mocks_mainnet_traces, f"{case}_safe_address")
+            tx_hash = HexBytes(getattr(mocks_mainnet_traces, f"{case}_tx_hash"))
+            traces = getattr(mocks_mainnet_traces, f"{case}_trace_transaction_result")
+            EthereumTxFactory(tx_hash=tx_hash, status=1)
+
+            for whitelisted_safes, expected_internal_txs in (
+                (frozenset(), 5),  # Stock
+                (frozenset({safe_address}), 1),
+            ):
+                with self.subTest(case=case, whitelisted_safes=whitelisted_safes):
+                    InternalTx.objects.all().delete()
+                    self.internal_tx_indexer.element_already_processed_checker.clear()
+                    self.internal_tx_indexer.whitelisted_safes = whitelisted_safes
+                    self.internal_tx_indexer.process_elements({tx_hash: traces})
+                    self.assertEqual(InternalTx.objects.count(), expected_internal_txs)
+                    if whitelisted_safes:
+                        internal_tx = InternalTx.objects.get()
+                        self.assertIn(safe_address, (internal_tx._from, internal_tx.to))
+
+    def test_process_elements_whitelist_other_safe(self):
+        """
+        A tx with a whitelisted Safe and a non-whitelisted Safe: nothing is stored or
+        decoded for the non-whitelisted one
+        """
+        whitelisted_safe = mocks_mainnet_traces.exec_safe_address
+        other_safe = fast_to_checksum_address(os.urandom(20))
+        tx_hash = HexBytes(mocks_mainnet_traces.exec_tx_hash)
+        exec_traces = mocks_mainnet_traces.exec_trace_transaction_result
+        safe_delegate_call = next(
+            trace
+            for trace in exec_traces
+            if trace["action"].get("callType") == "delegatecall"
+        )
+        other_safe_delegate_call = {
+            **safe_delegate_call,
+            "action": {**safe_delegate_call["action"], "from": other_safe},
+            "traceAddress": [9],
+        }
+        ether_to_other_safe = {
+            **safe_delegate_call,
+            "action": {
+                "from": fast_to_checksum_address(os.urandom(20)),
+                "callType": "call",
+                "gas": 2300,
+                "input": HexBytes("0x"),
+                "to": other_safe,
+                "value": 5,
+            },
+            "subtraces": 0,
+            "traceAddress": [10],
+        }
+        traces = exec_traces + [other_safe_delegate_call, ether_to_other_safe]
+        EthereumTxFactory(tx_hash=tx_hash, status=1)
+
+        self.internal_tx_indexer.whitelisted_safes = frozenset({whitelisted_safe})
+        self.internal_tx_indexer.process_elements({tx_hash: traces})
+
+        self.assertFalse(InternalTx.objects.filter(_from=other_safe).exists())
+        self.assertFalse(InternalTx.objects.filter(to=other_safe).exists())
+        self.assertTrue(InternalTx.objects.filter(_from=whitelisted_safe).exists())
+        self.assertEqual(
+            list(InternalTxDecoded.objects.values_list("safe_address", flat=True)),
+            [whitelisted_safe],
+        )
+        self.assertFalse(
+            SafeRelevantTransaction.objects.filter(safe=other_safe).exists()
+        )
+
+    def test_process_elements_whitelist_no_traces_left(self):
+        """
+        A tx with no traces of whitelisted Safes is not fetched. As in stock, it is
+        marked as processed only if another tx of the batch is processed
+        """
+        m = mocks_mainnet_traces
+        other_tx_hash = HexBytes(m.exec_tx_hash)
+        other_traces = m.exec_trace_transaction_result
+        tx_hash = HexBytes(m.incoming_ether_tx_hash)
+        traces = m.incoming_ether_trace_transaction_result
+        EthereumTxFactory(tx_hash=tx_hash, status=1)
+        internal_tx_indexer = self.internal_tx_indexer
+        internal_tx_indexer.whitelisted_safes = frozenset(
+            {m.incoming_ether_safe_address}
+        )
+
+        with mock.patch.object(
+            internal_tx_indexer,
+            "_prefetch_ethereum_txs",
+            wraps=internal_tx_indexer._prefetch_ethereum_txs,
+        ) as prefetch_ethereum_txs_mock:
+            # Only the not whitelisted tx: nothing to process, nothing marked
+            self.assertEqual(
+                internal_tx_indexer.process_elements({other_tx_hash: other_traces}), []
+            )
+            prefetch_ethereum_txs_mock.assert_not_called()
+            self.assertFalse(
+                internal_tx_indexer._is_processed(
+                    other_tx_hash, other_traces[0]["blockHash"]
+                )
+            )
+
+            self.assertEqual(
+                internal_tx_indexer.process_elements(
+                    {other_tx_hash: other_traces, tx_hash: traces}
+                ),
+                [tx_hash],
+            )
+            prefetch_ethereum_txs_mock.assert_called_once_with([tx_hash])
+
+        self.assertEqual(InternalTx.objects.count(), 1)
+        self.assertTrue(
+            internal_tx_indexer._is_processed(
+                other_tx_hash, other_traces[0]["blockHash"]
+            )
+        )
+
     def test_tx_processor_using_internal_tx_indexer(self):
         self._test_internal_tx_indexer()
         tx_processor = SafeTxProcessorProvider()

@@ -403,7 +403,9 @@ class InternalTxIndexer(EthereumIndexer):
             )
             # Keep only traces that could generate relevant InternalTxs
             relevant_traces = [
-                trace for trace in traces if self.is_relevant_trace(trace)
+                trace
+                for trace in traces
+                if self.is_relevant_trace(trace) and self._is_whitelisted_trace(trace)
             ]
             if relevant_traces:
                 filtered_traces_by_tx_hash[tx_hash] = relevant_traces
@@ -460,6 +462,24 @@ class InternalTxIndexer(EthereumIndexer):
             )
             self._mark_processed(tx_hash, block_hash)
         return tx_hashes
+
+    def _is_whitelisted_trace(self, trace: FilterTrace) -> bool:
+        """
+        A tx relevant for a whitelisted Safe can contain traces of other Safes, e.g. a
+        relayer batching several Safes. They are not stored
+
+        :param trace:
+        :return: ``True`` if the whitelist is disabled or the trace is `from`, `to` or
+            creates a whitelisted Safe
+        """
+        if not self.whitelisted_safes:
+            return True
+        action = trace.get("action", {})
+        return (
+            action.get("from") in self.whitelisted_safes
+            or action.get("to") in self.whitelisted_safes
+            or (trace.get("result") or {}).get("address") in self.whitelisted_safes
+        )
 
     @staticmethod
     def is_relevant_trace(trace: FilterTrace) -> bool:
