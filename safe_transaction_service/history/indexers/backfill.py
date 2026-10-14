@@ -17,6 +17,7 @@ from web3.exceptions import Web3RPCError
 
 from .erc20_events_indexer import Erc20EventsIndexer
 from .ethereum_indexer import EthereumIndexer, FindRelevantElementsException
+from .internal_tx_indexer import InternalTxIndexer
 from .safe_events_indexer import SafeEventsIndexer
 
 logger = getLogger(__name__)
@@ -82,6 +83,10 @@ class BackfillErc20EventsIndexer(BackfillCursorMixin, Erc20EventsIndexer):
     pass
 
 
+class BackfillInternalTxIndexer(BackfillCursorMixin, InternalTxIndexer):
+    pass
+
+
 def build_backfill_indexers(
     max_block_process_limit: int,
 ) -> tuple[BackfillSafeEventsIndexer, BackfillErc20EventsIndexer]:
@@ -104,6 +109,29 @@ def build_backfill_indexers(
         EthereumClient(settings.ETHEREUM_NODE_URL), **kwargs
     )
     return safe_events_indexer, erc20_events_indexer
+
+
+def build_backfill_internal_tx_indexer(
+    address: ChecksumAddress, max_block_process_limit: int
+) -> BackfillInternalTxIndexer:
+    """
+    :param address: Safe to backfill. Used as the whitelist, so `trace_filter` searches
+        the traces `from` the Safe (like live whitelist indexing) and only its traces
+        are stored
+    :param max_block_process_limit: Maximum number of blocks per `trace_filter`
+    :return: L1 (tracing) indexer for the backfill
+    """
+    internal_tx_indexer = BackfillInternalTxIndexer(
+        EthereumClient(settings.ETHEREUM_TRACING_NODE_URL),
+        confirmations=0,
+        blocks_to_reindex_again=0,
+        block_process_limit=min(1_000, max_block_process_limit),
+        block_process_limit_max=max_block_process_limit,
+        whitelisted_safes=frozenset({address}),
+    )
+    # Only `trace_filter`, `trace_block` would download whole blocks
+    internal_tx_indexer.number_trace_blocks = 0
+    return internal_tx_indexer
 
 
 def run_backfill(

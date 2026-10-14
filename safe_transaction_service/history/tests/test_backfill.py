@@ -12,6 +12,7 @@ from celery.exceptions import SoftTimeLimitExceeded
 from eth_account import Account
 from hexbytes import HexBytes
 from requests import Timeout
+from safe_eth.eth.ethereum_client import TracingManager
 from web3.exceptions import Web3RPCError
 
 from ..indexers.backfill import (
@@ -19,13 +20,16 @@ from ..indexers.backfill import (
     BackfillCursorMixin,
     BackfillErc20EventsIndexer,
     BackfillGaveUp,
+    BackfillInternalTxIndexer,
     BackfillSafeEventsIndexer,
     build_backfill_indexers,
+    build_backfill_internal_tx_indexer,
     run_backfill,
 )
 from ..indexers.ethereum_indexer import FindRelevantElementsException
 from ..models import IndexingStatus
 from ..services import IndexService, IndexServiceProvider
+from .factories import SafeMasterCopyFactory
 
 START = 100
 END = 150
@@ -105,6 +109,51 @@ class TestBackfill(TestCase):
         self.assertLessEqual(max(self.window_sizes(recorder.windows)), 8)
         self.assertEqual(safe_events_indexer.cursor, END + 1)
 
+    def test_run_backfill_internal_tx_indexer(self):
+        """
+        L1: windows cover the range and the master copies progress is not used or modified
+        """
+        master_copy = SafeMasterCopyFactory(tx_block_number=START - 50)
+        internal_tx_indexer = build_backfill_internal_tx_indexer(self.address, 8)
+        self.assertEqual(internal_tx_indexer.whitelisted_safes, {self.address})
+        self.assertTrue(internal_tx_indexer.IGNORE_ADDRESSES_ON_LOG_FILTER)
+        self.assertEqual(internal_tx_indexer.number_trace_blocks, 0)
+        self.assertEqual(internal_tx_indexer.confirmations, 0)
+
+        recorder = WindowRecorder()
+        self.run_recorded(internal_tx_indexer, recorder)
+        self.assert_coverage(recorder.successful_windows, START, END)
+        self.assertLessEqual(max(self.window_sizes(recorder.windows)), 8)
+        self.assertEqual(internal_tx_indexer.cursor, END + 1)
+        master_copy.refresh_from_db()
+        self.assertEqual(master_copy.tx_block_number, START - 50)
+
+    def test_internal_tx_indexer_queries(self):
+        """
+        L1: only `trace_filter` searching the traces `from` the Safe, never `trace_block`
+        """
+        internal_tx_indexer = build_backfill_internal_tx_indexer(self.address, 8)
+        with (
+            mock.patch.object(
+                TracingManager, "trace_filter", autospec=True, return_value=[]
+            ) as trace_filter_mock,
+            mock.patch.object(
+                TracingManager, "trace_blocks", autospec=True, return_value=[]
+            ) as trace_blocks_mock,
+        ):
+            run_backfill(internal_tx_indexer, {self.address}, START, END)
+
+        self.assertTrue(trace_filter_mock.call_args_list)
+        windows = []
+        for call in trace_filter_mock.call_args_list:
+            self.assertEqual(call.kwargs["from_address"], [self.address])
+            self.assertNotIn("to_address", call.kwargs)
+            windows.append((call.kwargs["from_block"], call.kwargs["to_block"]))
+        self.assert_coverage(windows, START, END)
+        # The last window ends at `end`: `trace_blocks` gets no blocks (no RPC call)
+        for call in trace_blocks_mock.call_args_list:
+            self.assertEqual(call.args[1], [])
+
     def test_rejection_is_retried(self):
         exceptions = [
             FindRelevantElementsException("Request error"),
@@ -170,7 +219,11 @@ class TestBackfill(TestCase):
         )
 
     def test_backfill_cursor_mixin_order(self):
-        for indexer_class in (BackfillSafeEventsIndexer, BackfillErc20EventsIndexer):
+        for indexer_class in (
+            BackfillSafeEventsIndexer,
+            BackfillErc20EventsIndexer,
+            BackfillInternalTxIndexer,
+        ):
             with self.subTest(indexer_class=indexer_class.__name__):
                 self.assertIs(
                     indexer_class.get_from_block_number,

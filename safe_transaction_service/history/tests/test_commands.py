@@ -11,7 +11,11 @@ from django_celery_beat.models import PeriodicTask
 from eth_account import Account
 from safe_eth.eth.account_abstraction import BundlerClient
 from safe_eth.eth.constants import NULL_ADDRESS
-from safe_eth.eth.ethereum_client import EthereumClient, EthereumNetwork
+from safe_eth.eth.ethereum_client import (
+    EthereumClient,
+    EthereumNetwork,
+    TracingManager,
+)
 from safe_eth.safe import Safe
 from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
 from safe_eth.util.util import to_0x_hex_str
@@ -32,6 +36,8 @@ from ..models import (
 from ..services import IndexServiceProvider
 from ..tasks import logger as task_logger
 from .factories import (
+    EthereumBlockFactory,
+    EthereumTxFactory,
     MultisigConfirmationFactory,
     MultisigTransactionFactory,
     ProxyFactoryFactory,
@@ -39,6 +45,7 @@ from .factories import (
     SafeLastStatusFactory,
     SafeMasterCopyFactory,
 )
+from .mocks import mocks_mainnet_traces
 
 
 class TestCommands(SafeTestCaseMixin, TestCase):
@@ -888,9 +895,11 @@ class TestCommands(SafeTestCaseMixin, TestCase):
         command = "backfill_whitelisted_safe"
         with (
             override_settings(
-                WHITELISTED_SAFES=frozenset({safe.address}), ETH_L2_NETWORK=False
+                WHITELISTED_SAFES=frozenset({safe.address}),
+                ETH_L2_NETWORK=False,
+                ETHEREUM_TRACING_NODE_URL=None,
             ),
-            self.assertRaisesMessage(CommandError, "ETH_L2_NETWORK"),
+            self.assertRaisesMessage(CommandError, "ETHEREUM_TRACING_NODE_URL"),
         ):
             call_command(
                 command,
@@ -925,3 +934,131 @@ class TestCommands(SafeTestCaseMixin, TestCase):
                     f"--creation-tx-hash=0x{'12' * 32}",
                 )
         self.assertFalse(SafeContract.objects.filter(address=safe.address).exists())
+
+    def _mock_l1_backfill(self, creation_traces: list):
+        """
+        Mock the tracing node with the Mainnet creation tx of a Safe
+
+        :return: Context manager with the `trace_filter` mock
+        """
+        m = mocks_mainnet_traces
+        creation_block = m.creation_block_number
+
+        def trace_filter(tracing, from_block, to_block, **kwargs):
+            if from_block <= creation_block <= to_block:
+                return m.creation_trace_filter_result
+            return []
+
+        patchers = (
+            mock.patch.object(
+                EthereumClient,
+                "get_transaction_receipt",
+                autospec=True,
+                return_value={
+                    "status": 1,
+                    "blockNumber": creation_block,
+                    "logs": [],
+                },
+            ),
+            mock.patch.object(
+                EthereumClient,
+                "current_block_number",
+                new_callable=PropertyMock,
+                return_value=creation_block + 20,
+            ),
+            mock.patch.object(
+                TracingManager,
+                "trace_transaction",
+                autospec=True,
+                return_value=creation_traces,
+            ),
+            mock.patch.object(
+                TracingManager,
+                "trace_transactions",
+                autospec=True,
+                side_effect=lambda tracing, tx_hashes: [
+                    creation_traces for _ in tx_hashes
+                ],
+            ),
+            mock.patch.object(
+                TracingManager, "trace_filter", autospec=True, side_effect=trace_filter
+            ),
+            mock.patch.object(
+                TracingManager, "trace_blocks", autospec=True, return_value=[]
+            ),
+        )
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # Indexers replace the client of the `IndexService` singleton
+        IndexServiceProvider.del_singleton()
+        self.addCleanup(IndexServiceProvider.del_singleton)
+        return patchers[4]
+
+    def test_backfill_whitelisted_safe_l1(self):
+        m = mocks_mainnet_traces
+        safe_address = m.creation_safe_address
+        EthereumTxFactory(
+            tx_hash=m.creation_tx_hash,
+            status=1,
+            block=EthereumBlockFactory(number=m.creation_block_number),
+        )
+        self._mock_l1_backfill(m.creation_trace_transaction_result)
+        command_args = [
+            "backfill_whitelisted_safe",
+            f"--address={safe_address}",
+            f"--creation-tx-hash={m.creation_tx_hash}",
+            "--skip-erc20",
+        ]
+        with override_settings(
+            WHITELISTED_SAFES=frozenset({safe_address}), ETH_L2_NETWORK=False
+        ):
+            buf = StringIO()
+            call_command(*command_args, stdout=buf, stderr=StringIO())
+            self.assertIn(f"Backfilled {safe_address}", buf.getvalue())
+            self.assertIn("BackfillInternalTxIndexer", buf.getvalue())
+            row_counts = self._get_backfill_row_counts()
+            # Running it again doesn't change anything
+            call_command(*command_args, stdout=StringIO(), stderr=StringIO())
+            self.assertEqual(self._get_backfill_row_counts(), row_counts)
+
+        self.assertTrue(
+            InternalTx.objects.filter(
+                contract_address=safe_address, tx_type=InternalTxType.CREATE.value
+            ).exists()
+        )
+        self.assertTrue(
+            InternalTxDecoded.objects.filter(
+                safe_address=safe_address, function_name="setup"
+            ).exists()
+        )
+        self.assertTrue(SafeContract.objects.filter(address=safe_address).exists())
+        safe_last_status = SafeLastStatus.objects.get(address=safe_address)
+        self.assertEqual(
+            safe_last_status.master_copy, "0xfb1bffC9d739B8D520DaF37dF666da4C687191EA"
+        )
+        self.assertEqual(safe_last_status.nonce, 0)
+        # Only the traces of the Safe are stored
+        for internal_tx in InternalTx.objects.all():
+            self.assertIn(
+                safe_address,
+                (internal_tx._from, internal_tx.to, internal_tx.contract_address),
+            )
+
+    def test_backfill_whitelisted_safe_l1_errors(self):
+        m = mocks_mainnet_traces
+        safe_address = m.creation_safe_address
+        # The traces of another tx: no creation or setup of the Safe
+        self._mock_l1_backfill(m.exec_trace_transaction_result)
+        with (
+            override_settings(
+                WHITELISTED_SAFES=frozenset({safe_address}), ETH_L2_NETWORK=False
+            ),
+            self.assertRaisesMessage(CommandError, "has no creation or setup trace"),
+        ):
+            call_command(
+                "backfill_whitelisted_safe",
+                f"--address={safe_address}",
+                f"--creation-tx-hash={m.exec_tx_hash}",
+            )
+        self.assertEqual(InternalTx.objects.count(), 0)
