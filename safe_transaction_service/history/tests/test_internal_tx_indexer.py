@@ -28,6 +28,7 @@ from ..models import (
     SafeStatus,
 )
 from .factories import EthereumTxFactory, SafeMasterCopyFactory
+from .mocks import mocks_mainnet_traces
 from .mocks.mocks_internal_tx_indexer import (
     block_result,
     trace_blocks_filtered_0x5aC2_result,
@@ -302,6 +303,126 @@ class TestInternalTxIndexer(TestCase):
         trace_block_mock.assert_called_with(
             internal_tx_indexer.ethereum_client.tracing,
             list(range(current_block_number - 3, current_block_number + 1)),
+        )
+
+    @mock.patch.object(TracingManager, "trace_blocks", autospec=True, return_value=[])
+    @mock.patch.object(TracingManager, "trace_filter", autospec=True, return_value=[])
+    @mock.patch.object(
+        EthereumClient,
+        "current_block_number",
+        new_callable=PropertyMock,
+        return_value=2000,
+    )
+    def test_trace_filter_queries_all_master_copies(
+        self,
+        current_block_number_mock: MagicMock,
+        trace_filter_mock: MagicMock,
+        trace_block_mock: MagicMock,
+    ):
+        """
+        Stock `trace_filter` searches traces `to` every master copy, so it finds the
+        transactions of every Safe on the network
+        """
+        master_copy_addresses = {
+            SafeMasterCopyFactory(tx_block_number=0).address for _ in range(3)
+        }
+        self.internal_tx_indexer.start()
+
+        trace_filter_mock.assert_called()
+        for call in trace_filter_mock.call_args_list:
+            self.assertEqual(set(call.kwargs["to_address"]), master_copy_addresses)
+            self.assertNotIn("from_address", call.kwargs)
+
+    def test_trace_block_matches_action_from_or_to(self):
+        """
+        `trace_block` keeps every trace of the transactions with a trace `from` or `to`
+        one of the addresses
+        """
+        block_traces = (
+            mocks_mainnet_traces.exec_trace_transaction_result
+            + mocks_mainnet_traces.incoming_ether_trace_transaction_result
+        )
+        exec_tx_hash = HexBytes(mocks_mainnet_traces.exec_tx_hash)
+        incoming_ether_tx_hash = HexBytes(mocks_mainnet_traces.incoming_ether_tx_hash)
+        safe_v1_3_0_singleton = "0xd9Db270c1B5E3Bd161E8c8503c55cEABeE709552"
+
+        for addresses, expected_tx_hashes in (
+            # Safe is the `from` of the delegatecall to its singleton
+            ({mocks_mainnet_traces.exec_safe_address}, [exec_tx_hash]),
+            # Both Safes delegatecall `to` the same singleton
+            ({safe_v1_3_0_singleton}, [exec_tx_hash, incoming_ether_tx_hash]),
+            ({"0x5aFE3855358E112B5647B952709E6165e1c1eEEe"}, []),
+        ):
+            with (
+                self.subTest(addresses=addresses),
+                mock.patch.object(
+                    TracingManager,
+                    "trace_blocks",
+                    autospec=True,
+                    return_value=[block_traces],
+                ),
+            ):
+                elements = (
+                    self.internal_tx_indexer._find_relevant_elements_using_trace_block(
+                        addresses, 1, 1
+                    )
+                )
+                self.assertEqual(list(elements.keys()), expected_tx_hashes)
+                for tx_hash, traces in elements.items():
+                    self.assertEqual(
+                        traces,
+                        [
+                            trace
+                            for trace in block_traces
+                            if trace["transactionHash"] == tx_hash
+                        ],
+                    )
+
+    @mock.patch.object(TracingManager, "trace_blocks", autospec=True, return_value=[])
+    @mock.patch.object(TracingManager, "trace_filter", autospec=True, return_value=[])
+    @mock.patch.object(
+        EthereumClient,
+        "current_block_number",
+        new_callable=PropertyMock,
+        return_value=2000,
+    )
+    def test_find_relevant_elements_number_trace_blocks_zero(
+        self,
+        current_block_number_mock: MagicMock,
+        trace_filter_mock: MagicMock,
+        trace_block_mock: MagicMock,
+    ):
+        """
+        `ETH_INTERNAL_TXS_NUMBER_TRACE_BLOCKS=0` (no `trace_block` near the tip)
+        """
+        current_block_number = current_block_number_mock.return_value
+        internal_tx_indexer = self.internal_tx_indexer
+        internal_tx_indexer.number_trace_blocks = 0
+        addresses = {"0x5aC255889882aCd3da2aA939679E3f3d4cea221e"}
+
+        internal_tx_indexer.find_relevant_elements(
+            addresses, 1, current_block_number - 1
+        )
+        trace_filter_mock.assert_called_once_with(
+            internal_tx_indexer.ethereum_client.tracing,
+            from_block=1,
+            to_block=current_block_number - 1,
+            to_address=list(addresses),
+        )
+        trace_block_mock.assert_not_called()
+        trace_filter_mock.reset_mock()
+
+        # Up to the current block: `trace_filter` to the current block, then
+        # `trace_blocks` is still called, with no blocks
+        internal_tx_indexer.find_relevant_elements(addresses, 1, current_block_number)
+        trace_filter_mock.assert_called_once_with(
+            internal_tx_indexer.ethereum_client.tracing,
+            from_block=1,
+            to_block=current_block_number,
+            to_address=list(addresses),
+        )
+        trace_block_mock.assert_called_once_with(
+            internal_tx_indexer.ethereum_client.tracing, []
         )
 
     def test_tx_processor_using_internal_tx_indexer(self):
