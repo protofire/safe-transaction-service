@@ -72,11 +72,12 @@ class DifferentialChain:
 
 
 class TestWhitelistDifferential(SafeTestCaseMixin, TestCase):
+    L2_NETWORK = True  # Safe events (L2) or traces (L1) indexing
     chain: DifferentialChain | None = None
     stock: tuple[Snapshot, Snapshot] | None = None
 
     def setUp(self):
-        cls = TestWhitelistDifferential
+        cls = type(self)
         if cls.chain is None:
             cls.chain = self.build_chain()
         for version, singleton in self.chain.singletons.items():
@@ -85,7 +86,7 @@ class TestWhitelistDifferential(SafeTestCaseMixin, TestCase):
                 initial_block_number=self.chain.range_start,
                 tx_block_number=self.chain.range_start,
                 version=version,
-                l2=True,
+                l2=self.L2_NETWORK,
             )
         ProxyFactoryFactory(
             address=self.proxy_factory.address,
@@ -253,6 +254,15 @@ class TestWhitelistDifferential(SafeTestCaseMixin, TestCase):
             self.client, whitelisted_safes
         )
 
+    def build_safe_indexer(self, **kwargs) -> SafeEventsIndexer:
+        return SafeEventsIndexer(EthereumClient(settings.ETHEREUM_NODE_URL), **kwargs)
+
+    def after_safe_indexing(self) -> None:
+        """
+        Called before indexing ERC20. On L2, `SafeContract` rows (the ERC20 monitored
+        addresses) are created by the Safe events indexer
+        """
+
     def run_live(self, whitelisted_safes: frozenset[str]) -> tuple[Snapshot, Snapshot]:
         """
         Index the chain range with the live indexers and process the decoded txs
@@ -260,16 +270,14 @@ class TestWhitelistDifferential(SafeTestCaseMixin, TestCase):
         range_end = self.chain.range_end
         reset_indexing_state(self.chain.range_start)
         with override_settings(
-            WHITELISTED_SAFES=whitelisted_safes, ETH_L2_NETWORK=True
+            WHITELISTED_SAFES=whitelisted_safes, ETH_L2_NETWORK=self.L2_NETWORK
         ):
             kwargs = {
                 "confirmations": 0,
                 "blocks_to_reindex_again": 0,
                 "query_chunk_size": QUERY_CHUNK_SIZE,
             }
-            safe_events_indexer = SafeEventsIndexer(
-                EthereumClient(settings.ETHEREUM_NODE_URL), **kwargs
-            )
+            safe_events_indexer = self.build_safe_indexer(**kwargs)
             erc20_events_indexer = Erc20EventsIndexer(
                 EthereumClient(settings.ETHEREUM_NODE_URL), **kwargs
             )
@@ -293,6 +301,8 @@ class TestWhitelistDifferential(SafeTestCaseMixin, TestCase):
                     indexer.start()
                 else:
                     self.fail(f"{indexer.__class__.__name__} did not reach {range_end}")
+                if indexer is safe_events_indexer:
+                    self.after_safe_indexing()
             IndexServiceProvider().process_all_decoded_txs()
             return self.take_snapshots()
 
@@ -305,7 +315,8 @@ class TestWhitelistDifferential(SafeTestCaseMixin, TestCase):
         SafeMasterCopy.objects.update(tx_block_number=range_end + 1)
         IndexingStatus.objects.set_erc20_721_indexing_status(range_end + 1)
         with override_settings(
-            WHITELISTED_SAFES=self.chain.whitelisted_safes, ETH_L2_NETWORK=True
+            WHITELISTED_SAFES=self.chain.whitelisted_safes,
+            ETH_L2_NETWORK=self.L2_NETWORK,
         ):
             for safe_address in sorted(self.chain.whitelisted_safes):
                 call_command(
@@ -321,7 +332,7 @@ class TestWhitelistDifferential(SafeTestCaseMixin, TestCase):
 
     def get_stock(self) -> tuple[Snapshot, Snapshot]:
         # The chain doesn't change, so the stock result can be reused between tests
-        cls = TestWhitelistDifferential
+        cls = type(self)
         if cls.stock is None:
             cls.stock = self.run_live(frozenset())
         return deepcopy(cls.stock)
