@@ -28,6 +28,9 @@ fi
 echo "==> $(date +%H:%M:%S) ==> Check RPC connected matches previously used RPC... "
 python manage.py check_chainid_matches
 
+echo "==> $(date +%H:%M:%S) ==> Check tracing node supports whitelist L1 indexing... "
+python manage.py check_tracing_support
+
 echo "==> $(date +%H:%M:%S) ==> Running Celery worker for queues $WORKER_QUEUES with concurrency $TASK_CONCURRENCY <=="
 exec celery --no-color -A config.celery_app worker \
      --pool=gevent \

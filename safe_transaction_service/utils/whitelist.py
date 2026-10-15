@@ -46,12 +46,16 @@ def parse_whitelisted_safes(values: Iterable[str]) -> frozenset[ChecksumAddress]
 
 
 def validate_whitelist_config(
-    whitelist: frozenset[ChecksumAddress], l2_network: bool
+    whitelist: frozenset[ChecksumAddress],
+    l2_network: bool,
+    tracing_node_url: str | None,
 ) -> None:
     """
     :raises ValueError: if the whitelist is enabled on a non L2 (tracing) network
+        without a tracing node
     """
-    if whitelist and not l2_network:
+    if whitelist and not l2_network and not tracing_node_url:
         raise ValueError(
-            "WHITELISTED_SAFES is only supported with ETH_L2_NETWORK=True (L2 event indexing)"
+            "WHITELISTED_SAFES with ETH_L2_NETWORK=False (L1 trace indexing) requires "
+            "ETHEREUM_TRACING_NODE_URL"
         )

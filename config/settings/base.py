@@ -638,7 +638,9 @@ try:
     WHITELISTED_SAFES = parse_whitelisted_safes(
         env.list("WHITELISTED_SAFES", default=[])
     )  # Only index these Safes. Empty == index every Safe
-    validate_whitelist_config(WHITELISTED_SAFES, ETH_L2_NETWORK)
+    validate_whitelist_config(
+        WHITELISTED_SAFES, ETH_L2_NETWORK, ETHEREUM_TRACING_NODE_URL
+    )
 except ValueError as e:
     raise ImproperlyConfigured(str(e)) from e
 

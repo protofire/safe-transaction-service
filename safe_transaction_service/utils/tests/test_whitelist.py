@@ -77,17 +77,36 @@ class TestParseWhitelistedSafes(TestCase):
 
 
 class TestValidateWhitelistConfig(TestCase):
-    def test_l1_rejected(self):
-        with self.assertRaisesRegex(ValueError, "ETH_L2_NETWORK"):
-            validate_whitelist_config(frozenset({CHECKSUM_ADDRESS}), l2_network=False)
+    def test_l1_without_tracing_node_rejected(self):
+        for tracing_node_url in (None, ""):
+            with (
+                self.subTest(tracing_node_url=tracing_node_url),
+                self.assertRaisesRegex(ValueError, "ETHEREUM_TRACING_NODE_URL"),
+            ):
+                validate_whitelist_config(
+                    frozenset({CHECKSUM_ADDRESS}),
+                    l2_network=False,
+                    tracing_node_url=tracing_node_url,
+                )
+
+    def test_l1_with_tracing_node_accepted(self):
+        validate_whitelist_config(
+            frozenset({CHECKSUM_ADDRESS}),
+            l2_network=False,
+            tracing_node_url="http://tracing-node",
+        )
 
     def test_l2_accepted(self):
-        validate_whitelist_config(frozenset({CHECKSUM_ADDRESS}), l2_network=True)
+        validate_whitelist_config(
+            frozenset({CHECKSUM_ADDRESS}), l2_network=True, tracing_node_url=None
+        )
 
     def test_empty_whitelist_always_valid(self):
         for l2_network in (True, False):
             with self.subTest(l2_network=l2_network):
-                validate_whitelist_config(frozenset(), l2_network=l2_network)
+                validate_whitelist_config(
+                    frozenset(), l2_network=l2_network, tracing_node_url=None
+                )
 
 
 class TestWhitelistSetting(TestCase):
