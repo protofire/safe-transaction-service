@@ -2,6 +2,12 @@
 
 Running log of decisions, deviations, and trade-offs made while implementing
 [`ROLLUPS_AND_PARALLEL_SPEC.md`](./ROLLUPS_AND_PARALLEL_SPEC.md).
+(Update 2026-10-23: that spec file was never committed to this repo, so the link is dead.)
+
+**Status (2026-10-23):** despite the title, this log now covers the whole analytics app:
+Parts 1–10, the catch-up, token holdings (P1–P8), the bootstrap and the backfill-liveness
+hardening, all merged to `staging`. Earlier entries stay as written. Where one is
+superseded, an "(update 2026-10-23: …)" note says so.
 
 ---
 
@@ -10,7 +16,9 @@ Running log of decisions, deviations, and trade-offs made while implementing
 - **§6 "config/settings/base.py (1880)"** — actual file is 810 lines. The
   `ANALYTICS_USE_ROLLUPS` flag is being added near the existing
   `ENABLE_ANALYTICS` flag (~line 55) so it sits with the other analytics
-  feature toggles, not deep in Celery routing.
+  feature toggles, not deep in Celery routing. *(Update 2026-10-23: the flag
+  was later removed and is not in the code. See
+  "`ANALYTICS_USE_ROLLUPS` flag (removed)" below.)*
 - **§4.1 "Reuses existing BALANCE_BATCH_SQL with a `WHERE substring(...)`"**
   — `BALANCE_BATCH_SQL` filters by `ANY(%s)` of explicit address bytes,
   not by raw table scan. Two options:
@@ -52,6 +60,13 @@ All five populators run inside one `relaxed_statement_timeout()` block in
 If one fails the rest still run (per-populator try/except, matching the
 existing per-day try/except pattern in `compute_daily_metrics_task`).
 
+*(Update 2026-10-23: superseded. There are now six populators, which run in
+the order of `catchup/day.py`'s `POPULATORS`: `active_safes`, `active_owners`,
+`token_volume`, `tx_volume`, `safe_app_txs`, `safe_creations`. The
+`DailyMetric` core runs **last** so it can read its daily counts from the
+two membership rollups. The entry point is `_upsert_daily_metric`,
+called via `compute_day`. See Part 2 and "Analytics catch-up".)*
+
 ## §4.2 backfill — chord vs group
 
 Spec shows a `group(...) | _backfill_done.s(stats_key)` which is the celery
@@ -61,6 +76,9 @@ write a small cursor blob — left as a Redis `SET` of the (start, end,
 written, failed) summary so the management command can poll it with
 `--wait` if needed. For now `--inline` falls back to the sequential loop
 for debugging.
+
+*(Update 2026-10-23: Part 3's per-run manifest and per-chunk keys replaced
+the single-cursor shape, and `--wait` no longer uses the result backend.)*
 
 ## Cold-window fallback (§5)
 
@@ -102,7 +120,9 @@ because there's no flag to flip.
   - Idempotency test for the 5-step `compute_daily_metrics_task`.
 - `test_views_v2.py`:
   - For the four affected endpoints, rollup-served path + cold-window
-    fallback exercised under `ANALYTICS_USE_ROLLUPS=True`.
+    fallback exercised. (These were first written against
+    `ANALYTICS_USE_ROLLUPS=True`. The flag is gone and both paths are now
+    unconditional, so the tests need no flag.)
 - `test_backfill_daily_metrics.py`:
   - Group dispatch under eager mode; assert one DailyMetric row per day
     plus rollup rows.
@@ -159,6 +179,12 @@ is now ignored.
 Failure semantics carry over: if `finalize_tvl_snapshot` raises, the
 placeholder snapshot stays, so the endpoint keeps serving a coherent
 zero payload until the next run succeeds.
+
+*(Update 2026-10-23: superseded by Part 8. `compute_tvl_task` now reads the
+native-balance rollup and calls `dispatch_tvl_finalize`, which dispatches
+`finalize_tvl_snapshot` directly. The 16-shard chord (`dispatch_tvl_chord`)
+runs only when the rollup has no watermark yet. The placeholder and its
+failure semantics are unchanged.)*
 
 ### Address-prefix filter in Python (not SQL)
 
@@ -389,7 +415,11 @@ this branch — only the analytics subtree was validated.
   `AnalyticsService` for one release as documentation pointers, then
   deleted. (`REDIS_SAFE_STATISTICS` was removed alongside the
   `/safe-statistics/` endpoint — see plan
-  `robust-wandering-spark.md`.)
+  `robust-wandering-spark.md`.) *(Update 2026-10-23: they were never
+  deleted. All three constants are still defined in
+  `services/analytics_service.py`, and nothing in the app reads or writes
+  them. `warm_analytics_cache --skip-if-fresh` now checks those three
+  snapshots in Postgres instead. See "Snapshots" under "Analytics catch-up".)*
 
 ---
 
@@ -537,6 +567,9 @@ shape.
   only, no DB. `--start/--end` are not required with it.
 - `--failed-only`: restrict the range to days whose `DailyMetric` row is
   missing or has `multisig_txs_via_api IS NULL` (ORM query, no new SQL).
+  *(Update 2026-10-23: superseded by the catch-up work. `select_failed_days`,
+  now in `catchup/day.py`, selects days without `completed_at`. See
+  "Operator recipes" under "Analytics catch-up".)*
   Works with both Celery and `--inline` modes. Prints `k/n days … need
   (re)running`; exits early with `Nothing to do.` when `k = 0`.
 - `--run-id`: optional explicit id (default `YYYYmmddTHHMMSS-<6 hex>`).
@@ -602,6 +635,13 @@ took ~22 min; 6 is a sensible ceiling on `postgres-shared`, go lower if
    and the daily task's own `_upsert_daily_metric` for yesterday can
    interleave with backfill rows. Start heavy backfills after 05:00 UTC and
    size `--chunk-days` × chunk duration so they finish before 01:00.
+   *(Update 2026-10-23: the nightly chain still ends with
+   `compute_safe_creations_task` at 04:30, and the drift checks run on Sundays
+   at 05:00 and 05:15. Three tasks now run outside that chain:
+   `analytics_catchup_task` every hour at :20, and `analytics_bootstrap_tick_task`
+   and `erc20_balance_backfill_watchdog_task` every 5 minutes. On a fresh
+   instance the bootstrap runs the one-time daily backfill by itself, so a
+   backfill run by hand is now an override rather than the default path.)*
 
 ---
 
@@ -1301,7 +1341,7 @@ raise, not a detail to fix quietly.
 
 ## The task lives in `tasks.py`, and that is not cosmetic
 
-`config/settings/base.py` (~line 316) routes only
+`config/settings/base.py` (~line 316; ~lines 345-350 as of 2026-10-23) routes only
 `safe_transaction_service.analytics.tasks.*` and `…tasks_shards.*` to the
 `contracts` queue. A new `tasks_balances.py` would have gone to the
 default queue and been silently never consumed — no error, no log, just a
@@ -1349,7 +1389,9 @@ breaking and must land consumer-first. So:
 - `partial_shards` **stays**, and the rollup path writes `0` — exactly
   what the hub reads as "complete" when it gates USD pricing
   (`collectors/tx_service.py:874-906`) and filters dashboard rows
-  (`dashboard/data.py:710`, `:758`).
+  (`dashboard/data.py:710`, `:758`). (Those hub line numbers are out of date.
+  As of 2026-10-23 the code is `_tvl_row` in `collectors/tx_service.py`
+  and `tvl_latest_by_chain_sql` / `tvl_daily_sql` in `dashboard/data.py`.)
 - `total_shards` **stays** at `0`. The hub reads it nowhere (checked by
   grep), but a key nobody reads is still a key that cannot be removed
   from the producer first.
@@ -1371,7 +1413,11 @@ is additive:
 shape-identical to a warm one.
 
 No hub change is required or included. The hub ignores unknown keys, and
-every key it reads today still means what it meant.
+every key it reads today still means what it meant. *(Update 2026-10-23: the
+hub now stores both keys in two nullable `tvl_snapshot` columns,
+`native_source` and `native_updated_to_block`, for rollout visibility only.
+Nothing on the hub reads them, and `partial_shards` is still the completeness
+signal.)*
 
 ## Backfill: the only place the full recompute still happens
 
@@ -1600,7 +1646,10 @@ The consumer-side guard `test_the_probe_is_sent_on_exactly_three_reads`
 (hub, `tests/test_tx_collector_new_endpoints.py`) asserts the old
 decision and will fail the moment the hub starts probing this endpoint.
 That is the hub PR's job, not this one's; it is named here so the failure
-reads as expected rather than as a surprise.
+reads as expected rather than as a surprise. *(Update 2026-10-23: that hub PR
+has landed. The hub requests `/token-volume/?window=90d&breakdown=day` and
+stores the days in `daily_token_series`. Its guard is now
+`test_the_probe_is_sent_on_exactly_four_reads`.)*
 
 ## Why this endpoint can have a breakdown at all
 
@@ -1818,7 +1867,8 @@ form that 500s in production.
 `analytics_active_safes_<window>` (resp. `…_owners_…`) *first*, via the new
 `_redis_peek`, and serves the cached scalar with the cached `computed_at`.
 That key has existed all along — `compute_daily_metrics_task` →
-`_refresh_active_window_caches` writes it nightly — but the read path only
+`_refresh_active_window_caches` writes it nightly (and `compute_active_safes_task`
+at 02:30 and `compute_active_owners_task` at 02:45 write it again) — but the read path only
 ever consulted it when the rollup was **empty**, so on any populated chain
 it was dead weight. A precomputed number that no request could reach.
 
@@ -1960,7 +2010,8 @@ instead of staying a silent hole. This section covers days. Snapshots
 (`summary` / `safe_segments` / `tvl`) get the same treatment and are
 covered in their own subsection below. It all lives in the new
 `analytics/catchup/` package (`__init__.py`, `day.py`, `gate.py`,
-`state.py`, `sweeper.py`, with `conf.py` as a sibling module) plus targeted
+`state.py`, `sweeper.py`, plus `snapshots.py` for the snapshot sweeper,
+with `conf.py` as a sibling module) plus targeted
 edits to `tasks.py`, `tasks_shards.py`, `models.py`, a new `admin.py`, and
 one beat entry in `history/management/commands/setup_service.py`. Every
 code comment that points a reader here says `"Analytics catch-up" in
@@ -2175,6 +2226,9 @@ with no summary line that run.
 
 The last row is already read and validated (`CatchupSettings` carries all
 seven fields), but nothing consumes it until the snapshot sweeper lands.
+*(Update 2026-10-23: the snapshot sweeper has landed. `SNAPSHOT_STALE_HOURS`
+is read by `sweep_snapshots` in `catchup/snapshots.py` and by
+`warm_analytics_cache --skip-if-fresh`. See "Snapshots" below.)*
 
 ## Divergences from the original design
 
@@ -2631,7 +2685,10 @@ to run it by hand or off-cycle.
 
 No code changes; this section and the workspace `CLAUDE.md` contract table / refresh
 cadence / ownership rows are what P6 delivers (spec §12). H1–H5 (hub storage, fetcher,
-pricing, persistence, dashboard) are a separate repo and a separate PR.
+pricing, persistence, dashboard) are a separate repo and a separate PR. *(Update
+2026-10-23: H1–H5 have landed. `feat/token-holdings` is merged to the hub's `main`
+(`494559c`), which brought `_fetch_token_holdings`, the `token_holdings` table and the
+dashboard tables.)*
 
 ---
 
