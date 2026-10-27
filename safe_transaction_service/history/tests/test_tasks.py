@@ -4,7 +4,7 @@ import json
 import logging
 from unittest.mock import MagicMock, patch
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
 from eth_account import Account
@@ -14,6 +14,7 @@ from safe_transaction_service.events.services import QueueService
 from ...utils.redis import get_redis
 from ..indexers import (
     Erc20EventsIndexerProvider,
+    HederaNativeTransferIndexerProvider,
     InternalTxIndexerProvider,
     SafeEventsIndexerProvider,
 )
@@ -38,6 +39,7 @@ from ..tasks import (
     delete_expired_delegates_task,
     index_erc20_events_out_of_sync_task,
     index_erc20_events_task,
+    index_hedera_native_transfers_task,
     index_internal_txs_task,
     index_new_proxies_task,
     index_safe_events_task,
@@ -410,3 +412,22 @@ class TestTasks(TestCase):
                 delegator=safe_contract_delegate_expected_to_be_deleted.delegator,
             ).exists()
         )
+
+
+class TestIndexHederaNativeTransfersTask(TestCase):
+    def tearDown(self):
+        HederaNativeTransferIndexerProvider.del_singleton()
+
+    @override_settings(HEDERA_MIRROR_NODE_URL=None)
+    def test_no_op_when_mirror_node_url_not_configured(self):
+        self.assertIsNone(index_hedera_native_transfers_task.delay().result)
+
+    @override_settings(HEDERA_MIRROR_NODE_URL="https://testnet.mirrornode.hedera.com")
+    @patch.object(HederaNativeTransferIndexerProvider, "get_new_instance")
+    def test_calls_indexer_and_returns_counts(self, mock_get_new_instance):
+        mock_indexer = MagicMock()
+        mock_indexer.process_all_safes.return_value = (2, 3)
+        mock_get_new_instance.return_value = mock_indexer
+
+        result = index_hedera_native_transfers_task.delay().result
+        self.assertEqual(result, (2, 3))
