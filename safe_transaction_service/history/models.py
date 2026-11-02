@@ -70,6 +70,7 @@ from safe_transaction_service.contracts.models import Contract
 from safe_transaction_service.utils.constants import (
     SIGNATURE_LENGTH as MAX_SIGNATURE_LENGTH,
 )
+from safe_transaction_service.utils.redis import defer_unlink
 
 from .constants import SAFE_PROXY_FACTORY_CREATION_EVENT_TOPIC
 from .utils import clean_receipt_log
@@ -154,8 +155,11 @@ class BulkCreateSignalMixin:
         result = super().bulk_create(
             objs, batch_size=batch_size, ignore_conflicts=ignore_conflicts
         )
-        for obj in objs:
-            post_save.send(obj.__class__, instance=obj, created=True)
+        # Signal receivers remove view caches. Collect the keys and remove them once after commit,
+        # instead of doing Redis round trips for every object
+        with defer_unlink():
+            for obj in objs:
+                post_save.send(obj.__class__, instance=obj, created=True)
         return result
 
     def bulk_create_from_generator(
