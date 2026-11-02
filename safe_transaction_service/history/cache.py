@@ -15,7 +15,7 @@ from safe_transaction_service.history.models import (
     MultisigTransaction,
     TokenTransfer,
 )
-from safe_transaction_service.utils.redis import get_redis, logger
+from safe_transaction_service.utils.redis import get_redis, logger, unlink_keys
 
 
 class CacheSafeTxsView:
@@ -162,6 +162,10 @@ def remove_cache_view_by_instance(
 
     :param instance:
     """
+    if not settings.CACHE_VIEW_DEFAULT_TIMEOUT:
+        # Cache is disabled so there's nothing to remove. Don't waste Redis round trips for every instance stored
+        return None
+
     addresses = []
     cache_tag: str | None = None
     if isinstance(instance, TokenTransfer):
@@ -189,12 +193,14 @@ def remove_cache_view_by_instance(
 
 def remove_cache_view_for_addresses(cache_tag: str, addresses: list[ChecksumAddress]):
     """
-    Remove several cache for the provided cache_tag and addresses
+    Remove several cache for the provided cache_tag and addresses using a single Redis round trip
 
     :param cache_tag:
     :param addresses:
     :return:
     """
-    for address in addresses:
-        cache_safe_txs = CacheSafeTxsView(cache_tag, address)
-        cache_safe_txs.remove_cache()
+    cache_names = [
+        CacheSafeTxsView(cache_tag, address).cache_name for address in addresses
+    ]
+    logger.debug("Removing all the cache for %s", cache_names)
+    unlink_keys(cache_names)
