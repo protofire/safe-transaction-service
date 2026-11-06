@@ -1,4 +1,3 @@
-import hashlib
 import logging
 
 from django.db.models import Q
@@ -30,7 +29,11 @@ from .models import (
     SafeLastStatus,
 )
 from .pagination import DummyPagination
-from .read_permit import PendingTxDetailRedactionMixin, PendingTxListRedactionMixin
+from .read_permit import (
+    PendingTxDetailRedactionMixin,
+    PendingTxListRedactionMixin,
+    get_weak_etag,
+)
 from .services import BalanceServiceProvider, TransactionServiceProvider
 from .services.balance_service import Balance
 from .services.collectibles_service import CollectiblesServiceProvider
@@ -633,10 +636,7 @@ class AllTransactionsListView(PendingTxListRedactionMixin, ListAPIView):
             )
 
         response = super().get(request, *args, **kwargs)
-        response.setdefault(
-            "ETag",
-            "W/" + hashlib.md5(str(response.data["results"]).encode()).hexdigest(),
-        )
+        response.setdefault("ETag", get_weak_etag(response.data["results"]))
         return response
 
 

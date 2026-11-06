@@ -112,6 +112,7 @@ To hide pending (unexecuted) multisig transaction details from callers that are 
 In `log` and `enforce` modes the service sets `Vary: Authorization` and `Cache-Control: private, no-store` on the pending-tx endpoints. In `off` mode headers are unchanged.
 A shared HTTP cache or CDN must honour `Cache-Control` for these paths. Do not use nginx `proxy_ignore_headers Cache-Control`, and keep the CDN minimum TTL at 0. Purge entries cached before this change.
 With `no-store`, the list, detail and confirmations endpoints no longer send an automatic ETag, so there is no 304 reply.
+The all-transactions endpoints (v1 and v2) still send a quoted weak ETag (`W/"<md5>"`), so `If-None-Match` returns 304. In `enforce` mode the ETag comes from the redacted body, so callers that are not owners get a different ETag from the owner.
 
 For more parameters check [base.py](config/settings/base.py) file.
 

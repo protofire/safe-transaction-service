@@ -173,6 +173,10 @@ def redact_pending_row(row: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def get_weak_etag(results) -> str:
+    return 'W/"' + hashlib.md5(str(results).encode()).hexdigest() + '"'
+
+
 def patch_pending_tx_cache_headers(response):
     # The body depends on `Authorization`: shared caches (proxy, CDN) must not store it
     if settings.PENDING_TX_REDACTION_MODE != "off":
@@ -225,9 +229,7 @@ class PendingTxListRedactionMixin:
             if enforce:
                 response.data = {**response.data, "results": results}
                 if response.has_header("ETag"):
-                    response["ETag"] = (
-                        "W/" + hashlib.md5(str(results).encode()).hexdigest()
-                    )
+                    response["ETag"] = get_weak_etag(results)
         return patch_pending_tx_cache_headers(
             super().finalize_response(request, response, *args, **kwargs)
         )

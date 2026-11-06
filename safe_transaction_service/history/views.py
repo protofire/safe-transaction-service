@@ -1,4 +1,3 @@
-import hashlib
 import logging
 from typing import Any
 
@@ -62,6 +61,7 @@ from .read_permit import (
     PendingTxConfirmationsRedactionMixin,
     PendingTxDetailRedactionMixin,
     PendingTxListRedactionMixin,
+    get_weak_etag,
 )
 from .serializers import SafeExportTransactionRequestParams, get_data_decoded_from_data
 from .services import (
@@ -418,10 +418,7 @@ class AllTransactionsListView(PendingTxListRedactionMixin, ListAPIView):
             )
 
         response = super().get(request, *args, **kwargs)
-        response.setdefault(
-            "ETag",
-            "W/" + hashlib.md5(str(response.data["results"]).encode()).hexdigest(),
-        )
+        response.setdefault("ETag", get_weak_etag(response.data["results"]))
         return response
 
 

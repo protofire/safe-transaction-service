@@ -237,6 +237,19 @@ class TestPendingTxRedaction(SafeTestCaseMixin, APITestCase):
         self.assertTrue(executed_row["is_executed"])
         self.assertEqual(executed_row["data"], to_0x_hex_str(SRC20_BARE_TRANSFER))
 
+    def create_listed_pending_tx(self):
+        # Sent to the mempool but not mined: listed but not executed
+        self.pending_tx = MultisigTransactionFactory(
+            safe=self.safe_address, data=SRC20_BARE_TRANSFER, trusted=True
+        )
+        EthereumTx.objects.filter(tx_hash=self.pending_tx.ethereum_tx_id).update(
+            block=None
+        )
+        MultisigConfirmationFactory(
+            multisig_transaction=self.pending_tx,
+            force_sign_with_account=self.owner,
+        )
+
     def test_mode_off_is_unchanged(self):
         for url in self.list_urls():
             self.assert_full(self.get(url))
@@ -290,17 +303,7 @@ class TestPendingTxRedaction(SafeTestCaseMixin, APITestCase):
 
     @override_settings(PENDING_TX_REDACTION_MODE="enforce")
     def test_enforce_all_transactions(self):
-        # Sent to the mempool but not mined: listed but not executed
-        self.pending_tx = MultisigTransactionFactory(
-            safe=self.safe_address, data=SRC20_BARE_TRANSFER, trusted=True
-        )
-        EthereumTx.objects.filter(tx_hash=self.pending_tx.ethereum_tx_id).update(
-            block=None
-        )
-        MultisigConfirmationFactory(
-            multisig_transaction=self.pending_tx,
-            force_sign_with_account=self.owner,
-        )
+        self.create_listed_pending_tx()
         for version in ("v1", "v2"):
             url = reverse(f"{version}:history:all-transactions", args=(self.safe_address,))
             with self.subTest(url=url):
@@ -468,11 +471,67 @@ class TestPendingTxRedaction(SafeTestCaseMixin, APITestCase):
                 self.assertEqual(response.status_code, status.HTTP_200_OK)
                 self.assertTrue(response.has_header("ETag"))
                 conditional = self.client.get(url, HTTP_IF_NONE_MATCH=response["ETag"])
-                # shortcut: no 304 assertion, the unquoted `W/<md5>` ETag of the view never
-                # matches `If-None-Match`; assert 304 once the ETag is quoted
+                self.assertEqual(
+                    conditional.status_code, status.HTTP_304_NOT_MODIFIED
+                )
                 self.assertEqual(conditional["ETag"], response["ETag"])
                 self.assert_shared_cache_headers(
                     conditional, self.header_values(response, "Vary")
+                )
+
+    def all_transactions_urls(self):
+        return [
+            reverse(f"{version}:history:all-transactions", args=(self.safe_address,))
+            for version in ("v1", "v2")
+        ]
+
+    def test_etag_is_quoted_weak(self):
+        for url in self.all_transactions_urls():
+            with self.subTest(url=url):
+                self.assertRegex(self.get(url)["ETag"], r'^W/"[0-9a-f]{32}"$')
+
+    def test_not_modified_in_every_mode(self):
+        for mode in ("off", "log", "enforce"):
+            for url in self.all_transactions_urls():
+                with self.subTest(url=url, mode=mode):
+                    with override_settings(PENDING_TX_REDACTION_MODE=mode):
+                        response = self.get(url)
+                        self.assertRegex(response["ETag"], r'^W/"[0-9a-f]{32}"$')
+                        conditional = self.client.get(
+                            url, HTTP_IF_NONE_MATCH=response["ETag"]
+                        )
+                        self.assertEqual(
+                            conditional.status_code, status.HTTP_304_NOT_MODIFIED
+                        )
+                        self.assertEqual(conditional["ETag"], response["ETag"])
+                        if mode == "off":
+                            self.assertFalse(conditional.has_header("Cache-Control"))
+                        else:
+                            self.assert_shared_cache_headers(
+                                conditional, self.header_values(response, "Vary")
+                            )
+
+    @override_settings(PENDING_TX_REDACTION_MODE="enforce")
+    def test_etag_does_not_leak_across_callers(self):
+        self.create_listed_pending_tx()
+        for url in self.all_transactions_urls():
+            with self.subTest(url=url):
+                owner_response = self.get(url, self.owner_permit())
+                anonymous_response = self.get(url)
+                self.assertNotEqual(owner_response["ETag"], anonymous_response["ETag"])
+                # The owner's ETag must not validate the redacted body
+                replay = self.client.get(
+                    url, HTTP_IF_NONE_MATCH=owner_response["ETag"]
+                )
+                self.assert_redacted(replay)
+                # The owner still gets 304 for the owner's ETag
+                owner_conditional = self.client.get(
+                    url,
+                    HTTP_IF_NONE_MATCH=owner_response["ETag"],
+                    HTTP_AUTHORIZATION=self.owner_permit(),
+                )
+                self.assertEqual(
+                    owner_conditional.status_code, status.HTTP_304_NOT_MODIFIED
                 )
 
     @override_settings(
