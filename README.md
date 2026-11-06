@@ -101,6 +101,16 @@ Configure the parameters needed on `.env`. These parameters **need to be changed
 If you don't want to use `trace_filter` for the internal tx indexing and just rely on `trace_block`, set:
 - `ETH_INTERNAL_NO_FILTER=1`
 
+To hide pending (unexecuted) multisig transaction details from callers that are not Safe owners
+(owners send `Authorization: Bearer <read permit>`, an EIP-712 `ReadPermit` signed by the owner):
+- `PENDING_TX_REDACTION_MODE`: `off` (default), `log` or `enforce`.
+- `SRC20_BARE_TRANSFER_RULE`: `warn` (default), `off` or `enforce`. `enforce` rejects bare SRC20 transfers with 422.
+- `READ_PERMIT_DOMAIN_NAME`: EIP-712 domain name for read permits. Set a value per environment.
+- `READ_PERMIT_MAX_TTL_SECONDS` (default `86400`) and `READ_PERMIT_OWNERS_CACHE_SECONDS` (default `60`).
+- `TX_SERVICE_READ_SERVICE_KEYS`: comma-separated bearer tokens with full read access.
+
+Responses vary by `Authorization`. A shared HTTP cache or CDN must send `Vary: Authorization` or not cache these endpoints.
+
 For more parameters check [base.py](config/settings/base.py) file.
 
 Then:

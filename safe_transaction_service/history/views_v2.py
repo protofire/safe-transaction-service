@@ -30,6 +30,7 @@ from .models import (
     SafeLastStatus,
 )
 from .pagination import DummyPagination
+from .read_permit import PendingTxDetailRedactionMixin, PendingTxListRedactionMixin
 from .services import BalanceServiceProvider, TransactionServiceProvider
 from .services.balance_service import Balance
 from .services.collectibles_service import CollectiblesServiceProvider
@@ -309,7 +310,7 @@ class SafeBalanceView(GenericAPIView):
 @extend_schema(
     tags=["transactions"],
 )
-class SafeMultisigTransactionDetailView(RetrieveAPIView):
+class SafeMultisigTransactionDetailView(PendingTxDetailRedactionMixin, RetrieveAPIView):
     """
     Returns a multi-signature transaction given its Safe transaction hash
     """
@@ -372,7 +373,7 @@ class SafeMultisigTransactionDetailView(RetrieveAPIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class SafeMultisigTransactionListView(ListAPIView):
+class SafeMultisigTransactionListView(PendingTxListRedactionMixin, ListAPIView):
     filter_backends = (
         django_filters.rest_framework.DjangoFilterBackend,
         OrderingFilter,
@@ -484,8 +485,9 @@ class SafeMultisigTransactionListView(ListAPIView):
         request.data["safe"] = address
         serializer = self.get_serializer(data=request.data)
         logger.info(
-            "Creating MultisigTransaction",
-            extra={"http_request": http_request_log(request, log_data=True)},
+            "Creating MultisigTransaction safe_tx_hash=%s",
+            request.data.get("contract_transaction_hash"),
+            extra={"http_request": http_request_log(request)},
         )
         if not serializer.is_valid():
             return Response(
@@ -496,7 +498,7 @@ class SafeMultisigTransactionListView(ListAPIView):
             return Response(status=status.HTTP_201_CREATED)
 
 
-class AllTransactionsListView(ListAPIView):
+class AllTransactionsListView(PendingTxListRedactionMixin, ListAPIView):
     filter_backends = (
         django_filters.rest_framework.DjangoFilterBackend,
         OrderingFilter,

@@ -73,9 +73,12 @@ def build_event_payload(
             #  'type': None,  It will be assigned later
             "safeTxHash": to_0x_hex_str(HexBytes(instance.safe_tx_hash)),
             "to": instance.to,
-            "data": to_0x_hex_str(HexBytes(instance.data)) if instance.data else None,
         }
         if instance.executed:
+            # Pending txs must not leak calldata, only executed ones (already public) carry it
+            payload["data"] = (
+                to_0x_hex_str(HexBytes(instance.data)) if instance.data else None
+            )
             payload["type"] = (
                 TransactionServiceEventType.EXECUTED_MULTISIG_TRANSACTION.name
             )

@@ -57,6 +57,7 @@ from .models import (
     SafeContractDelegate,
     TransferDict,
 )
+from .read_permit import contains_bare_src20_transfer
 from .services.safe_service import SafeCreationInfo
 
 logger = logging.getLogger(__name__)
@@ -231,6 +232,22 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
                 f"does not match provided contract-tx-hash={to_0x_hex_str(attrs['contract_transaction_hash'])}"
             )
 
+        if (
+            settings.SRC20_BARE_TRANSFER_RULE != "off"
+            and attrs["base_gas"] == 0
+            and contains_bare_src20_transfer(attrs["data"])
+        ):
+            logger.warning(
+                "Bare SRC20 transfer proposed for safe=%s safe-tx-hash=%s",
+                safe_address,
+                to_0x_hex_str(safe_tx_hash),
+            )
+            if settings.SRC20_BARE_TRANSFER_RULE == "enforce":
+                raise ValidationError(
+                    "Bare SRC20 transfer, its amount can be recovered from safeTxHash: "
+                    "add a random salt to calldata or a random baseGas"
+                )
+
         # Check there's not duplicated tx with same `nonce` or same `safeTxHash` for the same Safe.
         # We allow duplicated if existing tx is not executed
         multisig_transactions = MultisigTransaction.objects.filter(
@@ -368,7 +385,11 @@ class SafeMultisigTransactionSerializer(SafeMultisigTxSerializer):
         logger.info(
             f"MultisigTransaction {'Created' if created else 'Updated'}",
             extra={
-                "extra_data": multisig_transaction.to_dict(),
+                "extra_data": {
+                    key: value
+                    for key, value in multisig_transaction.to_dict().items()
+                    if key != "data"
+                },
             },
         )
 

@@ -5,6 +5,8 @@ Base settings to build other settings files upon.
 import logging
 from pathlib import Path
 
+from django.core.exceptions import ImproperlyConfigured
+
 import environ
 from corsheaders.defaults import default_headers as default_cors_headers
 from eth_typing import ChecksumAddress, HexAddress, HexStr
@@ -375,6 +377,7 @@ REST_FRAMEWORK = {
         # 'rest_framework.authentication.BasicAuthentication',
         "rest_framework.authentication.SessionAuthentication",
         "rest_framework.authentication.TokenAuthentication",
+        "safe_transaction_service.history.read_permit.OwnerPermitAuthentication",
     ),
     "DEFAULT_VERSIONING_CLASS": "rest_framework.versioning.NamespaceVersioning",
     "ALLOWED_VERSIONS": ["v1", "v2"],
@@ -846,3 +849,22 @@ BANNED_EOAS: set[ChecksumAddress] = {
 DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION = env.bool(
     "DISABLE_CREATION_MULTISIG_TRANSACTIONS_WITH_DELEGATE_CALL_OPERATION", default=False
 )
+
+# Pending multisig txs read access (owner ReadPermit / service keys)
+# ------------------------------------------------------------------------------
+PENDING_TX_REDACTION_MODE = env.str("PENDING_TX_REDACTION_MODE", default="off").lower()
+if PENDING_TX_REDACTION_MODE not in ("off", "log", "enforce"):
+    raise ImproperlyConfigured("PENDING_TX_REDACTION_MODE must be off, log or enforce")
+READ_PERMIT_DOMAIN_NAME = env.str(
+    "READ_PERMIT_DOMAIN_NAME", default="Safe Transaction Service ReadPermit"
+)
+READ_PERMIT_MAX_TTL_SECONDS = env.int("READ_PERMIT_MAX_TTL_SECONDS", default=86400)
+READ_PERMIT_OWNERS_CACHE_SECONDS = env.int(
+    "READ_PERMIT_OWNERS_CACHE_SECONDS", default=60
+)
+TX_SERVICE_READ_SERVICE_KEYS = [
+    key for key in env.list("TX_SERVICE_READ_SERVICE_KEYS", default=[]) if key
+]
+SRC20_BARE_TRANSFER_RULE = env.str("SRC20_BARE_TRANSFER_RULE", default="warn").lower()
+if SRC20_BARE_TRANSFER_RULE not in ("off", "warn", "enforce"):
+    raise ImproperlyConfigured("SRC20_BARE_TRANSFER_RULE must be off, warn or enforce")
