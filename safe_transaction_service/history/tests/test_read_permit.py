@@ -381,6 +381,100 @@ class TestPendingTxRedaction(SafeTestCaseMixin, APITestCase):
                 self.assertIn(to_0x_hex_str(SRC20_BARE_TRANSFER), str(cached))
                 self.assert_full(self.get(url, self.owner_permit()))
 
+    def header_values(self, response, name: str) -> set[str]:
+        return {
+            value.strip().lower()
+            for value in response.get(name, "").split(",")
+            if value.strip()
+        }
+
+    def assert_shared_cache_headers(self, response, base_vary: set[str]):
+        self.assertLessEqual(
+            base_vary | {"authorization"}, self.header_values(response, "Vary")
+        )
+        self.assertLessEqual(
+            {"private", "no-store"}, self.header_values(response, "Cache-Control")
+        )
+
+    @override_settings(TX_SERVICE_READ_SERVICE_KEYS=["service-key"])
+    def test_shared_cache_headers(self):
+        missing_hash = to_0x_hex_str(fast_keccak_text("missing"))
+        urls = {
+            "v1 confirmations": reverse(
+                "v1:history:multisig-transaction-confirmations",
+                args=(self.pending_tx.safe_tx_hash,),
+            )
+        }
+        for version in ("v1", "v2"):
+            urls.update(
+                {
+                    f"{version} list": reverse(
+                        f"{version}:history:multisig-transactions",
+                        args=(self.safe_address,),
+                    ),
+                    f"{version} all-transactions": reverse(
+                        f"{version}:history:all-transactions",
+                        args=(self.safe_address,),
+                    ),
+                    # 404 for anonymous callers in enforce mode
+                    f"{version} pending detail": reverse(
+                        f"{version}:history:multisig-transaction",
+                        args=(self.pending_tx.safe_tx_hash,),
+                    ),
+                    f"{version} executed detail": reverse(
+                        f"{version}:history:multisig-transaction",
+                        args=(self.executed_tx.safe_tx_hash,),
+                    ),
+                    f"{version} missing detail": reverse(
+                        f"{version}:history:multisig-transaction", args=(missing_hash,)
+                    ),
+                }
+            )
+        callers = {
+            "anonymous": None,
+            "owner": self.owner_permit(),
+            "service": "Bearer service-key",
+        }
+        for name, url in urls.items():
+            for caller, authorization in callers.items():
+                off = self.get(url, authorization)
+                base_vary = self.header_values(off, "Vary")
+                with self.subTest(url=name, caller=caller, mode="off"):
+                    self.assertNotIn("authorization", base_vary)
+                    self.assertFalse(off.has_header("Cache-Control"))
+                for mode in ("log", "enforce"):
+                    with self.subTest(url=name, caller=caller, mode=mode):
+                        with override_settings(PENDING_TX_REDACTION_MODE=mode):
+                            response = self.get(url, authorization)
+                            self.assert_shared_cache_headers(response, base_vary)
+                            if name == "v1 confirmations":
+                                # HEAD is not tested: the view has no serializer for HEAD
+                                self.assert_shared_cache_headers(
+                                    self.client.post(url, {}, format="json"), set()
+                                )
+                            else:
+                                self.assert_shared_cache_headers(
+                                    self.head(url, authorization), base_vary
+                                )
+
+    @override_settings(PENDING_TX_REDACTION_MODE="enforce")
+    def test_shared_cache_headers_not_modified(self):
+        for version in ("v1", "v2"):
+            url = reverse(
+                f"{version}:history:all-transactions", args=(self.safe_address,)
+            )
+            with self.subTest(url=url):
+                response = self.get(url)
+                self.assertEqual(response.status_code, status.HTTP_200_OK)
+                self.assertTrue(response.has_header("ETag"))
+                conditional = self.client.get(url, HTTP_IF_NONE_MATCH=response["ETag"])
+                # shortcut: no 304 assertion, the unquoted `W/<md5>` ETag of the view never
+                # matches `If-None-Match`; assert 304 once the ETag is quoted
+                self.assertEqual(conditional["ETag"], response["ETag"])
+                self.assert_shared_cache_headers(
+                    conditional, self.header_values(response, "Vary")
+                )
+
     @override_settings(
         CACHES={"default": {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}}
     )

@@ -109,7 +109,9 @@ To hide pending (unexecuted) multisig transaction details from callers that are 
 - `READ_PERMIT_MAX_TTL_SECONDS` (default `86400`) and `READ_PERMIT_OWNERS_CACHE_SECONDS` (default `60`).
 - `TX_SERVICE_READ_SERVICE_KEYS`: comma-separated bearer tokens with full read access.
 
-Responses vary by `Authorization`. A shared HTTP cache or CDN must send `Vary: Authorization` or not cache these endpoints.
+In `log` and `enforce` modes the service sets `Vary: Authorization` and `Cache-Control: private, no-store` on the pending-tx endpoints. In `off` mode headers are unchanged.
+A shared HTTP cache or CDN must honour `Cache-Control` for these paths. Do not use nginx `proxy_ignore_headers Cache-Control`, and keep the CDN minimum TTL at 0. Purge entries cached before this change.
+With `no-store`, the list, detail and confirmations endpoints no longer send an automatic ETag, so there is no 304 reply.
 
 For more parameters check [base.py](config/settings/base.py) file.
 

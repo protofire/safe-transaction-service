@@ -17,6 +17,7 @@ from django.conf import settings
 from django.contrib.auth.models import AnonymousUser
 from django.core.cache import cache as django_cache
 from django.http import Http404
+from django.utils.cache import patch_cache_control, patch_vary_headers
 
 from eth_typing import ChecksumAddress
 from hexbytes import HexBytes
@@ -172,6 +173,14 @@ def redact_pending_row(row: dict[str, Any]) -> dict[str, Any]:
     return redacted
 
 
+def patch_pending_tx_cache_headers(response):
+    # The body depends on `Authorization`: shared caches (proxy, CDN) must not store it
+    if settings.PENDING_TX_REDACTION_MODE != "off":
+        patch_vary_headers(response, ("Authorization",))
+        patch_cache_control(response, private=True, no_store=True)
+    return response
+
+
 class PendingTxListRedactionMixin:
     """
     Redacts unexecuted multisig rows of paginated responses for non entitled callers.
@@ -219,7 +228,9 @@ class PendingTxListRedactionMixin:
                     response["ETag"] = (
                         "W/" + hashlib.md5(str(results).encode()).hexdigest()
                     )
-        return super().finalize_response(request, response, *args, **kwargs)
+        return patch_pending_tx_cache_headers(
+            super().finalize_response(request, response, *args, **kwargs)
+        )
 
 
 class PendingTxConfirmationsRedactionMixin(PendingTxListRedactionMixin):
@@ -271,6 +282,11 @@ class PendingTxDetailRedactionMixin:
                     f"No {MultisigTransaction._meta.object_name} matches the given query."
                 )
         return multisig_tx
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        return patch_pending_tx_cache_headers(
+            super().finalize_response(request, response, *args, **kwargs)
+        )
 
 
 def contains_bare_src20_transfer(data: bytes | None) -> bool:
