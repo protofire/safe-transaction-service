@@ -9,6 +9,7 @@ from django.test import TestCase
 
 from django_celery_beat.models import PeriodicTask
 from eth_account import Account
+from hexbytes import HexBytes
 from safe_eth.eth.account_abstraction import BundlerClient
 from safe_eth.eth.ethereum_client import EthereumClient, EthereumNetwork
 from safe_eth.safe import Safe
@@ -17,6 +18,7 @@ from safe_eth.util.util import to_0x_hex_str
 
 from ..indexers import Erc20EventsIndexer, InternalTxIndexer, SafeEventsIndexer
 from ..models import (
+    EthereumTx,
     IndexingStatus,
     InternalTxDecoded,
     ProxyFactory,
@@ -26,6 +28,7 @@ from ..models import (
 from ..services import IndexServiceProvider
 from ..tasks import logger as task_logger
 from .factories import (
+    EthereumTxFactory,
     MultisigConfirmationFactory,
     MultisigTransactionFactory,
     SafeContractFactory,
@@ -741,3 +744,49 @@ class TestCommands(SafeTestCaseMixin, TestCase):
         )
         self.assertNotIn("is not matching", text)
         self.assertNotIn("is not valid for multisig transaction", text)
+
+    @mock.patch(
+        "safe_transaction_service.history.management.commands.fix_ethereum_logs.get_auto_ethereum_client"
+    )
+    def test_fix_ethereum_logs_skips_synthetic_null_logs_rows(
+        self, get_auto_ethereum_client_mock
+    ):
+        # A synthetic EthereumTx (e.g. a Hedera native transfer) has
+        # logs=None, not logs=[] — its tx_hash was never a real on-chain
+        # transaction, so get_transaction_receipts would return None for
+        # it and crash the command. It must be excluded from the queryset
+        # entirely, never even included in the batched RPC call.
+        synthetic_tx = EthereumTxFactory(logs=None)
+        real_tx_missing_address = EthereumTxFactory(
+            logs=[{"data": "0x1234", "topics": []}]
+        )
+
+        ethereum_client_mock = MagicMock()
+        ethereum_client_mock.get_transaction_receipts.return_value = [
+            {
+                "logs": [
+                    {
+                        "address": "0xabc",
+                        "data": HexBytes("0x1234"),
+                        "topics": [],
+                    }
+                ]
+            }
+        ]
+        get_auto_ethereum_client_mock.return_value = ethereum_client_mock
+
+        call_command("fix_ethereum_logs")
+
+        called_tx_hashes = ethereum_client_mock.get_transaction_receipts.call_args[0][
+            0
+        ]
+        self.assertEqual(called_tx_hashes, [real_tx_missing_address.tx_hash])
+
+        synthetic_tx.refresh_from_db()
+        self.assertIsNone(synthetic_tx.logs)
+
+        real_tx_missing_address.refresh_from_db()
+        self.assertEqual(
+            real_tx_missing_address.logs,
+            [{"address": "0xabc", "data": "0x1234", "topics": []}],
+        )

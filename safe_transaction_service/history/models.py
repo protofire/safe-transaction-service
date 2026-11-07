@@ -145,6 +145,10 @@ class TransferDict(TypedDict):
     # Next parameters will be used to build a unique transfer id
     _log_index: int
     _trace_address: str
+    # Real Hedera `transaction_id`, only set for synthetic Hedera-native
+    # transfers (see EthereumTx.hedera_transaction_id). Always `None` for
+    # token transfers.
+    hedera_transaction_id: str | None
 
 
 class BulkCreateSignalMixin:
@@ -449,6 +453,13 @@ class EthereumTx(TimeStampedModel):
     to = EthereumAddressBinaryField(null=True)
     value = Uint256Field()
     type = models.PositiveSmallIntegerField(default=0)
+    # Real Hedera `transaction_id` (e.g. "0.0.X-<seconds>-<nanos>") for
+    # synthetic Hedera-native-transfer rows. `tx_hash` for these rows is a
+    # service-generated placeholder (no real EVM transaction was ever
+    # submitted), so it can't be looked up on a Hedera block explorer.
+    # This field carries the real, explorer-resolvable identifier through
+    # to the API. Always `None` for ordinary EVM transactions.
+    hedera_transaction_id = models.CharField(max_length=64, null=True, default=None)
 
     def __str__(self):
         return f"{self.tx_hash} status={self.status} from={self._from} to={self.to}"
@@ -457,7 +468,14 @@ class EthereumTx(TimeStampedModel):
     def execution_date(self) -> datetime.datetime | None:
         if self.block_id is not None:
             return self.block.timestamp
-        return None
+        # Synthetic EthereumTx rows (Hedera native transfers indexed
+        # before their resolved block number has a corresponding
+        # EthereumBlock row) have no linked block. Fall back to the
+        # InternalTx leg's own timestamp, which is always set directly
+        # from the real source of truth (e.g. Mirror Node's
+        # consensus_timestamp) regardless of whether `block` is linked.
+        internal_tx = self.internal_txs.first()
+        return internal_tx.timestamp if internal_tx else None
 
     @property
     def success(self) -> bool | None:
@@ -542,6 +560,7 @@ class TokenTransferQuerySet(models.QuerySet):
             "execution_date",
             "_token_id",
             "token_address",
+            "hedera_transaction_id",
             "_log_index",
         ]
         return erc20_queryset.values(*values).union(
@@ -665,6 +684,10 @@ class ERC20TransferQuerySet(TokenTransferQuerySet):
             token_address=F("address"),
             _log_index=F("log_index"),
             _trace_address=RawSQL("NULL", ()),
+            # Native HBAR transfers are only ever stored as `InternalTx`, so token
+            # transfers never carry a Hedera transaction id (and must not JOIN
+            # `history_ethereumtx` just to read a NULL)
+            hedera_transaction_id=RawSQL("NULL::varchar", ()),
         )
 
 
@@ -783,6 +806,7 @@ class ERC721TransferQuerySet(TokenTransferQuerySet):
             token_address=F("address"),
             _log_index=F("log_index"),
             _trace_address=RawSQL("NULL", ()),
+            hedera_transaction_id=RawSQL("NULL::varchar", ()),
         )
 
 
@@ -1009,7 +1033,19 @@ class InternalTxQuerySet(models.QuerySet):
             token_address=Value(None, output_field=EthereumAddressBinaryField()),
             _log_index=RawSQL("NULL::numeric", ()),
             _trace_address=F("trace_address"),
+            hedera_transaction_id=self._hedera_transaction_id_expression(),
         )
+
+    @staticmethod
+    def _hedera_transaction_id_expression():
+        """
+        Only Hedera deployments (with native transfer indexing enabled) can have
+        synthetic `EthereumTx` rows with a `hedera_transaction_id`. Avoid the
+        extra JOIN with `history_ethereumtx` for every other chain.
+        """
+        if settings.HEDERA_MIRROR_NODE_URL:
+            return F("ethereum_tx__hedera_transaction_id")
+        return RawSQL("NULL::varchar", ())
 
     def ether_txs_for_address(self, address: str):
         return self.ether_txs().filter(Q(to=address) | Q(_from=address))
@@ -1027,6 +1063,7 @@ class InternalTxQuerySet(models.QuerySet):
             "execution_date",
             "_token_id",
             "token_address",
+            "hedera_transaction_id",
         ]
         erc20_queryset = ERC20Transfer.objects.token_txs()
         erc721_queryset = ERC721Transfer.objects.token_txs()
@@ -1046,6 +1083,7 @@ class InternalTxQuerySet(models.QuerySet):
             "execution_date",
             "_token_id",
             "token_address",
+            "hedera_transaction_id",
         ]
         erc20_queryset = ERC20Transfer.objects.incoming(address).token_txs()
         erc721_queryset = ERC721Transfer.objects.incoming(address).token_txs()
@@ -1086,6 +1124,7 @@ class InternalTxQuerySet(models.QuerySet):
             "execution_date",
             "_token_id",
             "token_address",
+            "hedera_transaction_id",
             "_log_index",
             "_trace_address",
         ]
@@ -1113,6 +1152,7 @@ class InternalTxQuerySet(models.QuerySet):
             "execution_date",
             "_token_id",
             "token_address",
+            "hedera_transaction_id",
             "_log_index",
             "_trace_address",
         ]
@@ -1137,6 +1177,7 @@ class InternalTxQuerySet(models.QuerySet):
             "execution_date",
             "_token_id",
             "token_address",
+            "hedera_transaction_id",
             "_log_index",
             "_trace_address",
         ]
@@ -2239,6 +2280,29 @@ class SafeRelevantTransaction(models.Model):
                 safe=event_data["args"]["to"],
             ),
         ]
+
+
+class HederaSafeTransferCursor(models.Model):
+    """
+    Tracks, per Safe, the Hedera account id it maps to and how far native
+    (non-EVM) HBAR transfer indexing has progressed for it.
+    """
+
+    safe_contract = models.OneToOneField(
+        SafeContract,
+        on_delete=models.CASCADE,
+        primary_key=True,
+        related_name="hedera_transfer_cursor",
+    )
+    hedera_account_id = models.CharField(max_length=32, null=True, blank=True)
+    last_consensus_timestamp = models.CharField(max_length=32, null=True, blank=True)
+    updated = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return (
+            f"Hedera transfer cursor for safe={self.safe_contract_id} "
+            f"account={self.hedera_account_id}"
+        )
 
 
 class SafeStatusBase(models.Model):
