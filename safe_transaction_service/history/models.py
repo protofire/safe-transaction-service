@@ -932,6 +932,35 @@ class InternalTxManager(BulkCreateSignalMixin, models.Manager):
             logger.debug("No InternalTx to store")
             return []
 
+        # Skip already stored InternalTxs (e.g. a reindex) to avoid a failing bulk insert
+        # and the slow one by one fallback. `HexBytes` normalizes `bytes`/`0x` str ethereum_tx ids
+        def key(internal_tx: "InternalTx") -> tuple[bytes, str]:
+            return (
+                bytes(HexBytes(internal_tx.ethereum_tx_id)),
+                internal_tx.trace_address,
+            )
+
+        existing_keys = {
+            (bytes(HexBytes(ethereum_tx_id)), trace_address)
+            for ethereum_tx_id, trace_address in self.filter(
+                ethereum_tx_id__in={key(internal_tx)[0] for internal_tx in internal_txs}
+            ).values_list("ethereum_tx_id", "trace_address")
+        }
+        if existing_keys:
+            internal_txs = [
+                internal_tx
+                for internal_tx in internal_txs
+                if key(internal_tx) not in existing_keys
+            ]
+            internal_txs_decoded = [
+                internal_tx_decoded
+                for internal_tx_decoded in internal_txs_decoded
+                if key(internal_tx_decoded.internal_tx) not in existing_keys
+            ]
+            if not internal_txs:
+                logger.debug("All InternalTx are already stored")
+                return []
+
         logger.debug(
             "Inserting %d InternalTx and %d InternalTxDecoded",
             len(internal_txs),
