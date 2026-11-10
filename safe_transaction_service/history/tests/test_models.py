@@ -10,6 +10,7 @@ from django.test import TestCase
 from django.utils import timezone
 
 from eth_account import Account
+from hexbytes import HexBytes
 from safe_eth.eth.utils import fast_keccak_text
 from safe_eth.safe.safe_signature import SafeSignatureType
 
@@ -713,6 +714,70 @@ class TestInternalTx(TestCase):
             InternalTx.objects.bulk_create(
                 internal_txs
             )  # Cannot bulk create again first 2 transactions
+
+    def test_store_internal_txs_and_decoded_in_db_skips_existing(self):
+        existing_decoded = InternalTxDecodedFactory(internal_tx__trace_address="0")
+        existing_not_decoded = InternalTxFactory(trace_address="1")
+        # Same ethereum_tx, different trace_address, so it's new
+        new_same_tx = InternalTxFactory.build(
+            ethereum_tx=existing_decoded.internal_tx.ethereum_tx, trace_address="2"
+        )
+        duplicate_decoded = InternalTxFactory.build(
+            ethereum_tx=existing_decoded.internal_tx.ethereum_tx, trace_address="0"
+        )
+        duplicate_decoded.ethereum_tx_id = HexBytes(duplicate_decoded.ethereum_tx_id)
+        duplicate_not_decoded = InternalTxFactory.build(
+            ethereum_tx=existing_not_decoded.ethereum_tx, trace_address="1"
+        )
+        new_with_decoded = InternalTxFactory.build(
+            ethereum_tx=EthereumTxFactory(), trace_address="0"
+        )
+        new_without_decoded = InternalTxFactory.build(
+            ethereum_tx=EthereumTxFactory(), trace_address="0"
+        )
+        internal_txs = [
+            duplicate_decoded,
+            duplicate_not_decoded,
+            new_same_tx,
+            new_with_decoded,
+            new_without_decoded,
+        ]
+        internal_txs_decoded = [
+            InternalTxDecodedFactory.build(internal_tx=duplicate_decoded),
+            InternalTxDecodedFactory.build(internal_tx=duplicate_not_decoded),
+            InternalTxDecodedFactory.build(internal_tx=new_with_decoded),
+        ]
+
+        with mock.patch.object(InternalTx, "save") as save_mock:
+            stored = InternalTx.objects.store_internal_txs_and_decoded_in_db(
+                internal_txs, internal_txs_decoded
+            )
+        save_mock.assert_not_called()  # One by one fallback must not be used
+
+        self.assertCountEqual(
+            stored, [new_same_tx, new_with_decoded, new_without_decoded]
+        )
+        self.assertEqual(InternalTx.objects.count(), 5)
+        self.assertEqual(InternalTxDecoded.objects.count(), 2)
+        self.assertTrue(
+            InternalTxDecoded.objects.filter(internal_tx=new_with_decoded).exists()
+        )
+        self.assertFalse(
+            InternalTxDecoded.objects.filter(
+                internal_tx_id=existing_not_decoded.pk
+            ).exists()
+        )
+
+        # Everything already stored
+        with mock.patch.object(InternalTx, "save") as save_mock:
+            self.assertEqual(
+                InternalTx.objects.store_internal_txs_and_decoded_in_db(
+                    [duplicate_not_decoded], []
+                ),
+                [],
+            )
+        save_mock.assert_not_called()
+        self.assertEqual(InternalTx.objects.count(), 5)
 
     def test_get_parent_child(self):
         i = InternalTxFactory(trace_address="0")
