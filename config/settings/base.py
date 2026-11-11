@@ -591,8 +591,19 @@ HEDERA_MIRROR_NODE_MAX_RETRIES = env.int("HEDERA_MIRROR_NODE_MAX_RETRIES", defau
 HEDERA_MIRROR_NODE_INDEX_INTERVAL_SECONDS = env.int(
     "HEDERA_MIRROR_NODE_INDEX_INTERVAL_SECONDS", default=300
 )
+# Per-account catch-up of a Safe not following the feed yet (new, unbanned), in
+# CRYPTOTRANSFER rows of its account (incoming HBAR, HTS tokens...). It must
+# outpace the rows the account gets per run, or it never catches up
 HEDERA_NATIVE_TRANSFER_MAX_TXS_PER_SAFE_PER_RUN = env.int(
-    "HEDERA_NATIVE_TRANSFER_MAX_TXS_PER_SAFE_PER_RUN", default=500
+    "HEDERA_NATIVE_TRANSFER_MAX_TXS_PER_SAFE_PER_RUN", default=5000
+)
+# Network-wide CRYPTOTRANSFER feed: pages (100 txs each) read per run, and how far
+# behind "now" it stays so Mirror Node has finished ingesting what it returns
+HEDERA_NATIVE_TRANSFER_FEED_MAX_PAGES_PER_RUN = env.int(
+    "HEDERA_NATIVE_TRANSFER_FEED_MAX_PAGES_PER_RUN", default=1000
+)
+HEDERA_NATIVE_TRANSFER_FEED_LAG_SECONDS = env.int(
+    "HEDERA_NATIVE_TRANSFER_FEED_LAG_SECONDS", default=30
 )
 
 ETH_INTERNAL_TXS_BLOCK_PROCESS_LIMIT = env.int(

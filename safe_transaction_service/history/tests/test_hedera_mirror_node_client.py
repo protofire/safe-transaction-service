@@ -143,6 +143,77 @@ class TestHederaMirrorNodeClient(TestCase):
         second_page_url = client.http_session.get.call_args_list[1][0][0]
         self.assertIn("/v1/secret-key-123/api/v1/transactions?page=2", second_page_url)
 
+    def test_get_crypto_transfers_bounds_the_timestamp_range(self):
+        self.client.http_session.get = MagicMock(
+            return_value=self._mock_response(200, {"transactions": [], "links": {}})
+        )
+        list(
+            self.client.get_crypto_transfers(
+                "0.0.10127045",
+                after_timestamp="1700000000.000000001",
+                until_timestamp="1700000600.000000000",
+            )
+        )
+        url = self.client.http_session.get.call_args[0][0]
+        self.assertIn("account.id=0.0.10127045", url)
+        self.assertIn("timestamp=gt:1700000000.000000001", url)
+        self.assertIn("timestamp=lte:1700000600.000000000", url)
+
+    def test_get_network_crypto_transfer_pages_queries_every_account(self):
+        page_1 = self._mock_response(
+            200,
+            {
+                "transactions": [{"transaction_id": "tx-1"}],
+                "links": {"next": "/api/v1/transactions?page=2"},
+            },
+        )
+        page_2 = self._mock_response(
+            200, {"transactions": [{"transaction_id": "tx-2"}], "links": {"next": None}}
+        )
+        self.client.http_session.get = MagicMock(side_effect=[page_1, page_2])
+
+        pages = list(
+            self.client.get_network_crypto_transfer_pages(
+                "1700000000.000000001", "1700000600.000000000"
+            )
+        )
+
+        self.assertEqual(
+            [[tx["transaction_id"] for tx in page] for page in pages],
+            [["tx-1"], ["tx-2"]],
+        )
+        first_page_url = self.client.http_session.get.call_args_list[0][0][0]
+        self.assertNotIn("account.id", first_page_url)
+        for param in (
+            "transactiontype=CRYPTOTRANSFER",
+            "result=success",
+            "order=asc",
+            "limit=100",
+            "timestamp=gt:1700000000.000000001",
+            "timestamp=lte:1700000600.000000000",
+        ):
+            with self.subTest(param=param):
+                self.assertIn(param, first_page_url)
+
+    def test_get_network_crypto_transfer_pages_is_lazy(self):
+        # Pages must be requested one at a time, so the indexer can stop
+        # reading (and paying) as soon as it hits its per-run page limit
+        self.client.http_session.get = MagicMock(
+            return_value=self._mock_response(
+                200,
+                {
+                    "transactions": [{"transaction_id": "tx"}],
+                    "links": {"next": "/api/v1/transactions?page=next"},
+                },
+            )
+        )
+        pages = self.client.get_network_crypto_transfer_pages(
+            "1700000000.000000001", "1700000600.000000000"
+        )
+        next(pages)
+        next(pages)
+        self.assertEqual(self.client.http_session.get.call_count, 2)
+
     def test_resolve_block_number_returns_number(self):
         self.client.http_session.get = MagicMock(
             return_value=self._mock_response(200, {"blocks": [{"number": 12345}]})
@@ -159,6 +230,17 @@ class TestHederaMirrorNodeClient(TestCase):
         called_url = self.client.http_session.get.call_args[0][0]
         self.assertIn("timestamp=gte:1787164650.039440869", called_url)
         self.assertIn("order=asc", called_url)
+
+    def test_get_blocks_starts_at_the_block_containing_the_timestamp(self):
+        blocks = [{"number": 1}, {"number": 2}]
+        self.client.http_session.get = MagicMock(
+            return_value=self._mock_response(200, {"blocks": blocks})
+        )
+        self.assertEqual(self.client.get_blocks("1700000000.000000001"), blocks)
+        url = self.client.http_session.get.call_args[0][0]
+        self.assertIn(
+            "api/v1/blocks?timestamp=gte:1700000000.000000001&order=asc&limit=100", url
+        )
 
     def test_resolve_block_number_returns_none_when_no_block_found(self):
         self.client.http_session.get = MagicMock(

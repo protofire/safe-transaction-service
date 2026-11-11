@@ -212,19 +212,21 @@ def index_hedera_native_transfers_task(self) -> tuple[int, int] | None:
     Index native (non-EVM) HBAR transfers from the Hedera Mirror Node for
     every tracked Safe. No-op if HEDERA_MIRROR_NODE_URL isn't configured.
 
-    :return: Tuple of (number of Safes processed, number of InternalTx rows
-        created), or None if the feature is disabled.
+    :return: Tuple of (number of Safes following the transfer feed, number
+        of InternalTx rows created), or None if the feature is disabled or
+        another run is in progress.
     """
     if not settings.HEDERA_MIRROR_NODE_URL:
         return None
     with contextlib.suppress(LockError):
         with only_one_running_task(self):
             logger.info("Start indexing of Hedera native transfers")
-            number_safes, number_internal_txs = (
-                HederaNativeTransferIndexerProvider().process_all_safes()
-            )
+            result = HederaNativeTransferIndexerProvider().process_all_safes()
+            if result is None:  # Another run is in progress
+                return None
+            number_safes, number_internal_txs = result
             logger.info(
-                "Hedera native transfer indexing processed %d safes, created %d internal txs",
+                "Hedera native transfer indexing: %d safes following the feed, created %d internal txs",
                 number_safes,
                 number_internal_txs,
             )

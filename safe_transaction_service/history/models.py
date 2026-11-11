@@ -2293,6 +2293,9 @@ class HederaSafeTransferCursor(models.Model):
     )
     hedera_account_id = models.CharField(max_length=32, null=True, blank=True)
     last_consensus_timestamp = models.CharField(max_length=32, null=True, blank=True)
+    # Caught up to the network-wide feed (see HederaTransferFeedCursor) and
+    # indexed from it since `last_consensus_timestamp`
+    following_feed = models.BooleanField(default=False)
     updated = models.DateTimeField(auto_now=True)
 
     def __str__(self):
@@ -2300,6 +2303,27 @@ class HederaSafeTransferCursor(models.Model):
             f"Hedera transfer cursor for safe={self.safe_contract_id} "
             f"account={self.hedera_account_id}"
         )
+
+
+class HederaTransferFeedCursor(models.Model):
+    """
+    Single row tracking how far the network-wide Mirror Node
+    ``CRYPTOTRANSFER`` feed has been read. Every Safe whose own
+    ``HederaSafeTransferCursor`` has caught up to it is indexed from that
+    shared feed instead of with its own per-account query. Moving it back
+    reindexes that range. Moving it forward (or deleting it) skips the range
+    for every Safe following the feed, unless they're taken off the feed
+    first so they catch up on it with their own query.
+    """
+
+    SINGLETON_ID = 1
+
+    id = models.PositiveSmallIntegerField(primary_key=True, default=SINGLETON_ID)
+    last_consensus_timestamp = models.CharField(max_length=32)
+    updated = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Hedera transfer feed cursor at {self.last_consensus_timestamp}"
 
 
 class SafeStatusBase(models.Model):
