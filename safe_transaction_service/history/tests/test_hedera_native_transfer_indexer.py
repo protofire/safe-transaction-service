@@ -2,7 +2,7 @@ import datetime
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
-from django.db import connection
+from django.db import IntegrityError, connection
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -1195,6 +1195,111 @@ class TestHederaNativeTransferIndexerProcessAllSafes(TestCase):
 
         self.client.get_crypto_transfers.assert_not_called()
         self.assertEqual(self._received_tinybar(safe_contract), [100, 200])
+
+    def test_transfer_failing_for_one_safe_takes_only_that_safe_off_the_feed(self):
+        failing_safe = self._create_safe("0.0.5000001", cursor_timestamp=FEED_CURSOR)
+        other_safe = self._create_safe("0.0.5000002", cursor_timestamp=FEED_CURSOR)
+        HederaSafeTransferCursor.objects.update(following_feed=True)
+        self.mirror_node.transactions = [
+            incoming_tx("1767225700.000000001", ("0.0.5000001", 1)),
+            # Its sender can't be looked up, and the error keeps coming back
+            incoming_tx(
+                "1767225710.000000001", ("0.0.5000001", 2), sender="0.0.6666666"
+            ),
+            incoming_tx("1767225720.000000001", ("0.0.5000002", 30)),
+            incoming_tx("1767225730.000000001", ("0.0.5000001", 3)),
+        ]
+
+        def resolve_evm_address(account_id):
+            if account_id == "0.0.6666666":
+                raise HederaMirrorNodeClientException("Mirror Node returned 500")
+            return self.mirror_node.resolve_evm_address(account_id)
+
+        self.client.resolve_evm_address.side_effect = resolve_evm_address
+        for _ in range(2):
+            self.indexer.process_all_safes()
+
+        # The feed and the other Safe carry on past it
+        self.assertEqual(self._feed_timestamp(), "1767225730.000000001")
+        self.assertEqual(self._received_tinybar(other_safe), [30])
+        # The failing Safe stops right before it, on its own catch-up
+        self.assertEqual(self._received_tinybar(failing_safe), [1])
+        self.assertEqual(self._cursor_timestamp(failing_safe), "1767225700.000000001")
+        self.assertFalse(self._is_following_feed(failing_safe))
+        self.assertTrue(self._is_following_feed(other_safe))
+
+        self.client.resolve_evm_address.side_effect = (
+            self.mirror_node.resolve_evm_address
+        )
+        self.indexer.process_all_safes()
+
+        self.assertEqual(self._received_tinybar(failing_safe), [1, 2, 3])
+        self.assertTrue(self._is_following_feed(failing_safe))
+
+    def test_catch_ups_out_of_time_leave_the_rest_to_the_next_run(self):
+        follower = self._create_safe("0.0.5000001", cursor_timestamp=FEED_CURSOR)
+        HederaSafeTransferCursor.objects.update(following_feed=True)
+        safes_catching_up = [
+            self._create_safe("0.0.5000002"),
+            self._create_safe("0.0.5000003"),
+        ]
+        self.mirror_node.transactions = [
+            incoming_tx(f"1767225{second:03d}.000000001", (account_id, second))
+            for second in range(1, 151)
+            for account_id in ("0.0.5000002", "0.0.5000003")
+        ] + [incoming_tx("1767225700.000000001", ("0.0.5000001", 7))]
+
+        self._build_indexer(catch_up_time_limit_seconds=0).process_all_safes()
+
+        # The feed isn't held back by the catch-ups
+        self.assertEqual(self._received_tinybar(follower), [7])
+        self.assertEqual(self._feed_timestamp(), "1767225700.000000001")
+        # The catch-up running when time ran out (whichever Safe came first)
+        # stops after its page, and no other one is started
+        self.assertEqual(
+            sorted(
+                len(self._received_tinybar(safe_contract))
+                for safe_contract in safes_catching_up
+            ),
+            [0, 100],
+        )
+        self.assertEqual(self.client.get_crypto_transfers.call_count, 1)
+        for safe_contract in safes_catching_up:
+            self.assertFalse(
+                HederaSafeTransferCursor.objects.filter(
+                    safe_contract=safe_contract, following_feed=True
+                ).exists()
+            )
+
+        self.indexer.process_all_safes()
+
+        for safe_contract in safes_catching_up:
+            self.assertEqual(self._received_tinybar(safe_contract), list(range(1, 151)))
+            self.assertTrue(self._is_following_feed(safe_contract))
+
+    def test_cursor_creation_error_skips_only_that_safe(self):
+        failing_safe = self._create_safe("0.0.5000001")
+        ok_safe = self._create_safe("0.0.5000002")
+        self.mirror_node.transactions = [
+            incoming_tx("1767225700.000000001", ("0.0.5000002", 100)),
+        ]
+        create = HederaSafeTransferCursor.objects.create
+
+        def create_cursor(safe_contract):
+            if safe_contract == failing_safe:
+                raise IntegrityError("duplicate key value violates unique constraint")
+            return create(safe_contract=safe_contract)
+
+        with patch.object(
+            HederaSafeTransferCursor.objects, "create", side_effect=create_cursor
+        ):
+            number_safes, _ = self.indexer.process_all_safes()
+
+        self.assertEqual(number_safes, 1)
+        self.assertEqual(self._received_tinybar(ok_safe), [100])
+        self.assertFalse(
+            HederaSafeTransferCursor.objects.filter(safe_contract=failing_safe).exists()
+        )
 
     def test_one_safe_raising_does_not_prevent_processing_the_others(self):
         failing_safe = self._create_safe("0.0.5000001")

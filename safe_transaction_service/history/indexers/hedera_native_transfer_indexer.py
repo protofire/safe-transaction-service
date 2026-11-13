@@ -2,6 +2,7 @@ import contextlib
 import datetime
 import itertools
 import logging
+import time
 from collections.abc import Iterator
 from decimal import Decimal
 
@@ -178,6 +179,9 @@ class HederaNativeTransferIndexerProvider:
             max_txs_per_safe_per_run=settings.HEDERA_NATIVE_TRANSFER_MAX_TXS_PER_SAFE_PER_RUN,
             feed_max_pages_per_run=settings.HEDERA_NATIVE_TRANSFER_FEED_MAX_PAGES_PER_RUN,
             feed_lag_seconds=settings.HEDERA_NATIVE_TRANSFER_FEED_LAG_SECONDS,
+            # The rest of the task timeout (same as the task lock timeout) is
+            # left for the feed
+            catch_up_time_limit_seconds=settings.CELERY_TASK_LOCK_TIMEOUT // 2,
         )
 
     @classmethod
@@ -288,11 +292,18 @@ class HederaNativeTransferIndexer:
         max_txs_per_safe_per_run: int = 5000,
         feed_max_pages_per_run: int = 1000,
         feed_lag_seconds: int = 30,
+        catch_up_time_limit_seconds: int = 450,
     ):
+        """
+        :param catch_up_time_limit_seconds: How long a run may spend catching
+            Safes up before reading the feed. The rest are caught up on the
+            next run, so slow catch-ups can't hold the feed back
+        """
         self.client = client
         self.max_txs_per_safe_per_run = max_txs_per_safe_per_run
         self.feed_max_pages_per_run = feed_max_pages_per_run
         self.feed_lag_seconds = feed_lag_seconds
+        self.catch_up_time_limit_seconds = catch_up_time_limit_seconds
 
     def get_feed_until_timestamp(self) -> str:
         """
@@ -307,8 +318,9 @@ class HederaNativeTransferIndexer:
     def process_all_safes(self) -> tuple[int, int] | None:
         """
         1. Catch up every Safe not following the feed yet with its own
-           per-account query, up to the feed cursor. Safes already following
-           it need no request.
+           per-account query, up to the feed cursor, for at most
+           ``catch_up_time_limit_seconds``. Safes already following it need
+           no request.
         2. Read the network-wide feed from the feed cursor on and index the
            transfers to every Safe following it.
 
@@ -328,6 +340,7 @@ class HederaNativeTransferIndexer:
     def _process_all_safes(self) -> tuple[int, int]:
         # Overlapping runs could move the feed cursor back, or let a Safe
         # join the feed after another run read past its join point
+        catch_up_deadline = time.monotonic() + self.catch_up_time_limit_seconds
         feed_cursor, _ = HederaTransferFeedCursor.objects.get_or_create(
             id=HederaTransferFeedCursor.SINGLETON_ID,
             defaults={"last_consensus_timestamp": self.get_feed_until_timestamp()},
@@ -350,37 +363,54 @@ class HederaNativeTransferIndexer:
 
         following_cursors: list[HederaSafeTransferCursor] = []
         number_internal_txs_created = 0
+        catch_up_time_left = True
         for safe_contract in SafeContract.objects.filter(banned=False).iterator():
             cursor = safe_cursors.get(safe_contract.address)
-            if cursor is None:
-                cursor = HederaSafeTransferCursor.objects.create(
-                    safe_contract=safe_contract
+            if cursor and cursor.following_feed:
+                following_cursors.append(cursor)
+                continue
+            if not catch_up_time_left:
+                continue
+            try:
+                if cursor is None:
+                    cursor = HederaSafeTransferCursor.objects.create(
+                        safe_contract=safe_contract
+                    )
+                caught_up, number_created = self.catch_up_safe(
+                    safe_contract,
+                    cursor,
+                    feed_cursor.last_consensus_timestamp,
+                    lookups,
+                    deadline=catch_up_deadline,
                 )
-            if not cursor.following_feed:
-                try:
-                    caught_up, number_created = self.catch_up_safe(
-                        safe_contract,
-                        cursor,
-                        feed_cursor.last_consensus_timestamp,
-                        lookups,
+            except Exception:
+                logger.exception(
+                    "Error indexing Hedera native transfers for safe=%s",
+                    safe_contract.address,
+                )
+                continue
+            finally:
+                if time.monotonic() > catch_up_deadline:
+                    catch_up_time_left = False
+                    logger.warning(
+                        "Hedera native transfer indexing spent %d seconds catching "
+                        "up Safes, the rest are caught up on the next run",
+                        self.catch_up_time_limit_seconds,
                     )
-                except Exception:
-                    logger.exception(
-                        "Error indexing Hedera native transfers for safe=%s",
-                        safe_contract.address,
-                    )
-                    continue
-                number_internal_txs_created += number_created
-                if not caught_up:
-                    continue
+            number_internal_txs_created += number_created
+            if caught_up:
                 cursor.following_feed = True
                 cursor.save(update_fields=["following_feed", "updated"])
-            following_cursors.append(cursor)
+                following_cursors.append(cursor)
 
         number_internal_txs_created += self.process_feed(
             feed_cursor, following_cursors, lookups
         )
-        return len(following_cursors), number_internal_txs_created
+        # Safes the feed failed to index left it
+        number_safes_following = HederaSafeTransferCursor.objects.filter(
+            following_feed=True
+        ).count()
+        return number_safes_following, number_internal_txs_created
 
     def process_safe(
         self, safe_contract: SafeContract, until_timestamp: str | None = None
@@ -410,8 +440,11 @@ class HederaNativeTransferIndexer:
         cursor: HederaSafeTransferCursor,
         until_timestamp: str | None,
         lookups: CachedMirrorNodeLookups,
+        deadline: float | None = None,
     ) -> tuple[bool, int]:
         """
+        :param deadline: ``time.monotonic()`` value to stop reading at,
+            keeping the pages already read
         :return: (whether the Safe is now indexed up to ``until_timestamp``,
             number of InternalTx rows created)
         """
@@ -447,6 +480,7 @@ class HederaNativeTransferIndexer:
         ethereum_txs: list[EthereumTx] = []
         internal_txs: list[InternalTx] = []
         last_committed_timestamp = cursor.last_consensus_timestamp
+        out_of_time = False
         mirror_txs = self.client.get_crypto_transfers(
             cursor.hedera_account_id,
             after_timestamp=cursor.last_consensus_timestamp,
@@ -480,8 +514,11 @@ class HederaNativeTransferIndexer:
                         ethereum_txs.append(ethereum_tx)
                         internal_txs.extend(new_internal_txs)
                     last_committed_timestamp = mirror_tx["consensus_timestamp"]
+                if deadline is not None and time.monotonic() > deadline:
+                    out_of_time = True
+                    break
             # Stopped by `max_txs_per_safe_per_run` if there's more to read
-            caught_up = next(mirror_txs, None) is None
+            caught_up = not out_of_time and next(mirror_txs, None) is None
         except UnresolvedBlockNumber as exc:
             logger.warning(
                 "Could not resolve block number for Hedera consensus_timestamp=%s, "
@@ -522,7 +559,11 @@ class HederaNativeTransferIndexer:
         """
         Read the network-wide feed from ``feed_cursor`` on, committing the
         transfers and the feed cursor page by page. A Mirror Node error
-        stops the feed, keeping the pages already read.
+        reading the feed stops it, keeping the pages already read. An error
+        indexing one transfer for one Safe takes only that Safe off the
+        feed, so one transfer can't hold back every Safe: it's caught up
+        with its own query from right before that transfer, and fails there
+        on its own until the error goes away.
 
         :return: Number of InternalTx rows created
         """
@@ -576,15 +617,17 @@ class HederaNativeTransferIndexer:
             internal_txs: list[InternalTx] = []
             last_committed_timestamp = feed_cursor.last_consensus_timestamp
             block_number_unresolved = False
+            # Safes taken off the feed: address -> indexed up to here
+            safes_leaving_feed: dict[str, str] = {}
             page_receivers = [
                 (
                     mirror_tx,
                     sorted(
                         {
-                            transfer["account"]
+                            transfer.get("account")
                             for transfer in mirror_tx.get("transfers") or []
-                            if transfer["amount"] > 0
-                            and transfer["account"] in safe_address_by_account_id
+                            if (transfer.get("amount") or 0) > 0
+                            and transfer.get("account") in safe_address_by_account_id
                         }
                     ),
                 )
@@ -599,15 +642,31 @@ class HederaNativeTransferIndexer:
             )
             for mirror_tx, safe_account_ids in page_receivers:
                 try:
-                    tx_rows = [
-                        self._build_transfer_rows(
-                            mirror_tx,
-                            safe_address_by_account_id[account_id],
-                            account_id,
-                            lookups,
-                        )
-                        for account_id in safe_account_ids
-                    ]
+                    tx_rows = []
+                    for account_id in safe_account_ids:
+                        safe_address = safe_address_by_account_id.get(account_id)
+                        if not safe_address:  # Taken off the feed earlier
+                            continue
+                        try:
+                            tx_rows.append(
+                                self._build_transfer_rows(
+                                    mirror_tx, safe_address, account_id, lookups
+                                )
+                            )
+                        except UnresolvedBlockNumber:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                "Error indexing Hedera transaction_id=%s for "
+                                "safe=%s, taking it off the transfer feed: it's "
+                                "caught up with its own query from "
+                                "consensus_timestamp=%s",
+                                mirror_tx.get("transaction_id"),
+                                safe_address,
+                                last_committed_timestamp,
+                            )
+                            safes_leaving_feed[safe_address] = last_committed_timestamp
+                            del safe_address_by_account_id[account_id]
                 except UnresolvedBlockNumber as exc:
                     logger.warning(
                         "Could not resolve block number for Hedera "
@@ -625,6 +684,14 @@ class HederaNativeTransferIndexer:
 
             with transaction.atomic():
                 number_created = self._store_transfer_rows(ethereum_txs, internal_txs)
+                for safe_address, indexed_until in safes_leaving_feed.items():
+                    HederaSafeTransferCursor.objects.filter(
+                        safe_contract_id=safe_address
+                    ).update(
+                        following_feed=False,
+                        last_consensus_timestamp=indexed_until,
+                        updated=timezone.now(),
+                    )
                 if last_committed_timestamp != feed_cursor.last_consensus_timestamp:
                     feed_cursor.last_consensus_timestamp = last_committed_timestamp
                     feed_cursor.save(
