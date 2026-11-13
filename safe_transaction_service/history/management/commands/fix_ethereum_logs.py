@@ -10,10 +10,18 @@ class Command(BaseCommand):
     help = "Add missing address to every EthereumTx log"
 
     def handle(self, *args, **options):
-        # We need to add `address` to the logs, so we exclude empty logs and logs already containing `address`
+        # We need to add `address` to the logs, so we exclude empty/unset logs
+        # and logs already containing `address`. `logs=None` (as opposed to
+        # `logs=[]`) was never excluded here before — harmless for a
+        # never-mined tx missing a receipt, but a synthetic (e.g.
+        # Hedera-native) EthereumTx with a tx_hash that was never a real
+        # on-chain transaction would match this queryset, then crash on a
+        # `None` receipt from get_transaction_receipts below.
         ethereum_client = get_auto_ethereum_client()
-        queryset = EthereumTx.objects.exclude(logs__0__has_key="address").exclude(
-            logs=[]
+        queryset = (
+            EthereumTx.objects.exclude(logs__0__has_key="address")
+            .exclude(logs=[])
+            .exclude(logs__isnull=True)
         )
         total = queryset.count()
         processed = 200
