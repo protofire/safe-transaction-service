@@ -1,15 +1,27 @@
+import contextlib
 import datetime
+import itertools
 import logging
+import time
+from collections.abc import Iterator
+from decimal import Decimal
 
-from django.db import transaction
+from django.db import connection, transaction
+from django.utils import timezone
 
+from hexbytes import HexBytes
 from safe_eth.eth.utils import fast_keccak_text
 from safe_eth.util.util import to_0x_hex_str
 
-from ..clients.hedera_mirror_node_client import HederaMirrorNodeClient
+from ..clients.hedera_mirror_node_client import (
+    MIRROR_NODE_PAGE_SIZE,
+    HederaMirrorNodeClient,
+)
 from ..models import (
     EthereumTx,
     EthereumTxCallType,
+    HederaSafeTransferCursor,
+    HederaTransferFeedCursor,
     InternalTx,
     InternalTxType,
     SafeContract,
@@ -19,6 +31,8 @@ from ..models import (
 logger = logging.getLogger(__name__)
 
 TINYBAR_TO_WEIBAR = 10**10
+# Postgres advisory lock id, any constant unique in the database
+INDEXING_LOCK_ID = 0x48424152  # "HBAR"
 
 
 def consensus_timestamp_to_datetime(consensus_timestamp: str) -> datetime.datetime:
@@ -44,6 +58,15 @@ def datetime_to_consensus_timestamp(dt: datetime.datetime) -> str:
     seconds = int(timestamp)
     nanos = round((timestamp - seconds) * 1_000_000_000)
     return f"{seconds}.{nanos:09d}"
+
+
+def consensus_timestamp_is_before(timestamp: str, other_timestamp: str) -> bool:
+    """
+    :param timestamp: Mirror Node ``"<seconds>.<nanos>"`` string.
+    :param other_timestamp: Mirror Node ``"<seconds>.<nanos>"`` string.
+    :return: Whether ``timestamp`` is strictly older than ``other_timestamp``.
+    """
+    return Decimal(timestamp) < Decimal(other_timestamp)
 
 
 def build_synthetic_tx_hash(mirror_tx: dict, safe_address: str) -> str:
@@ -154,6 +177,11 @@ class HederaNativeTransferIndexerProvider:
                 max_retries=settings.HEDERA_MIRROR_NODE_MAX_RETRIES,
             ),
             max_txs_per_safe_per_run=settings.HEDERA_NATIVE_TRANSFER_MAX_TXS_PER_SAFE_PER_RUN,
+            feed_max_pages_per_run=settings.HEDERA_NATIVE_TRANSFER_FEED_MAX_PAGES_PER_RUN,
+            feed_lag_seconds=settings.HEDERA_NATIVE_TRANSFER_FEED_LAG_SECONDS,
+            # The rest of the task timeout (same as the task lock timeout) is
+            # left for the feed
+            catch_up_time_limit_seconds=settings.CELERY_TASK_LOCK_TIMEOUT // 2,
         )
 
     @classmethod
@@ -162,41 +190,268 @@ class HederaNativeTransferIndexerProvider:
             del cls.instance
 
 
+@contextlib.contextmanager
+def indexing_lock() -> Iterator[bool]:
+    """
+    Database-level guard so two indexing runs never overlap, even if the
+    Celery task lock expires or a run is started by hand. Released when the
+    run ends, or with the connection if the worker dies.
+
+    :return: Whether the lock was acquired
+    """
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_try_advisory_lock(%s)", [INDEXING_LOCK_ID])
+        acquired = cursor.fetchone()[0]
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_unlock(%s)", [INDEXING_LOCK_ID])
+
+
+class UnresolvedBlockNumber(Exception):
+    """
+    Mirror Node returned no block for a transfer's consensus timestamp. The
+    transfer (and everything after it) is retried on the next run.
+    """
+
+
+class CachedMirrorNodeLookups:
+    """
+    Block number and EVM address lookups, cached for the duration of one
+    indexing run so a block or counterparty shared by several transfers is
+    only requested once.
+    """
+
+    def __init__(self, client: HederaMirrorNodeClient):
+        self.client = client
+        self.block_numbers: dict[str, int | None] = {}
+        self.evm_addresses: dict[str, str] = {}
+
+    def prefetch_block_numbers(self, consensus_timestamps: list[str]) -> None:
+        """
+        Resolve the block numbers of several close consensus timestamps (e.g.
+        one feed page) with ``/blocks`` range requests instead of one request
+        each. Timestamps left unresolved are looked up one by one later.
+        """
+        pending = sorted(
+            {
+                consensus_timestamp
+                for consensus_timestamp in consensus_timestamps
+                if consensus_timestamp not in self.block_numbers
+            },
+            key=Decimal,
+        )
+        while pending:
+            number_pending = len(pending)
+            for block in self.client.get_blocks(pending[0]):
+                # Same match as `resolve_block_number`: the first block
+                # ending at or after the timestamp
+                block_end = Decimal(block["timestamp"]["to"])
+                while pending and Decimal(pending[0]) <= block_end:
+                    self.block_numbers[pending.pop(0)] = block["number"]
+            if len(pending) == number_pending:
+                # Not ingested yet
+                return
+
+    def get_block_number(self, consensus_timestamp: str) -> int:
+        """
+        :raises UnresolvedBlockNumber:
+        """
+        if consensus_timestamp not in self.block_numbers:
+            self.block_numbers[consensus_timestamp] = self.client.resolve_block_number(
+                consensus_timestamp
+            )
+        block_number = self.block_numbers[consensus_timestamp]
+        if block_number is None:
+            raise UnresolvedBlockNumber(consensus_timestamp)
+        return block_number
+
+    def get_evm_address(self, account_id: str) -> str:
+        if account_id not in self.evm_addresses:
+            self.evm_addresses[account_id] = self.client.resolve_evm_address(account_id)
+        return self.evm_addresses[account_id]
+
+
 class HederaNativeTransferIndexer:
+    """
+    Indexes native (non-EVM) HBAR transfers to Safes from the Hedera Mirror
+    Node. Mirror Node has no multi-account filter, so instead of querying
+    every Safe's account on every run, the indexer reads the network-wide
+    ``CRYPTOTRANSFER`` feed once per run (see ``HederaTransferFeedCursor``)
+    and matches it locally. A Safe only gets its own per-account query to
+    catch up to that feed: when it's first seen, after being unbanned, or
+    while a previous catch-up hasn't finished. From then on it follows the
+    feed (``HederaSafeTransferCursor.following_feed``) until it's banned.
+    """
+
     def __init__(
-        self, client: HederaMirrorNodeClient, max_txs_per_safe_per_run: int = 500
+        self,
+        client: HederaMirrorNodeClient,
+        max_txs_per_safe_per_run: int = 5000,
+        feed_max_pages_per_run: int = 1000,
+        feed_lag_seconds: int = 30,
+        catch_up_time_limit_seconds: int = 450,
     ):
+        """
+        :param catch_up_time_limit_seconds: How long a run may spend catching
+            Safes up before reading the feed. The rest are caught up on the
+            next run, so slow catch-ups can't hold the feed back
+        """
         self.client = client
         self.max_txs_per_safe_per_run = max_txs_per_safe_per_run
+        self.feed_max_pages_per_run = feed_max_pages_per_run
+        self.feed_lag_seconds = feed_lag_seconds
+        self.catch_up_time_limit_seconds = catch_up_time_limit_seconds
 
-    def process_all_safes(self) -> tuple[int, int]:
+    def get_feed_until_timestamp(self) -> str:
         """
-        :return: (number of Safes processed, number of InternalTx rows created)
+        :return: Newest consensus timestamp the feed may read up to. Kept
+            ``feed_lag_seconds`` behind now so Mirror Node has finished
+            ingesting everything before it.
         """
-        number_safes_processed = 0
+        return datetime_to_consensus_timestamp(
+            timezone.now() - datetime.timedelta(seconds=self.feed_lag_seconds)
+        )
+
+    def process_all_safes(self) -> tuple[int, int] | None:
+        """
+        1. Catch up every Safe not following the feed yet with its own
+           per-account query, up to the feed cursor, for at most
+           ``catch_up_time_limit_seconds``. Safes already following it need
+           no request.
+        2. Read the network-wide feed from the feed cursor on and index the
+           transfers to every Safe following it.
+
+        :return: (number of Safes following the feed, number of InternalTx
+            rows created), or ``None`` if skipped because another run is in
+            progress
+        """
+        with indexing_lock() as acquired:
+            if not acquired:
+                logger.warning(
+                    "Another Hedera native transfer indexing run is in progress, "
+                    "skipping this one"
+                )
+                return None
+            return self._process_all_safes()
+
+    def _process_all_safes(self) -> tuple[int, int]:
+        # Overlapping runs could move the feed cursor back, or let a Safe
+        # join the feed after another run read past its join point
+        catch_up_deadline = time.monotonic() + self.catch_up_time_limit_seconds
+        feed_cursor, _ = HederaTransferFeedCursor.objects.get_or_create(
+            id=HederaTransferFeedCursor.SINGLETON_ID,
+            defaults={"last_consensus_timestamp": self.get_feed_until_timestamp()},
+        )
+        # Banned Safes leave the feed. They're indexed up to the feed cursor,
+        # so if unbanned they are caught up from there
+        HederaSafeTransferCursor.objects.filter(
+            following_feed=True, safe_contract__banned=True
+        ).update(
+            following_feed=False,
+            last_consensus_timestamp=feed_cursor.last_consensus_timestamp,
+            updated=timezone.now(),
+        )
+
+        lookups = CachedMirrorNodeLookups(self.client)
+        safe_cursors = {
+            cursor.safe_contract_id: cursor
+            for cursor in HederaSafeTransferCursor.objects.all()
+        }
+
+        following_cursors: list[HederaSafeTransferCursor] = []
         number_internal_txs_created = 0
+        catch_up_time_left = True
         for safe_contract in SafeContract.objects.filter(banned=False).iterator():
+            cursor = safe_cursors.get(safe_contract.address)
+            if cursor and cursor.following_feed:
+                following_cursors.append(cursor)
+                continue
+            if not catch_up_time_left:
+                continue
             try:
-                number_internal_txs_created += self.process_safe(safe_contract)
+                if cursor is None:
+                    cursor = HederaSafeTransferCursor.objects.create(
+                        safe_contract=safe_contract
+                    )
+                caught_up, number_created = self.catch_up_safe(
+                    safe_contract,
+                    cursor,
+                    feed_cursor.last_consensus_timestamp,
+                    lookups,
+                    deadline=catch_up_deadline,
+                )
             except Exception:
                 logger.exception(
                     "Error indexing Hedera native transfers for safe=%s",
                     safe_contract.address,
                 )
                 continue
-            number_safes_processed += 1
-        return number_safes_processed, number_internal_txs_created
+            finally:
+                if time.monotonic() > catch_up_deadline:
+                    catch_up_time_left = False
+                    logger.warning(
+                        "Hedera native transfer indexing spent %d seconds catching "
+                        "up Safes, the rest are caught up on the next run",
+                        self.catch_up_time_limit_seconds,
+                    )
+            number_internal_txs_created += number_created
+            if caught_up:
+                cursor.following_feed = True
+                cursor.save(update_fields=["following_feed", "updated"])
+                following_cursors.append(cursor)
 
-    def process_safe(self, safe_contract: SafeContract) -> int:
-        from ..models import HederaSafeTransferCursor
+        number_internal_txs_created += self.process_feed(
+            feed_cursor, following_cursors, lookups
+        )
+        # Safes the feed failed to index left it
+        number_safes_following = HederaSafeTransferCursor.objects.filter(
+            following_feed=True
+        ).count()
+        return number_safes_following, number_internal_txs_created
 
+    def process_safe(
+        self, safe_contract: SafeContract, until_timestamp: str | None = None
+    ) -> int:
+        """
+        Index a single Safe with its own per-account query.
+
+        :param safe_contract:
+        :param until_timestamp: Stop at this consensus timestamp. ``None``
+            reads up to the newest transfer.
+        :return: Number of InternalTx rows created
+        """
         cursor, _ = HederaSafeTransferCursor.objects.get_or_create(
             safe_contract=safe_contract
         )
+        _, number_created = self.catch_up_safe(
+            safe_contract,
+            cursor,
+            until_timestamp,
+            CachedMirrorNodeLookups(self.client),
+        )
+        return number_created
+
+    def catch_up_safe(
+        self,
+        safe_contract: SafeContract,
+        cursor: HederaSafeTransferCursor,
+        until_timestamp: str | None,
+        lookups: CachedMirrorNodeLookups,
+        deadline: float | None = None,
+    ) -> tuple[bool, int]:
+        """
+        :param deadline: ``time.monotonic()`` value to stop reading at,
+            keeping the pages already read
+        :return: (whether the Safe is now indexed up to ``until_timestamp``,
+            number of InternalTx rows created)
+        """
         if not cursor.hedera_account_id:
             account_id = self.client.resolve_account_id(safe_contract.address)
             if not account_id:
-                return 0
+                return False, 0
             cursor.hedera_account_id = account_id
             # Seed the cursor at the Safe's REAL on-chain creation time —
             # not `safe_contract.created` (a DateField with auto_now_add,
@@ -216,131 +471,366 @@ class HederaNativeTransferIndexer:
             )
             cursor.save(update_fields=["hedera_account_id", "last_consensus_timestamp"])
 
+        if until_timestamp and not consensus_timestamp_is_before(
+            cursor.last_consensus_timestamp, until_timestamp
+        ):
+            # Created after the feed cursor, or already caught up
+            return True, 0
+
         ethereum_txs: list[EthereumTx] = []
         internal_txs: list[InternalTx] = []
-        block_number_cache: dict[str, int | None] = {}
-        counterparty_address_cache: dict[str, str] = {}
         last_committed_timestamp = cursor.last_consensus_timestamp
-
-        for processed_count, mirror_tx in enumerate(
-            self.client.get_crypto_transfers(
-                cursor.hedera_account_id,
-                after_timestamp=cursor.last_consensus_timestamp,
-            )
-        ):
-            if processed_count >= self.max_txs_per_safe_per_run:
-                break
-            consensus_timestamp = mirror_tx["consensus_timestamp"]
-
-            if mirror_tx.get("result") == "SUCCESS":
-                legs = extract_transfer_legs(mirror_tx, cursor.hedera_account_id)
-                if legs:
-                    if consensus_timestamp not in block_number_cache:
-                        block_number_cache[consensus_timestamp] = (
-                            self.client.resolve_block_number(consensus_timestamp)
+        out_of_time = False
+        mirror_txs = self.client.get_crypto_transfers(
+            cursor.hedera_account_id,
+            after_timestamp=cursor.last_consensus_timestamp,
+            until_timestamp=until_timestamp,
+        )
+        try:
+            for mirror_txs_batch in itertools.batched(
+                itertools.islice(mirror_txs, self.max_txs_per_safe_per_run),
+                min(MIRROR_NODE_PAGE_SIZE, self.max_txs_per_safe_per_run),
+                strict=False,
+            ):
+                lookups.prefetch_block_numbers(
+                    [
+                        mirror_tx["consensus_timestamp"]
+                        for mirror_tx in mirror_txs_batch
+                        if any(
+                            transfer["account"] == cursor.hedera_account_id
+                            and transfer["amount"] > 0
+                            for transfer in mirror_tx.get("transfers") or []
                         )
-                    block_number = block_number_cache[consensus_timestamp]
-                    if block_number is None:
-                        logger.warning(
-                            "Could not resolve block number for Hedera "
-                            "consensus_timestamp=%s, stopping sync for "
-                            "safe=%s until next run",
-                            consensus_timestamp,
-                            safe_contract.address,
-                        )
-                        break
-
-                    timestamp = consensus_timestamp_to_datetime(consensus_timestamp)
-                    tx_hash = build_synthetic_tx_hash(mirror_tx, safe_contract.address)
-                    ethereum_tx = EthereumTx(
-                        tx_hash=tx_hash,
-                        # Deliberately never linked to a real EthereumBlock
-                        # (see execution_date/get_block_number's fallback to
-                        # the InternalTx leg's own always-set values): doing
-                        # so would make this row's survival depend on that
-                        # block never being reorg-cascade-deleted, which the
-                        # Hedera-specific sync cursor has no way to detect
-                        # or recover from.
-                        block=None,
-                        status=1,
-                        gas=0,
-                        gas_used=0,
-                        gas_price=0,
-                        data=None,
-                        nonce=0,
-                        type=0,
-                        _from=None,
-                        to=safe_contract.address,
-                        value=0,
-                        hedera_transaction_id=mirror_tx["transaction_id"],
+                    ]
+                )
+                for mirror_tx in mirror_txs_batch:
+                    ethereum_tx, new_internal_txs = self._build_transfer_rows(
+                        mirror_tx,
+                        safe_contract.address,
+                        cursor.hedera_account_id,
+                        lookups,
                     )
-                    ethereum_txs.append(ethereum_tx)
+                    if ethereum_tx:
+                        ethereum_txs.append(ethereum_tx)
+                        internal_txs.extend(new_internal_txs)
+                    last_committed_timestamp = mirror_tx["consensus_timestamp"]
+                if deadline is not None and time.monotonic() > deadline:
+                    out_of_time = True
+                    break
+            # Stopped by `max_txs_per_safe_per_run` if there's more to read
+            caught_up = not out_of_time and next(mirror_txs, None) is None
+        except UnresolvedBlockNumber as exc:
+            logger.warning(
+                "Could not resolve block number for Hedera consensus_timestamp=%s, "
+                "stopping sync for safe=%s until next run",
+                exc,
+                safe_contract.address,
+            )
+            caught_up = False
+        except Exception:
+            # Keep what was read so far, the rest is retried on the next run
+            logger.exception(
+                "Error reading Hedera native transfers for safe=%s after "
+                "consensus_timestamp=%s",
+                safe_contract.address,
+                last_committed_timestamp,
+            )
+            caught_up = False
 
-                    for index, leg in enumerate(legs):
-                        counterparty_account_id = leg["counterparty_account_id"]
-                        if counterparty_account_id not in counterparty_address_cache:
-                            counterparty_address_cache[counterparty_account_id] = (
-                                self.client.resolve_evm_address(counterparty_account_id)
-                            )
-                        counterparty_evm_address = counterparty_address_cache[
-                            counterparty_account_id
-                        ]
+        if caught_up and until_timestamp:
+            # Everything up to `until_timestamp` was read, not only up to the
+            # last transfer found
+            last_committed_timestamp = until_timestamp
 
-                        value_weibar = leg["amount_tinybar"] * TINYBAR_TO_WEIBAR
-
-                        if index == 0:
-                            ethereum_tx._from = counterparty_evm_address
-
-                        internal_txs.append(
-                            InternalTx(
-                                ethereum_tx=ethereum_tx,
-                                timestamp=timestamp,
-                                block_number=block_number,
-                                _from=counterparty_evm_address,
-                                gas=0,
-                                data=None,
-                                to=safe_contract.address,
-                                value=value_weibar,
-                                gas_used=0,
-                                contract_address=None,
-                                code=None,
-                                output=None,
-                                refund_address=None,
-                                tx_type=InternalTxType.CALL.value,
-                                call_type=EthereumTxCallType.CALL.value,
-                                trace_address=str(index),
-                                error=None,
-                            )
-                        )
-
-            last_committed_timestamp = consensus_timestamp
-
-        if not ethereum_txs:
+        with transaction.atomic():
+            number_created = self._store_transfer_rows(ethereum_txs, internal_txs)
             if last_committed_timestamp != cursor.last_consensus_timestamp:
                 cursor.last_consensus_timestamp = last_committed_timestamp
                 cursor.save(update_fields=["last_consensus_timestamp"])
+
+        return caught_up, number_created
+
+    def process_feed(
+        self,
+        feed_cursor: HederaTransferFeedCursor,
+        following_cursors: list[HederaSafeTransferCursor],
+        lookups: CachedMirrorNodeLookups,
+    ) -> int:
+        """
+        Read the network-wide feed from ``feed_cursor`` on, committing the
+        transfers and the feed cursor page by page. A Mirror Node error
+        reading the feed stops it, keeping the pages already read. An error
+        indexing one transfer for one Safe takes only that Safe off the
+        feed, so one transfer can't hold back every Safe: it's caught up
+        with its own query from right before that transfer, and fails there
+        on its own until the error goes away.
+
+        :return: Number of InternalTx rows created
+        """
+        until_timestamp = self.get_feed_until_timestamp()
+        if not consensus_timestamp_is_before(
+            feed_cursor.last_consensus_timestamp, until_timestamp
+        ):
             return 0
 
-        safe_relevant_txs = [
-            SafeRelevantTransaction(
-                ethereum_tx=internal_tx.ethereum_tx,
-                safe=safe_contract.address,
-                timestamp=internal_tx.timestamp,
+        safe_address_by_account_id = {
+            cursor.hedera_account_id: cursor.safe_contract_id
+            for cursor in following_cursors
+        }
+        number_internal_txs_created = 0
+        pages = self.client.get_network_crypto_transfer_pages(
+            feed_cursor.last_consensus_timestamp, until_timestamp
+        )
+        try:
+            for number_created in self._process_feed_pages(
+                feed_cursor, pages, safe_address_by_account_id, lookups
+            ):
+                number_internal_txs_created += number_created
+        except Exception:
+            logger.exception(
+                "Error reading the Hedera native transfer feed after "
+                "consensus_timestamp=%s",
+                feed_cursor.last_consensus_timestamp,
             )
+
+        logger.info(
+            "Hedera native transfer feed is at consensus_timestamp=%s, %.0f seconds behind now",
+            feed_cursor.last_consensus_timestamp,
+            timezone.now().timestamp() - float(feed_cursor.last_consensus_timestamp),
+        )
+        return number_internal_txs_created
+
+    def _process_feed_pages(
+        self,
+        feed_cursor: HederaTransferFeedCursor,
+        pages: Iterator[list[dict]],
+        safe_address_by_account_id: dict[str, str],
+        lookups: CachedMirrorNodeLookups,
+    ) -> Iterator[int]:
+        """
+        :return: Number of InternalTx rows created, once per committed page
+        """
+        for page_number, page in enumerate(
+            itertools.islice(pages, self.feed_max_pages_per_run), start=1
+        ):
+            ethereum_txs: list[EthereumTx] = []
+            internal_txs: list[InternalTx] = []
+            last_committed_timestamp = feed_cursor.last_consensus_timestamp
+            block_number_unresolved = False
+            # Safes taken off the feed: address -> indexed up to here
+            safes_leaving_feed: dict[str, str] = {}
+            page_receivers = [
+                (
+                    mirror_tx,
+                    sorted(
+                        {
+                            transfer.get("account")
+                            for transfer in mirror_tx.get("transfers") or []
+                            if (transfer.get("amount") or 0) > 0
+                            and transfer.get("account") in safe_address_by_account_id
+                        }
+                    ),
+                )
+                for mirror_tx in page
+            ]
+            lookups.prefetch_block_numbers(
+                [
+                    mirror_tx["consensus_timestamp"]
+                    for mirror_tx, safe_account_ids in page_receivers
+                    if safe_account_ids
+                ]
+            )
+            for mirror_tx, safe_account_ids in page_receivers:
+                try:
+                    tx_rows = []
+                    for account_id in safe_account_ids:
+                        safe_address = safe_address_by_account_id.get(account_id)
+                        if not safe_address:  # Taken off the feed earlier
+                            continue
+                        try:
+                            tx_rows.append(
+                                self._build_transfer_rows(
+                                    mirror_tx, safe_address, account_id, lookups
+                                )
+                            )
+                        except UnresolvedBlockNumber:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                "Error indexing Hedera transaction_id=%s for "
+                                "safe=%s, taking it off the transfer feed: it's "
+                                "caught up with its own query from "
+                                "consensus_timestamp=%s",
+                                mirror_tx.get("transaction_id"),
+                                safe_address,
+                                last_committed_timestamp,
+                            )
+                            safes_leaving_feed[safe_address] = last_committed_timestamp
+                            del safe_address_by_account_id[account_id]
+                except UnresolvedBlockNumber as exc:
+                    logger.warning(
+                        "Could not resolve block number for Hedera "
+                        "consensus_timestamp=%s, stopping the transfer feed until "
+                        "next run",
+                        exc,
+                    )
+                    block_number_unresolved = True
+                    break
+                for ethereum_tx, new_internal_txs in tx_rows:
+                    if ethereum_tx:
+                        ethereum_txs.append(ethereum_tx)
+                        internal_txs.extend(new_internal_txs)
+                last_committed_timestamp = mirror_tx["consensus_timestamp"]
+
+            with transaction.atomic():
+                number_created = self._store_transfer_rows(ethereum_txs, internal_txs)
+                for safe_address, indexed_until in safes_leaving_feed.items():
+                    HederaSafeTransferCursor.objects.filter(
+                        safe_contract_id=safe_address
+                    ).update(
+                        following_feed=False,
+                        last_consensus_timestamp=indexed_until,
+                        updated=timezone.now(),
+                    )
+                if last_committed_timestamp != feed_cursor.last_consensus_timestamp:
+                    feed_cursor.last_consensus_timestamp = last_committed_timestamp
+                    feed_cursor.save(
+                        update_fields=["last_consensus_timestamp", "updated"]
+                    )
+            yield number_created
+
+            if block_number_unresolved:
+                break
+            if (
+                page_number == self.feed_max_pages_per_run
+                and len(page) == MIRROR_NODE_PAGE_SIZE
+            ):
+                # Only a full page can be followed by another one
+                logger.warning(
+                    "Hedera native transfer feed read its limit of %d pages and "
+                    "stopped at consensus_timestamp=%s, anything after it is "
+                    "read on the next run",
+                    page_number,
+                    feed_cursor.last_consensus_timestamp,
+                )
+
+    def _build_transfer_rows(
+        self,
+        mirror_tx: dict,
+        safe_address: str,
+        safe_account_id: str,
+        lookups: CachedMirrorNodeLookups,
+    ) -> tuple[EthereumTx | None, list[InternalTx]]:
+        """
+        :return: The synthetic EthereumTx and its InternalTx legs for the HBAR
+            ``mirror_tx`` moved into the Safe, or ``(None, [])`` if it didn't
+        :raises UnresolvedBlockNumber:
+        """
+        if mirror_tx.get("result") != "SUCCESS":
+            return None, []
+        legs = extract_transfer_legs(mirror_tx, safe_account_id)
+        if not legs:
+            return None, []
+
+        consensus_timestamp = mirror_tx["consensus_timestamp"]
+        block_number = lookups.get_block_number(consensus_timestamp)
+        timestamp = consensus_timestamp_to_datetime(consensus_timestamp)
+        ethereum_tx = EthereumTx(
+            tx_hash=build_synthetic_tx_hash(mirror_tx, safe_address),
+            # Deliberately never linked to a real EthereumBlock
+            # (see execution_date/get_block_number's fallback to
+            # the InternalTx leg's own always-set values): doing
+            # so would make this row's survival depend on that
+            # block never being reorg-cascade-deleted, which the
+            # Hedera-specific sync cursor has no way to detect
+            # or recover from.
+            block=None,
+            status=1,
+            gas=0,
+            gas_used=0,
+            gas_price=0,
+            data=None,
+            nonce=0,
+            type=0,
+            _from=None,
+            to=safe_address,
+            value=0,
+            hedera_transaction_id=mirror_tx["transaction_id"],
+        )
+
+        internal_txs = []
+        for index, leg in enumerate(legs):
+            counterparty_evm_address = lookups.get_evm_address(
+                leg["counterparty_account_id"]
+            )
+            if index == 0:
+                ethereum_tx._from = counterparty_evm_address
+
+            internal_txs.append(
+                InternalTx(
+                    ethereum_tx=ethereum_tx,
+                    timestamp=timestamp,
+                    block_number=block_number,
+                    _from=counterparty_evm_address,
+                    gas=0,
+                    data=None,
+                    to=safe_address,
+                    value=leg["amount_tinybar"] * TINYBAR_TO_WEIBAR,
+                    gas_used=0,
+                    contract_address=None,
+                    code=None,
+                    output=None,
+                    refund_address=None,
+                    tx_type=InternalTxType.CALL.value,
+                    call_type=EthereumTxCallType.CALL.value,
+                    trace_address=str(index),
+                    error=None,
+                )
+            )
+        return ethereum_tx, internal_txs
+
+    @staticmethod
+    def _store_transfer_rows(
+        ethereum_txs: list[EthereumTx], internal_txs: list[InternalTx]
+    ) -> int:
+        """
+        Insert the rows not stored yet, so a range read twice fills in only
+        what's missing. InternalTx legs already stored are skipped before
+        inserting, as `bulk_create` would send `post_save(created=True)` for
+        them anyway, and so their events again.
+
+        :return: Number of InternalTx rows created
+        """
+        if not ethereum_txs:
+            return 0
+        stored_legs = {
+            (HexBytes(tx_hash), trace_address)
+            for tx_hash, trace_address in InternalTx.objects.filter(
+                ethereum_tx_id__in=[ethereum_tx.tx_hash for ethereum_tx in ethereum_txs]
+            ).values_list("ethereum_tx_id", "trace_address")
+        }
+        new_internal_txs = [
+            internal_tx
             for internal_tx in internal_txs
+            if (HexBytes(internal_tx.ethereum_tx.tx_hash), internal_tx.trace_address)
+            not in stored_legs
         ]
-
-        with transaction.atomic():
-            EthereumTx.objects.bulk_create_from_generator(
-                iter(ethereum_txs), ignore_conflicts=True
-            )
-            InternalTx.objects.bulk_create_from_generator(
-                iter(internal_txs), ignore_conflicts=True
-            )
-            SafeRelevantTransaction.objects.bulk_create(
-                safe_relevant_txs, ignore_conflicts=True
-            )
-            cursor.last_consensus_timestamp = last_committed_timestamp
-            cursor.save(update_fields=["last_consensus_timestamp"])
-
-        return len(internal_txs)
+        # No events are sent for these two, so stored rows can be sent again
+        EthereumTx.objects.bulk_create_from_generator(
+            iter(ethereum_txs), ignore_conflicts=True
+        )
+        InternalTx.objects.bulk_create_from_generator(
+            iter(new_internal_txs), ignore_conflicts=True
+        )
+        SafeRelevantTransaction.objects.bulk_create(
+            [
+                SafeRelevantTransaction(
+                    ethereum_tx=internal_tx.ethereum_tx,
+                    safe=internal_tx.to,
+                    timestamp=internal_tx.timestamp,
+                )
+                for internal_tx in internal_txs
+            ],
+            ignore_conflicts=True,
+        )
+        return len(new_internal_txs)

@@ -128,18 +128,57 @@ class HederaMirrorNodeClient(BaseHTTPClient):
         return evm_address or hedera_account_id_to_long_zero_address(account_id)
 
     def get_crypto_transfers(
-        self, account_id: str, after_timestamp: str | None = None
+        self,
+        account_id: str,
+        after_timestamp: str | None = None,
+        until_timestamp: str | None = None,
     ) -> Iterator[dict]:
+        """
+        :param account_id: Hedera account id, e.g. ``"0.0.X"``.
+        :param after_timestamp: Only transactions with a consensus timestamp
+            strictly after this one.
+        :param until_timestamp: Only transactions with a consensus timestamp
+            up to and including this one.
+        :return: ``CRYPTOTRANSFER`` transactions involving ``account_id``,
+            oldest first.
+        """
         params = (
             f"account.id={account_id}&transactiontype=CRYPTOTRANSFER"
             f"&order=asc&limit={MIRROR_NODE_PAGE_SIZE}"
         )
         if after_timestamp:
             params += f"&timestamp=gt:{after_timestamp}"
-        url = urljoin(self.base_url, f"api/v1/transactions?{params}")
+        if until_timestamp:
+            params += f"&timestamp=lte:{until_timestamp}"
+        for page in self._get_pages(f"api/v1/transactions?{params}"):
+            yield from page
+
+    def get_network_crypto_transfer_pages(
+        self, after_timestamp: str, until_timestamp: str
+    ) -> Iterator[list[dict]]:
+        """
+        Network-wide feed of successful ``CRYPTOTRANSFER`` transactions, for
+        every account at once, so the cost depends on network volume rather
+        than on the number of tracked accounts.
+
+        :param after_timestamp: Only transactions with a consensus timestamp
+            strictly after this one.
+        :param until_timestamp: Only transactions with a consensus timestamp
+            up to and including this one.
+        :return: One list of transactions per Mirror Node page, oldest first.
+        """
+        params = (
+            f"transactiontype=CRYPTOTRANSFER&result=success"
+            f"&order=asc&limit={MIRROR_NODE_PAGE_SIZE}"
+            f"&timestamp=gt:{after_timestamp}&timestamp=lte:{until_timestamp}"
+        )
+        yield from self._get_pages(f"api/v1/transactions?{params}")
+
+    def _get_pages(self, path: str) -> Iterator[list[dict]]:
+        url = urljoin(self.base_url, path)
         while url:
             data = self._get(url)
-            yield from data.get("transactions", [])
+            yield data.get("transactions", [])
             next_link = (data.get("links") or {}).get("next")
             if not next_link:
                 url = None
@@ -173,3 +212,19 @@ class HederaMirrorNodeClient(BaseHTTPClient):
         )
         blocks = data.get("blocks") or []
         return blocks[0]["number"] if blocks else None
+
+    def get_blocks(self, from_consensus_timestamp: str) -> list[dict]:
+        """
+        :param from_consensus_timestamp:
+        :return: Up to ``MIRROR_NODE_PAGE_SIZE`` consecutive blocks, oldest
+            first, starting with the one containing ``from_consensus_timestamp``
+            (same lookup as :meth:`resolve_block_number`)
+        """
+        data = self._get(
+            urljoin(
+                self.base_url,
+                f"api/v1/blocks?timestamp=gte:{from_consensus_timestamp}"
+                f"&order=asc&limit={MIRROR_NODE_PAGE_SIZE}",
+            )
+        )
+        return data.get("blocks") or []
