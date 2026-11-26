@@ -873,6 +873,51 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
         self.assertEqual(response.status_code, status.HTTP_201_CREATED)
         self.assertEqual(MultisigConfirmation.objects.count(), 2)
 
+    def test_post_multisig_confirmation_replaces_confirmation_made_on_another_safe(
+        self,
+    ):
+        """
+        An unbound ``approveHash`` confirmation of the owner made on another Safe does
+        not block the owner's signature: it is replaced by it
+        """
+        owner_account = Account.create()
+        safe = self.deploy_test_safe(owners=[owner_account.address])
+        multisig_transaction = MultisigTransactionFactory(
+            safe=safe.address, trusted=False, ethereum_tx=None
+        )
+        safe_tx_hash = to_0x_hex_str(HexBytes(multisig_transaction.safe_tx_hash))
+        MultisigConfirmationFactory(
+            multisig_transaction=None,
+            multisig_transaction_hash=safe_tx_hash,
+            owner=owner_account.address,
+            safe_address=Account.create().address,
+            signature_type=SafeSignatureType.APPROVED_HASH.value,
+        )
+
+        response = self.client.post(
+            reverse(
+                "v1:history:multisig-transaction-confirmations", args=(safe_tx_hash,)
+            ),
+            format="json",
+            data={
+                "signature": to_0x_hex_str(
+                    owner_account.unsafe_sign_hash(safe_tx_hash)["signature"]
+                )
+            },
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        multisig_confirmation = MultisigConfirmation.objects.get(
+            multisig_transaction_hash=safe_tx_hash
+        )
+        self.assertEqual(multisig_confirmation.multisig_transaction_id, safe_tx_hash)
+        self.assertEqual(multisig_confirmation.safe_address, safe.address)
+        self.assertEqual(
+            multisig_confirmation.signature_type, SafeSignatureType.EOA.value
+        )
+        multisig_transaction.refresh_from_db()
+        self.assertTrue(multisig_transaction.trusted)
+
     def test_post_multisig_confirmation_banned(self):
         owner_account_1 = Account.create()
         owner_account_2 = Account.create()
@@ -2288,6 +2333,60 @@ class TestViewsV150(SafeTestCaseMixin, APITestCase):
             "Just one signature is expected if using delegates",
             response.data["non_field_errors"][0],
         )
+
+    def test_post_multisig_transactions_with_zero_address_signature(self):
+        """
+        A signature that cannot be recovered parses with ``NULL_ADDRESS`` as owner, and
+        it must be rejected as not valid.
+        """
+        safe_owner = Account.create()
+        safe = self.deploy_test_safe(owners=[safe_owner.address])
+        safe_address = safe.address
+
+        data = {
+            "to": Account.create().address,
+            "value": 0,
+            "data": None,
+            "operation": 0,
+            "nonce": 0,
+            "safeTxGas": 0,
+            "baseGas": 0,
+            "gasPrice": 0,
+            "gasToken": NULL_ADDRESS,
+            "refundReceiver": NULL_ADDRESS,
+            "sender": safe_owner.address,
+        }
+        safe_tx = safe.build_multisig_tx(
+            data["to"],
+            data["value"],
+            data["data"],
+            data["operation"],
+            data["safeTxGas"],
+            data["baseGas"],
+            data["gasPrice"],
+            data["gasToken"],
+            data["refundReceiver"],
+            safe_nonce=data["nonce"],
+        )
+        data["contractTransactionHash"] = to_0x_hex_str(safe_tx.safe_tx_hash)
+        # `r = s = 0` cannot be recovered. `v=27` is EOA and `v=31` is eth_sign
+        for v in (27, 31):
+            with self.subTest(v=v):
+                signature = bytes(64) + bytes([v])
+                data["signature"] = to_0x_hex_str(signature)
+                response = self.client.post(
+                    reverse("v1:history:multisig-transactions", args=(safe_address,)),
+                    format="json",
+                    data=data,
+                )
+                self.assertEqual(
+                    response.status_code, status.HTTP_422_UNPROCESSABLE_ENTITY
+                )
+                self.assertEqual(
+                    response.data["non_field_errors"][0],
+                    f"Signature={to_0x_hex_str(signature)} for owner={NULL_ADDRESS} is not valid",
+                )
+        self.assertEqual(MultisigTransaction.objects.count(), 0)
 
     def test_post_multisig_transactions_with_banned_signatures(self):
         safe_owners = [Account.create() for _ in range(4)]

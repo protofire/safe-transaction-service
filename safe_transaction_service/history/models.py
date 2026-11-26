@@ -368,7 +368,28 @@ class EthereumTxManager(BulkCreateSignalMixin, models.Manager):
         if tx_receipt is None:
             raise ValueError("tx_receipt cannot be empty")
 
-        data = HexBytes(tx.get("data") or tx.get("input"))
+        # Handle missing data/input field
+        data_value = tx.get("data") or tx.get("input")
+        if data_value is None:
+            if settings.ETH_ALLOW_EMPTY_TRANSACTION_DATA:
+                data_value = b""
+            else:
+                raise ValueError(
+                    f"Transaction missing data/input field. TxHash: {tx.get('hash')}. "
+                    f"Set ETH_ALLOW_EMPTY_TRANSACTION_DATA=true if this is expected for your network."
+                )
+        data = HexBytes(data_value)
+
+        # Handle missing value field
+        if "value" not in tx:
+            if settings.ETH_ALLOW_EMPTY_TRANSACTION_DATA:
+                tx["value"] = 0
+            else:
+                raise ValueError(
+                    f"Transaction missing value field. TxHash: {tx.get('hash')}. "
+                    f"Set ETH_ALLOW_EMPTY_TRANSACTION_DATA=true if this is expected for your network."
+                )
+
         logs = tx_receipt and [
             clean_receipt_log(log) for log in tx_receipt.get("logs", [])
         ]
@@ -590,7 +611,9 @@ class TokenTransfer(models.Model):
     """Abstract base model normalizing token transfer events across standards."""
 
     objects = TokenTransferManager.from_queryset(TokenTransferQuerySet)()
-    ethereum_tx = models.ForeignKey(EthereumTx, on_delete=models.CASCADE)
+    ethereum_tx = models.ForeignKey(
+        EthereumTx, on_delete=models.CASCADE, db_index=False
+    )
     timestamp = models.DateTimeField(db_index=True)
     block_number = models.PositiveIntegerField()
     address = EthereumAddressBinaryField()  # Token address
@@ -1168,7 +1191,10 @@ class InternalTx(models.Model):
 
     objects = InternalTxManager.from_queryset(InternalTxQuerySet)()
     ethereum_tx = models.ForeignKey(
-        EthereumTx, on_delete=models.CASCADE, related_name="internal_txs"
+        EthereumTx,
+        on_delete=models.CASCADE,
+        related_name="internal_txs",
+        db_index=False,
     )
     timestamp = models.DateTimeField(db_index=True)
     block_number = models.PositiveIntegerField()
@@ -1671,7 +1697,7 @@ class MultisigTransaction(TimeStampedModel):
 
     objects = MultisigTransactionManager.from_queryset(MultisigTransactionQuerySet)()
     safe_tx_hash = Keccak256Field(primary_key=True)
-    safe = EthereumAddressBinaryField(db_index=True)
+    safe = EthereumAddressBinaryField()  # Covered by the (safe, nonce, created) index
     proposer = EthereumAddressBinaryField(null=True)
     proposed_by_delegate = EthereumAddressBinaryField(null=True, blank=True)
     ethereum_tx = models.ForeignKey(
@@ -1696,6 +1722,7 @@ class MultisigTransaction(TimeStampedModel):
     signatures = models.BinaryField(null=True, blank=True)  # When tx is executed
     nonce = Uint256Field(db_index=True)
     failed = models.BooleanField(null=True, blank=True, default=None, db_index=True)
+    payment = Uint256Field(null=True, blank=True, default=None)
     origin = models.JSONField(default=dict)  # To store arbitrary data on the tx
     trusted = models.BooleanField(
         default=False, db_index=True
@@ -1856,6 +1883,39 @@ class MultisigConfirmationManager(models.Manager):
             owner=owner,
         ).delete()[0]
 
+    def get_or_create_for_transaction(
+        self,
+        multisig_transaction: MultisigTransaction,
+        defaults_by_owner: dict[ChecksumAddress, dict[str, Any]],
+    ) -> list[tuple["MultisigConfirmation", bool]]:
+        """
+        Confirmations are unique by hash and owner, and an ``approveHash`` of the
+        hash can be indexed from any contract with any owner. Unbound confirmations
+        of the owners are replaced, so they cannot hold the place of the owners'
+        confirmations.
+
+        :param multisig_transaction: Transaction confirmed by the owners
+        :param defaults_by_owner: Fields for a new confirmation of each owner
+        :return: Confirmation of each owner bound to ``multisig_transaction``, and
+            whether it was created
+        """
+        self.without_transaction().filter(
+            multisig_transaction_hash=multisig_transaction.safe_tx_hash,
+            owner__in=defaults_by_owner,
+        ).delete()
+        return [
+            self.get_or_create(
+                multisig_transaction_hash=multisig_transaction.safe_tx_hash,
+                owner=owner,
+                defaults={
+                    **defaults,
+                    "multisig_transaction": multisig_transaction,
+                    "safe_address": multisig_transaction.safe,
+                },
+            )
+            for owner, defaults in defaults_by_owner.items()
+        ]
+
 
 class MultisigConfirmationQuerySet(models.QuerySet):
     def without_transaction(self):
@@ -1863,6 +1923,20 @@ class MultisigConfirmationQuerySet(models.QuerySet):
 
     def with_transaction(self):
         return self.exclude(multisig_transaction=None)
+
+    def bindable_to_transaction(
+        self, safe_tx_hash: bytes | str, safe_address: ChecksumAddress
+    ):
+        """
+        :param safe_tx_hash: Hash of the transaction
+        :param safe_address: Safe of the transaction
+        :return: Confirmations of ``safe_tx_hash`` with no transaction yet that were
+            made on ``safe_address``. The hash alone is not enough, as ``approveHash``
+            can be called on any Safe for any hash
+        """
+        return self.without_transaction().filter(
+            multisig_transaction_hash=safe_tx_hash, safe_address=safe_address
+        )
 
 
 class MultisigConfirmation(TimeStampedModel):
@@ -1882,9 +1956,12 @@ class MultisigConfirmation(TimeStampedModel):
         related_name="confirmations",
     )
     multisig_transaction_hash = Keccak256Field(
-        null=True, db_index=True
+        null=True
     )  # Use this while we don't have a `multisig_transaction`
     owner = EthereumAddressBinaryField()
+    # Safe the confirmation was made on. For an indexed `approveHash` it is the
+    # contract that was called (traces) or that emitted the event
+    safe_address = EthereumAddressBinaryField(null=True)
 
     signature = HexV2Field(null=True, default=None, max_length=MAX_SIGNATURE_LENGTH)
     signature_type = models.PositiveSmallIntegerField(
@@ -1899,6 +1976,19 @@ class MultisigConfirmation(TimeStampedModel):
             )
         ]
         ordering = ["created"]
+
+    @property
+    def safe_address_or_transaction_safe(self) -> ChecksumAddress | None:
+        """
+        :return: Safe the confirmation was made on. Confirmations stored without it
+            take the Safe of their `MultisigTransaction`. `None` when neither is
+            available
+        """
+        if self.safe_address:
+            return self.safe_address
+        if self.multisig_transaction_id:
+            return self.multisig_transaction.safe  # This could make a db call
+        return None
 
     def __str__(self):
         if self.multisig_transaction_id:
@@ -2151,6 +2241,7 @@ class SafeContractDelegate(models.Model):
         related_name="safe_contract_delegates",
         null=True,
         default=None,
+        db_index=False,
     )  # If safe_contract is not defined, delegate is valid for every Safe which delegator is an owner
     delegate = EthereumAddressBinaryField(db_index=True)
     delegator = EthereumAddressBinaryField(
@@ -2188,7 +2279,9 @@ class SafeRelevantTransaction(models.Model):
 
     objects = SafeRelevantTransactionManager()
     timestamp = models.DateTimeField()
-    ethereum_tx = models.ForeignKey(EthereumTx, on_delete=models.CASCADE)
+    ethereum_tx = models.ForeignKey(
+        EthereumTx, on_delete=models.CASCADE, db_index=False
+    )
     safe = (
         EthereumAddressBinaryField()
     )  # Not using a ForeignKey as Safe might not be created yet in `SafeContract` table
@@ -2468,9 +2561,7 @@ class SafeStatus(SafeStatusBase):
         related_name="safe_status",
         primary_key=True,
     )  # Make internal_tx the primary key
-    address = EthereumAddressBinaryField(
-        db_index=True
-    )  # Address is not the primary key
+    address = EthereumAddressBinaryField()  # Address is not the primary key
 
     class Meta:
         indexes = [

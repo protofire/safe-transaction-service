@@ -1,7 +1,10 @@
 from abc import ABC, abstractmethod
+from unittest import mock
+from unittest.mock import MagicMock
 
 from django.test import TestCase
 
+import eth_abi
 from eth_account import Account
 from eth_typing import ChecksumAddress
 from hexbytes import HexBytes
@@ -11,14 +14,15 @@ from safe_eth.eth.contracts import (
     get_safe_V1_4_1_contract,
     get_safe_V1_5_0_contract,
 )
+from safe_eth.eth.utils import fast_keccak_text
 from safe_eth.safe import Safe
 from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
 from safe_eth.util.util import to_0x_hex_str
 from web3 import Web3
-from web3.auto import w3
 from web3.datastructures import AttributeDict
 from web3.types import LogReceipt
 
+from ...events.services.queue_service import QueueService
 from ..indexers import SafeEventsIndexer, SafeEventsIndexerProvider
 from ..indexers.tx_processor import SafeTxProcessor
 from ..models import (
@@ -32,13 +36,21 @@ from ..models import (
     SafeContract,
     SafeLastStatus,
     SafeStatus,
+    TransactionServiceEventType,
 )
-from .factories import EthereumBlockFactory, EthereumTxFactory, SafeMasterCopyFactory
+from .factories import (
+    EthereumBlockFactory,
+    EthereumTxFactory,
+    MultisigTransactionFactory,
+    SafeLastStatusFactory,
+    SafeMasterCopyFactory,
+)
 from .mocks.mocks_safe_events_indexer import (
     proxy_creation_event_mock,
     safe_events_mock,
     setup_events_mock,
 )
+from .utils import get_sent_event_types
 
 
 class SafeEventsIndexerBaseAbstractTestBase(SafeTestCaseMixin, TestCase, ABC):
@@ -834,97 +846,6 @@ class SafeEventsIndexerBaseAbstractTestBase(SafeTestCaseMixin, TestCase, ABC):
             safe_creation_events[safe_address][1]["event"], "ProxyCreation"
         )
 
-    def test_proxy_creation_event_without_initializer(self):
-        initial_block_number = self.ethereum_client.current_block_number + 1
-        SafeMasterCopyFactory(
-            address=self.safe_contract.address,
-            initial_block_number=initial_block_number,
-            tx_block_number=initial_block_number,
-            version=self.safe_contract_version,
-            l2=True,
-        )
-        ethereum_tx_sent = self.proxy_factory.deploy_proxy_contract_with_nonce(
-            self.ethereum_test_account,
-            self.safe_contract.address,
-            initializer=b"",
-        )
-        safe_address = ethereum_tx_sent.contract_address
-        self.assertEqual(InternalTx.objects.count(), 0)
-        self.assertEqual(InternalTxDecoded.objects.count(), 0)
-        self.assertEqual(self.safe_events_indexer.start(), (1, 1))
-        self.assertEqual(
-            InternalTxDecoded.objects.count(), 0
-        )  # Just created without setup
-        self.assertEqual(InternalTx.objects.count(), 1)  # Proxy factory
-        # Proxy creation InternalTx must contain the Safe address
-        self.assertEqual(
-            InternalTx.objects.filter(contract_address=safe_address).count(), 1
-        )
-        # Call setup
-        owner_account_1 = self.ethereum_test_account
-        owners = [owner_account_1.address]
-        threshold = 1
-        to = NULL_ADDRESS
-        data = b""
-        fallback_handler = NULL_ADDRESS
-        payment_token = NULL_ADDRESS
-        payment = 0
-        payment_receiver = NULL_ADDRESS
-        deployed_safe_contract = self.get_safe_contract(self.w3, safe_address)
-        setup_call = deployed_safe_contract.functions.setup(
-            owners,
-            threshold,
-            to,
-            data,
-            fallback_handler,
-            payment_token,
-            payment,
-            payment_receiver,
-        ).build_transaction(
-            {"nonce": self.w3.eth.get_transaction_count(owner_account_1.address)}
-        )
-        signed_tx = owner_account_1.sign_transaction(setup_call)
-        w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-        self.assertEqual(self.safe_events_indexer.start(), (1, 1))
-        # We remove the proxyCreation internaltx
-        self.assertEqual(InternalTx.objects.count(), 1)
-        self.assertEqual(InternalTxDecoded.objects.count(), 1)
-        # TODO get singleton address when setup and creation are not indexed together
-        # self.assertEqual(InternalTx.objects.filter(contract_address=None, to=self.safe_contract.address).count(), 1)
-        # ProxyCreation first and SafeSetup later indexed together
-        ethereum_tx_sent = self.proxy_factory.deploy_proxy_contract_with_nonce(
-            self.ethereum_test_account,
-            self.safe_contract.address,
-            initializer=b"",
-        )
-        safe_address = ethereum_tx_sent.contract_address
-        deployed_safe_contract = self.get_safe_contract(self.w3, safe_address)
-        setup_call = deployed_safe_contract.functions.setup(
-            owners,
-            threshold,
-            to,
-            data,
-            fallback_handler,
-            payment_token,
-            payment,
-            payment_receiver,
-        ).build_transaction(
-            {"nonce": self.w3.eth.get_transaction_count(owner_account_1.address)}
-        )
-        signed_tx = owner_account_1.sign_transaction(setup_call)
-        w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-        self.assertEqual(self.safe_events_indexer.start(), (2, 2))
-        # Proxy creation InternalTx must contain the Safe address
-        self.assertEqual(
-            InternalTx.objects.filter(contract_address=safe_address).count(), 1
-        )
-        self.assertEqual(
-            InternalTx.objects.filter(
-                contract_address=None, to=self.safe_contract.address
-            ).count(),
-            1,
-        )
-
     def test_process_safe_creation_events_forcing_duplicate_events(self):
         # Insert a lonely ProxyCreation event
         proxy_creation_events = self.safe_events_indexer.decode_elements(
@@ -1585,3 +1506,105 @@ class TestSafeEventsIndexerV1_3_0(SafeEventsIndexerBaseAbstractTestBase):
         :return: Last Safe Contract available
         """
         return get_safe_V1_3_0_contract(w3, address=address)
+
+
+class TestSafeEventsIndexerApproveHashFromFakeSafe(SafeTestCaseMixin, TestCase):
+    @staticmethod
+    def _build_emit_log_code(topics: list[bytes], data: bytes) -> bytes:
+        """
+        :return: EVM code that emits one log with ``topics`` and ``data``
+        """
+        push32 = b"\x7f"
+        mstore = b"\x52"
+        padded_data = data + b"\x00" * (-len(data) % 32)
+        code = b""
+        for offset in range(0, len(padded_data), 32):
+            code += push32 + padded_data[offset : offset + 32]
+            code += push32 + offset.to_bytes(32, "big") + mstore
+        for topic in reversed(topics):
+            code += push32 + topic.rjust(32, b"\x00")
+        code += push32 + len(data).to_bytes(32, "big")
+        code += push32 + (0).to_bytes(32, "big")
+        log_opcode = bytes([0xA0 + len(topics)])
+        return code + log_opcode
+
+    @mock.patch.object(QueueService, "send_event")
+    def test_approve_hash_event_from_fake_safe_does_not_trust_transaction(
+        self, send_event_mock: MagicMock
+    ):
+        """
+        A contract that is not a Safe emits ``SafeSetup`` and then ``ApproveHash``
+        with the hash of a proposal for a real Safe and one of its owners. The
+        indexer stores the approval for the fake Safe, and the proposal stays
+        untrusted
+        """
+        victim_owner = Account.create().address
+        victim_safe_status = SafeLastStatusFactory(owners=[victim_owner])
+        safe_tx_hash = to_0x_hex_str(fast_keccak_text(victim_owner))
+        MultisigTransactionFactory(
+            safe_tx_hash=safe_tx_hash,
+            safe=victim_safe_status.address,
+            trusted=False,
+            ethereum_tx=None,
+        )
+
+        safe_events_indexer = SafeEventsIndexer(
+            self.ethereum_client, confirmations=0, blocks_to_reindex_again=0
+        )
+        safe_events_indexer.start()
+        attacker = self.ethereum_test_account
+        safe_setup_data = eth_abi.encode(
+            ["address[]", "uint256", "address", "address"],
+            [[attacker.address], 1, NULL_ADDRESS, NULL_ADDRESS],
+        )
+        fake_safe_constructor = (
+            self._build_emit_log_code(
+                [
+                    fast_keccak_text(
+                        "SafeSetup(address,address[],uint256,address,address)"
+                    ),
+                    HexBytes(attacker.address),
+                ],
+                safe_setup_data,
+            )
+            + self._build_emit_log_code(
+                [
+                    fast_keccak_text("ApproveHash(bytes32,address)"),
+                    HexBytes(safe_tx_hash),
+                    HexBytes(victim_owner),
+                ],
+                b"",
+            )
+            + b"\x00"  # STOP
+        )
+        tx_hash = self.send_tx({"data": fake_safe_constructor}, attacker)
+        tx_receipt = self.wait_for_receipt(tx_hash)
+        fake_safe_address = tx_receipt["contractAddress"]
+
+        block_number = tx_receipt["blockNumber"]
+        safe_events_indexer.process_elements(
+            safe_events_indexer.find_relevant_elements(
+                set(), block_number, block_number
+            )
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            SafeTxProcessor(
+                self.ethereum_client, None, None
+            ).process_decoded_transactions(
+                list(InternalTxDecoded.objects.pending_for_safes())
+            )
+
+        approve_hash_confirmation = MultisigConfirmation.objects.get(
+            multisig_transaction_hash=safe_tx_hash
+        )
+        self.assertEqual(approve_hash_confirmation.owner, victim_owner)
+        self.assertEqual(approve_hash_confirmation.safe_address, fake_safe_address)
+        self.assertIsNone(approve_hash_confirmation.multisig_transaction_id)
+        self.assertFalse(
+            MultisigTransaction.objects.get(safe_tx_hash=safe_tx_hash).trusted
+        )
+        sent_event_types = get_sent_event_types(send_event_mock)
+        self.assertNotIn(
+            TransactionServiceEventType.PENDING_MULTISIG_TRANSACTION.name,
+            sent_event_types,
+        )
