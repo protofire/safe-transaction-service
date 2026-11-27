@@ -552,6 +552,12 @@ LOGGING = {
         "safe_transaction_service.history.tasks.index_erc20_events_task": {
             "level": ERC20_721_INDEXER_LOG_LEVEL,
         },
+        "safe_transaction_service.history.indexers.ethereum_indexer": {
+            "level": ERC20_721_INDEXER_LOG_LEVEL,
+        },
+        "safe_transaction_service.history.indexers.events_indexer": {
+            "level": ERC20_721_INDEXER_LOG_LEVEL,
+        },
         # PROXY_FACTORY_INDEXER_LOG_LEVEL
         "safe_transaction_service.history.indexers.proxy_factory_indexer": {
             "level": PROXY_FACTORY_INDEXER_LOG_LEVEL,
@@ -633,6 +639,9 @@ ETH_L2_NETWORK = env.bool(
 ETH_ZKSYNC_COMPATIBLE_NETWORK = env.bool(
     "ETH_ZKSYNC_COMPATIBLE_NETWORK", default=False
 )  # Fix some issues regarding zkSync compatible networks
+ETH_ALLOW_EMPTY_TRANSACTION_DATA = env.bool(
+    "ETH_ALLOW_EMPTY_TRANSACTION_DATA", default=False
+)  # Allow transactions with null data/input fields (required for some networks like Tempo)
 ETH_EVENTS_BLOCK_PROCESS_LIMIT = env.int(
     "ETH_EVENTS_BLOCK_PROCESS_LIMIT", default=50
 )  # Initial number of blocks to process together when searching for events. It will be auto increased. 0 == no limit.
@@ -660,6 +669,15 @@ ETH_REORG_BLOCKS = env.int(
 ETH_ERC20_LOAD_ADDRESSES_CHUNK_SIZE = env.int(
     "ETH_ERC20_LOAD_ADDRESSES_CHUNK_SIZE", default=500_000
 )  # Load Safe addresses for the ERC20 indexer with a database iterator with the defined `chunk_size`
+ETH_EVENTS_IGNORED_INITIATORS: set[ChecksumAddress] = {
+    ChecksumAddress(HexAddress(HexStr(address)))
+    for address in env.list("ETH_EVENTS_IGNORED_INITIATORS", default=[])
+}  # Initiator addresses whose created Safes should be ignored during L2 indexing
+ETH_EVENTS_IGNORED_TO: set[ChecksumAddress] = {
+    ChecksumAddress(HexAddress(HexStr(address)))
+    for address in env.list("ETH_EVENTS_IGNORED_TO", default=[])
+}  # Transaction 'to' addresses to ignore during L2 indexing
+
 
 # ENABLE/DISABLE COLLECTIBLES DOWNLOAD METADATA, enable=True, disabled by default
 COLLECTIBLES_ENABLE_DOWNLOAD_METADATA = env.bool(

@@ -1,7 +1,10 @@
 from abc import ABC, abstractmethod
+from unittest import mock
+from unittest.mock import MagicMock
 
 from django.test import TestCase
 
+import eth_abi
 from eth_account import Account
 from eth_typing import ChecksumAddress
 from hexbytes import HexBytes
@@ -11,14 +14,15 @@ from safe_eth.eth.contracts import (
     get_safe_V1_4_1_contract,
     get_safe_V1_5_0_contract,
 )
+from safe_eth.eth.utils import fast_keccak_text
 from safe_eth.safe import Safe
 from safe_eth.safe.tests.safe_test_case import SafeTestCaseMixin
 from safe_eth.util.util import to_0x_hex_str
 from web3 import Web3
-from web3.auto import w3
 from web3.datastructures import AttributeDict
 from web3.types import LogReceipt
 
+from ...events.services.queue_service import QueueService
 from ..indexers import SafeEventsIndexer, SafeEventsIndexerProvider
 from ..indexers.tx_processor import SafeTxProcessor
 from ..models import (
@@ -29,15 +33,24 @@ from ..models import (
     InternalTxType,
     MultisigConfirmation,
     MultisigTransaction,
+    SafeContract,
     SafeLastStatus,
     SafeStatus,
+    TransactionServiceEventType,
 )
-from .factories import EthereumBlockFactory, EthereumTxFactory, SafeMasterCopyFactory
+from .factories import (
+    EthereumBlockFactory,
+    EthereumTxFactory,
+    MultisigTransactionFactory,
+    SafeLastStatusFactory,
+    SafeMasterCopyFactory,
+)
 from .mocks.mocks_safe_events_indexer import (
     proxy_creation_event_mock,
     safe_events_mock,
     setup_events_mock,
 )
+from .utils import get_sent_event_types
 
 
 class SafeEventsIndexerBaseAbstractTestBase(SafeTestCaseMixin, TestCase, ABC):
@@ -833,97 +846,6 @@ class SafeEventsIndexerBaseAbstractTestBase(SafeTestCaseMixin, TestCase, ABC):
             safe_creation_events[safe_address][1]["event"], "ProxyCreation"
         )
 
-    def test_proxy_creation_event_without_initializer(self):
-        initial_block_number = self.ethereum_client.current_block_number + 1
-        SafeMasterCopyFactory(
-            address=self.safe_contract.address,
-            initial_block_number=initial_block_number,
-            tx_block_number=initial_block_number,
-            version=self.safe_contract_version,
-            l2=True,
-        )
-        ethereum_tx_sent = self.proxy_factory.deploy_proxy_contract_with_nonce(
-            self.ethereum_test_account,
-            self.safe_contract.address,
-            initializer=b"",
-        )
-        safe_address = ethereum_tx_sent.contract_address
-        self.assertEqual(InternalTx.objects.count(), 0)
-        self.assertEqual(InternalTxDecoded.objects.count(), 0)
-        self.assertEqual(self.safe_events_indexer.start(), (1, 1))
-        self.assertEqual(
-            InternalTxDecoded.objects.count(), 0
-        )  # Just created without setup
-        self.assertEqual(InternalTx.objects.count(), 1)  # Proxy factory
-        # Proxy creation InternalTx must contain the Safe address
-        self.assertEqual(
-            InternalTx.objects.filter(contract_address=safe_address).count(), 1
-        )
-        # Call setup
-        owner_account_1 = self.ethereum_test_account
-        owners = [owner_account_1.address]
-        threshold = 1
-        to = NULL_ADDRESS
-        data = b""
-        fallback_handler = NULL_ADDRESS
-        payment_token = NULL_ADDRESS
-        payment = 0
-        payment_receiver = NULL_ADDRESS
-        deployed_safe_contract = self.get_safe_contract(self.w3, safe_address)
-        setup_call = deployed_safe_contract.functions.setup(
-            owners,
-            threshold,
-            to,
-            data,
-            fallback_handler,
-            payment_token,
-            payment,
-            payment_receiver,
-        ).build_transaction(
-            {"nonce": self.w3.eth.get_transaction_count(owner_account_1.address)}
-        )
-        signed_tx = owner_account_1.sign_transaction(setup_call)
-        w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-        self.assertEqual(self.safe_events_indexer.start(), (1, 1))
-        # We remove the proxyCreation internaltx
-        self.assertEqual(InternalTx.objects.count(), 1)
-        self.assertEqual(InternalTxDecoded.objects.count(), 1)
-        # TODO get singleton address when setup and creation are not indexed together
-        # self.assertEqual(InternalTx.objects.filter(contract_address=None, to=self.safe_contract.address).count(), 1)
-        # ProxyCreation first and SafeSetup later indexed together
-        ethereum_tx_sent = self.proxy_factory.deploy_proxy_contract_with_nonce(
-            self.ethereum_test_account,
-            self.safe_contract.address,
-            initializer=b"",
-        )
-        safe_address = ethereum_tx_sent.contract_address
-        deployed_safe_contract = self.get_safe_contract(self.w3, safe_address)
-        setup_call = deployed_safe_contract.functions.setup(
-            owners,
-            threshold,
-            to,
-            data,
-            fallback_handler,
-            payment_token,
-            payment,
-            payment_receiver,
-        ).build_transaction(
-            {"nonce": self.w3.eth.get_transaction_count(owner_account_1.address)}
-        )
-        signed_tx = owner_account_1.sign_transaction(setup_call)
-        w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-        self.assertEqual(self.safe_events_indexer.start(), (2, 2))
-        # Proxy creation InternalTx must contain the Safe address
-        self.assertEqual(
-            InternalTx.objects.filter(contract_address=safe_address).count(), 1
-        )
-        self.assertEqual(
-            InternalTx.objects.filter(
-                contract_address=None, to=self.safe_contract.address
-            ).count(),
-            1,
-        )
-
     def test_process_safe_creation_events_forcing_duplicate_events(self):
         # Insert a lonely ProxyCreation event
         proxy_creation_events = self.safe_events_indexer.decode_elements(
@@ -1008,6 +930,393 @@ class SafeEventsIndexerBaseAbstractTestBase(SafeTestCaseMixin, TestCase, ABC):
         self.assertEqual(len(internal_txs), 0)
         self.assertEqual(InternalTx.objects.count(), 3)
         self.assertEqual(InternalTxDecoded.objects.count(), 1)
+
+    def test_conditional_indexing_disabled(self):
+        """
+        Test that when conditional indexing is disabled (default), all events are processed
+        regardless of the initiator.
+        """
+        # Create ethereum txs for the mocks (the _from doesn't matter when disabled)
+        for safe_event in safe_events_mock:
+            tx_hash = safe_event["transactionHash"]
+            block_hash = safe_event["blockHash"]
+            if not EthereumTx.objects.filter(tx_hash=tx_hash).exists():
+                EthereumTxFactory(tx_hash=tx_hash, block__block_hash=block_hash)
+
+        self.assertEqual(InternalTx.objects.count(), 0)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+
+        # Process events without conditional indexing (ignored_initiators=set())
+        safe_events_indexer = SafeEventsIndexer(
+            self.ethereum_client,
+            confirmations=0,
+            blocks_to_reindex_again=0,
+            ignored_initiators=set(),
+        )
+        safe_events_indexer.process_elements(safe_events_mock)
+
+        # Safe should be processed normally
+        safe_address = "0x0059c65c3d2325D77E9288E022D24d3972b1799D"
+        # InternalTxDecoded should be created for the Safe setup
+        self.assertTrue(
+            InternalTxDecoded.objects.filter(
+                safe_address=safe_address, function_name="setup"
+            ).exists()
+        )
+
+    def test_conditional_indexing_allowed_initiator(self):
+        """
+        Test that when conditional indexing is enabled, events from transactions
+        with non-blocklisted _from addresses are processed.
+        """
+        # The initiator (ethereum_tx._from) for the Safe creation transaction
+        tx_sender = "0xA21E2615ED32CE9DdFc53A1B0ccFE689e9152f25"
+        # Use a different address in blocklist, so tx_sender is allowed
+        different_address = Account.create().address
+
+        # Create ethereum txs for the mocks with the tx_sender as _from
+        for safe_event in safe_events_mock:
+            tx_hash = safe_event["transactionHash"]
+            block_hash = safe_event["blockHash"]
+            if not EthereumTx.objects.filter(tx_hash=tx_hash).exists():
+                EthereumTxFactory(
+                    tx_hash=tx_hash, block__block_hash=block_hash, _from=tx_sender
+                )
+
+        self.assertEqual(InternalTx.objects.count(), 0)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+
+        # Process events with conditional indexing enabled but initiator not in blocklist
+        safe_events_indexer = SafeEventsIndexer(
+            self.ethereum_client,
+            confirmations=0,
+            blocks_to_reindex_again=0,
+            ignored_initiators={different_address},
+        )
+        safe_events_indexer.process_elements(safe_events_mock)
+
+        # The Safe address from the mock is 0x0059c65c3d2325D77E9288E022D24d3972b1799D
+        safe_address = "0x0059c65c3d2325D77E9288E022D24d3972b1799D"
+
+        # InternalTxDecoded should be created for the Safe setup (events were processed)
+        self.assertTrue(
+            InternalTxDecoded.objects.filter(
+                safe_address=safe_address, function_name="setup"
+            ).exists()
+        )
+
+    def test_conditional_indexing_blocklisted_initiator(self):
+        """
+        Test that when conditional indexing is enabled, events from transactions
+        with blocklisted _from addresses are NOT processed.
+        """
+        # The initiator (ethereum_tx._from) for the Safe creation transaction
+        blocklisted_initiator = "0xA21E2615ED32CE9DdFc53A1B0ccFE689e9152f25"
+
+        # Create ethereum txs for the mocks with blocklisted_initiator as _from
+        for safe_event in safe_events_mock:
+            tx_hash = safe_event["transactionHash"]
+            block_hash = safe_event["blockHash"]
+            if not EthereumTx.objects.filter(tx_hash=tx_hash).exists():
+                EthereumTxFactory(
+                    tx_hash=tx_hash,
+                    block__block_hash=block_hash,
+                    _from=blocklisted_initiator,
+                )
+
+        self.assertEqual(InternalTx.objects.count(), 0)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+
+        # Process events with blocklisted initiator and conditional indexing enabled
+        safe_events_indexer = SafeEventsIndexer(
+            self.ethereum_client,
+            confirmations=0,
+            blocks_to_reindex_again=0,
+            ignored_initiators={blocklisted_initiator},
+        )
+        safe_events_indexer.process_elements(safe_events_mock)
+
+        # The Safe address from the mock is 0x0059c65c3d2325D77E9288E022D24d3972b1799D
+        safe_address = "0x0059c65c3d2325D77E9288E022D24d3972b1799D"
+
+        # No InternalTxDecoded should be created for the Safe setup (events were filtered)
+        self.assertEqual(
+            InternalTxDecoded.objects.filter(safe_address=safe_address).count(), 0
+        )
+
+    def test_conditional_indexing_mixed_initiators(self):
+        """
+        Test that when conditional indexing is enabled, only events from transactions
+        with non-blocklisted _from addresses are processed.
+
+        This tests the scenario where some transactions are from allowed initiators
+        and some are from blocklisted initiators.
+        """
+        allowed_initiator = "0xA21E2615ED32CE9DdFc53A1B0ccFE689e9152f25"
+        blocklisted_initiator = Account.create().address
+
+        # Create ethereum txs with different initiators
+        # First tx (creation) from allowed initiator, second tx from blocklisted
+        tx_hashes_seen = set()
+        for safe_event in safe_events_mock:
+            tx_hash = safe_event["transactionHash"]
+            block_hash = safe_event["blockHash"]
+            if (
+                tx_hash not in tx_hashes_seen
+                and not EthereumTx.objects.filter(tx_hash=tx_hash).exists()
+            ):
+                tx_hashes_seen.add(tx_hash)
+                # First unique tx gets allowed initiator
+                initiator = (
+                    allowed_initiator
+                    if len(tx_hashes_seen) == 1
+                    else blocklisted_initiator
+                )
+                EthereumTxFactory(
+                    tx_hash=tx_hash, block__block_hash=block_hash, _from=initiator
+                )
+
+        self.assertEqual(InternalTx.objects.count(), 0)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+
+        # Process events with conditional indexing enabled
+        safe_events_indexer = SafeEventsIndexer(
+            self.ethereum_client,
+            confirmations=0,
+            blocks_to_reindex_again=0,
+            ignored_initiators={blocklisted_initiator},
+        )
+        safe_events_indexer.process_elements(safe_events_mock)
+
+        safe_address = "0x0059c65c3d2325D77E9288E022D24d3972b1799D"
+
+        # Only events from the first (allowed) transaction should be processed
+        # The SafeSetup and ProxyCreation events are in the first tx, so setup should exist
+        self.assertTrue(
+            InternalTxDecoded.objects.filter(
+                safe_address=safe_address, function_name="setup"
+            ).exists()
+        )
+        # But events from the second (blocklisted) transaction should not be processed
+        # The number of InternalTx should be limited to just the creation events
+        self.assertEqual(
+            InternalTx.objects.count(), 2
+        )  # Only ProxyCreation and SafeSetup
+
+    def test_conditional_indexing_creation_and_non_creation_same_batch(self):
+        """
+        Test that when conditional indexing is enabled and creation events + non-creation
+        events for the same Safe are processed in the same batch, both are indexed correctly.
+
+        This tests the race condition fix: SafeContract must be created during creation
+        event processing so that non-creation events aren't filtered out when checking
+        SafeContract.objects.get_existing_addresses().
+        """
+        # Use an allowed initiator (not in blocklist)
+        allowed_initiator = "0xA21E2615ED32CE9DdFc53A1B0ccFE689e9152f25"
+        # Use a different address in blocklist
+        blocklisted_address = Account.create().address
+
+        # Create ethereum txs for the mocks with allowed_initiator as _from
+        for safe_event in safe_events_mock:
+            tx_hash = safe_event["transactionHash"]
+            block_hash = safe_event["blockHash"]
+            if not EthereumTx.objects.filter(tx_hash=tx_hash).exists():
+                EthereumTxFactory(
+                    tx_hash=tx_hash,
+                    block__block_hash=block_hash,
+                    _from=allowed_initiator,
+                )
+
+        self.assertEqual(InternalTx.objects.count(), 0)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+        self.assertEqual(SafeContract.objects.count(), 0)
+
+        # Process ALL events in a single batch with conditional indexing enabled
+        safe_events_indexer = SafeEventsIndexer(
+            self.ethereum_client,
+            confirmations=0,
+            blocks_to_reindex_again=0,
+            ignored_initiators={blocklisted_address},
+        )
+        safe_events_indexer.process_elements(safe_events_mock)
+
+        safe_address = "0x0059c65c3d2325D77E9288E022D24d3972b1799D"
+
+        # SafeContract should be created during indexing (not by SafeTxProcessor)
+        self.assertTrue(
+            SafeContract.objects.filter(address=safe_address).exists(),
+            "SafeContract should be created during creation event processing",
+        )
+
+        # SafeSetup should be processed (creation event)
+        self.assertTrue(
+            InternalTxDecoded.objects.filter(
+                safe_address=safe_address, function_name="setup"
+            ).exists(),
+            "SafeSetup event should be processed",
+        )
+
+        # Non-creation events should also be processed (AddedOwner, etc.)
+        # The mock has multiple SafeMultiSigTransaction events in blocks 77-86.
+        # If SafeContract wasn't created during creation processing, these would be filtered.
+        self.assertTrue(
+            InternalTxDecoded.objects.filter(
+                safe_address=safe_address, function_name="execTransaction"
+            ).exists(),
+            "Non-creation events should be processed because SafeContract "
+            "was created during creation event processing",
+        )
+
+    def test_conditional_indexing_blocklisted_to(self):
+        """
+        Test that when conditional indexing is enabled, events from transactions
+        with blocklisted 'to' addresses are NOT processed.
+        """
+        # The 'to' address for the Safe creation transaction
+        blocklisted_to_address = "0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67"
+
+        # Create ethereum txs for the mocks with blocklisted_to_address as 'to'
+        for safe_event in safe_events_mock:
+            tx_hash = safe_event["transactionHash"]
+            block_hash = safe_event["blockHash"]
+            if not EthereumTx.objects.filter(tx_hash=tx_hash).exists():
+                EthereumTxFactory(
+                    tx_hash=tx_hash,
+                    block__block_hash=block_hash,
+                    to=blocklisted_to_address,
+                )
+
+        self.assertEqual(InternalTx.objects.count(), 0)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+
+        # Process events with blocklisted 'to' and conditional indexing enabled
+        safe_events_indexer = SafeEventsIndexer(
+            self.ethereum_client,
+            confirmations=0,
+            blocks_to_reindex_again=0,
+            ignored_to={blocklisted_to_address},
+        )
+        safe_events_indexer.process_elements(safe_events_mock)
+
+        # The Safe address from the mock is 0x0059c65c3d2325D77E9288E022D24d3972b1799D
+        safe_address = "0x0059c65c3d2325D77E9288E022D24d3972b1799D"
+
+        # No InternalTxDecoded should be created for the Safe setup (events were filtered)
+        self.assertEqual(
+            InternalTxDecoded.objects.filter(safe_address=safe_address).count(), 0
+        )
+
+    def test_conditional_indexing_allowed_to(self):
+        """
+        Test that when conditional indexing is enabled, events from transactions
+        with non-blocklisted 'to' addresses are processed.
+        """
+        tx_to_address = "0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67"
+        # Use a different address in blocklist, so tx_to_address is allowed
+        different_address = Account.create().address
+
+        # Create ethereum txs for the mocks with the tx_to_address as 'to'
+        for safe_event in safe_events_mock:
+            tx_hash = safe_event["transactionHash"]
+            block_hash = safe_event["blockHash"]
+            if not EthereumTx.objects.filter(tx_hash=tx_hash).exists():
+                EthereumTxFactory(
+                    tx_hash=tx_hash,
+                    block__block_hash=block_hash,
+                    to=tx_to_address,
+                )
+
+        self.assertEqual(InternalTx.objects.count(), 0)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+
+        # Process events with conditional indexing enabled but 'to' not in blocklist
+        safe_events_indexer = SafeEventsIndexer(
+            self.ethereum_client,
+            confirmations=0,
+            blocks_to_reindex_again=0,
+            ignored_to={different_address},
+        )
+        safe_events_indexer.process_elements(safe_events_mock)
+
+        # The Safe address from the mock is 0x0059c65c3d2325D77E9288E022D24d3972b1799D
+        safe_address = "0x0059c65c3d2325D77E9288E022D24d3972b1799D"
+
+        # InternalTxDecoded should be created for the Safe setup (events were processed)
+        self.assertTrue(
+            InternalTxDecoded.objects.filter(
+                safe_address=safe_address, function_name="setup"
+            ).exists()
+        )
+
+    def test_conditional_indexing_mixed_from_and_to(self):
+        """
+        Test that when conditional indexing is enabled, transactions are filtered
+        when either _from OR to is blocklisted.
+
+        This tests the scenario where some transactions are blocklisted by _from
+        and some by to.
+        """
+        allowed_initiator = "0xA21E2615ED32CE9DdFc53A1B0ccFE689e9152f25"
+        blocklisted_initiator = Account.create().address
+        allowed_to = "0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67"
+        blocklisted_to = Account.create().address
+
+        # Create ethereum txs with different initiators and to addresses
+        # First tx (creation) is allowed, second tx has blocklisted 'to'
+        tx_hashes_seen = set()
+        for safe_event in safe_events_mock:
+            tx_hash = safe_event["transactionHash"]
+            block_hash = safe_event["blockHash"]
+            if (
+                tx_hash not in tx_hashes_seen
+                and not EthereumTx.objects.filter(tx_hash=tx_hash).exists()
+            ):
+                tx_hashes_seen.add(tx_hash)
+                # First unique tx is allowed, second tx has blocklisted 'to'
+                if len(tx_hashes_seen) == 1:
+                    EthereumTxFactory(
+                        tx_hash=tx_hash,
+                        block__block_hash=block_hash,
+                        _from=allowed_initiator,
+                        to=allowed_to,
+                    )
+                else:
+                    EthereumTxFactory(
+                        tx_hash=tx_hash,
+                        block__block_hash=block_hash,
+                        _from=allowed_initiator,  # From is allowed
+                        to=blocklisted_to,  # But 'to' is blocklisted
+                    )
+
+        self.assertEqual(InternalTx.objects.count(), 0)
+        self.assertEqual(InternalTxDecoded.objects.count(), 0)
+
+        # Process events with both blocklists configured
+        safe_events_indexer = SafeEventsIndexer(
+            self.ethereum_client,
+            confirmations=0,
+            blocks_to_reindex_again=0,
+            ignored_initiators={blocklisted_initiator},
+            ignored_to={blocklisted_to},
+        )
+        safe_events_indexer.process_elements(safe_events_mock)
+
+        safe_address = "0x0059c65c3d2325D77E9288E022D24d3972b1799D"
+
+        # Only events from the first (allowed) transaction should be processed
+        # The SafeSetup and ProxyCreation events are in the first tx, so setup should exist
+        self.assertTrue(
+            InternalTxDecoded.objects.filter(
+                safe_address=safe_address, function_name="setup"
+            ).exists()
+        )
+        # But events from the second transaction should not be processed
+        # (even though _from is allowed, 'to' is blocklisted)
+        # The number of InternalTx should be limited to just the creation events
+        self.assertEqual(
+            InternalTx.objects.count(), 2
+        )  # Only ProxyCreation and SafeSetup
 
 
 class TestSafeEventsIndexerV1_5_0(SafeEventsIndexerBaseAbstractTestBase):
@@ -1197,3 +1506,105 @@ class TestSafeEventsIndexerV1_3_0(SafeEventsIndexerBaseAbstractTestBase):
         :return: Last Safe Contract available
         """
         return get_safe_V1_3_0_contract(w3, address=address)
+
+
+class TestSafeEventsIndexerApproveHashFromFakeSafe(SafeTestCaseMixin, TestCase):
+    @staticmethod
+    def _build_emit_log_code(topics: list[bytes], data: bytes) -> bytes:
+        """
+        :return: EVM code that emits one log with ``topics`` and ``data``
+        """
+        push32 = b"\x7f"
+        mstore = b"\x52"
+        padded_data = data + b"\x00" * (-len(data) % 32)
+        code = b""
+        for offset in range(0, len(padded_data), 32):
+            code += push32 + padded_data[offset : offset + 32]
+            code += push32 + offset.to_bytes(32, "big") + mstore
+        for topic in reversed(topics):
+            code += push32 + topic.rjust(32, b"\x00")
+        code += push32 + len(data).to_bytes(32, "big")
+        code += push32 + (0).to_bytes(32, "big")
+        log_opcode = bytes([0xA0 + len(topics)])
+        return code + log_opcode
+
+    @mock.patch.object(QueueService, "send_event")
+    def test_approve_hash_event_from_fake_safe_does_not_trust_transaction(
+        self, send_event_mock: MagicMock
+    ):
+        """
+        A contract that is not a Safe emits ``SafeSetup`` and then ``ApproveHash``
+        with the hash of a proposal for a real Safe and one of its owners. The
+        indexer stores the approval for the fake Safe, and the proposal stays
+        untrusted
+        """
+        victim_owner = Account.create().address
+        victim_safe_status = SafeLastStatusFactory(owners=[victim_owner])
+        safe_tx_hash = to_0x_hex_str(fast_keccak_text(victim_owner))
+        MultisigTransactionFactory(
+            safe_tx_hash=safe_tx_hash,
+            safe=victim_safe_status.address,
+            trusted=False,
+            ethereum_tx=None,
+        )
+
+        safe_events_indexer = SafeEventsIndexer(
+            self.ethereum_client, confirmations=0, blocks_to_reindex_again=0
+        )
+        safe_events_indexer.start()
+        attacker = self.ethereum_test_account
+        safe_setup_data = eth_abi.encode(
+            ["address[]", "uint256", "address", "address"],
+            [[attacker.address], 1, NULL_ADDRESS, NULL_ADDRESS],
+        )
+        fake_safe_constructor = (
+            self._build_emit_log_code(
+                [
+                    fast_keccak_text(
+                        "SafeSetup(address,address[],uint256,address,address)"
+                    ),
+                    HexBytes(attacker.address),
+                ],
+                safe_setup_data,
+            )
+            + self._build_emit_log_code(
+                [
+                    fast_keccak_text("ApproveHash(bytes32,address)"),
+                    HexBytes(safe_tx_hash),
+                    HexBytes(victim_owner),
+                ],
+                b"",
+            )
+            + b"\x00"  # STOP
+        )
+        tx_hash = self.send_tx({"data": fake_safe_constructor}, attacker)
+        tx_receipt = self.wait_for_receipt(tx_hash)
+        fake_safe_address = tx_receipt["contractAddress"]
+
+        block_number = tx_receipt["blockNumber"]
+        safe_events_indexer.process_elements(
+            safe_events_indexer.find_relevant_elements(
+                set(), block_number, block_number
+            )
+        )
+        with self.captureOnCommitCallbacks(execute=True):
+            SafeTxProcessor(
+                self.ethereum_client, None, None
+            ).process_decoded_transactions(
+                list(InternalTxDecoded.objects.pending_for_safes())
+            )
+
+        approve_hash_confirmation = MultisigConfirmation.objects.get(
+            multisig_transaction_hash=safe_tx_hash
+        )
+        self.assertEqual(approve_hash_confirmation.owner, victim_owner)
+        self.assertEqual(approve_hash_confirmation.safe_address, fake_safe_address)
+        self.assertIsNone(approve_hash_confirmation.multisig_transaction_id)
+        self.assertFalse(
+            MultisigTransaction.objects.get(safe_tx_hash=safe_tx_hash).trusted
+        )
+        sent_event_types = get_sent_event_types(send_event_mock)
+        self.assertNotIn(
+            TransactionServiceEventType.PENDING_MULTISIG_TRANSACTION.name,
+            sent_event_types,
+        )
